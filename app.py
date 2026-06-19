@@ -3,10 +3,11 @@ import pandas as pd
 import os
 import chromadb
 from chromadb.utils import embedding_functions
-from langchain_ollama import OllamaLLM
-import openpyxl # 엑셀 셀 내부에 숨겨진 하이퍼링크를 추출하기 위한 라이브러리
+# [변경] 로컬 전용 Ollama를 지우고 클라우드 전용 초고속 Groq 엔진을 탑재합니다.
+from langchain_groq import ChatGroq
+import openpyxl 
 
-# --- 1. 경로 및 로컬 DB 상시 연결 초기화 ---
+# --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
@@ -21,6 +22,7 @@ except Exception:
         shutil.rmtree(DB_PATH)
     chroma_client = chromadb.PersistentClient(path=DB_PATH)
 
+# 한국어 자연어 문장 백터 검색에 최적화된 고성능 오픈소스 임베딩 모델 강제 바인딩
 sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
     model_name="jhgan/ko-sroberta-multitask"
 )
@@ -30,35 +32,33 @@ collection = chroma_client.get_or_create_collection(
     embedding_function=sentence_transformer_ef
 )
 
-llm = OllamaLLM(model="llama3.2", timeout=120)
+# [중요] 사용자가 제공한 Groq API 키를 내부 런타임에 이식 완료 (메타의 고성능 Llama 3.2 3B Preview 적용)
+GROQ_API_KEY = "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"
+llm = ChatGroq(
+    model="llama-3.2-3b-preview", 
+    groq_api_key=GROQ_API_KEY,
+    temperature=0.1 # 특허 분석의 무결성을 위해 무작위성을 최소화하고 팩트 기반 기술 유도
+)
 
 
-# --- [핵심 추가] 엑셀에서 하이퍼링크(URL)를 딕셔너리 형태로 미리 맵핑하는 함수 ---
+# --- 2. 엑셀 파싱 및 무결성 메타데이터 적재 로직 (오픈파이엑셀 연동) ---
 def extract_excel_hyperlinks(uploaded_file):
-    """
-    openpyxl을 이용해 엑셀 파일 내의 모든 셀을 돌며 하이퍼링크가 심겨진 
-    텍스트(출원번호 등)와 실제 URL 주소를 매칭한 사전(Dict)을 반환합니다.
-    """
+    """엑셀 셀 내부 레이어에 숨겨져 있는 하이퍼링크 URL 주소를 매핑하여 딕셔너리로 반환"""
     link_dict = {}
     try:
-        # 업로드된 파일을 openpyxl 워크북으로 로드
         wb = openpyxl.load_workbook(uploaded_file, data_only=False)
         sheet = wb.active
-        
         for row in sheet.iter_rows():
             for cell in row:
-                # 셀에 하이퍼링크가 존재하는 경우
                 if cell.hyperlink and cell.hyperlink.target:
-                    cell_text = str(cell.value).strip().replace("-", "") # 하이픈 제거한 텍스트를 키로 삼음
+                    cell_text = str(cell.value).strip().replace("-", "")
                     link_dict[cell_text] = cell.hyperlink.target
     except Exception as e:
-        print(f"하이퍼링크 추출 중 오류 발생(정상 스킵 가능): {e}")
+        print(f"링크 파싱 스킵: {e}")
     return link_dict
 
 
-# --- 2. 데이터 가공 백엔드 로직 (하이퍼링크 메타데이터 적재 보완) ---
 def process_and_update_db(uploaded_file):
-    # 파일 포인터가 초기화되도록 하기 위해 파일 복사본 생성 후 링크 추출 진행
     import copy
     file_for_links = copy.deepcopy(uploaded_file)
     hyperlink_map = extract_excel_hyperlinks(file_for_links)
@@ -120,9 +120,7 @@ def process_and_update_db(uploaded_file):
             search_context = f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
             doc_id = str(row[id_col]).replace("-", "").strip()
             
-            # [보완] 엑셀 매핑 사전에서 하이퍼링크 URL 추적 (없으면 공백)
             patent_url = hyperlink_map.get(doc_id, "")
-            # 만약 출원번호 열이 아니라 특허명칭 등 다른 열에 링크가 걸려 있을 경우를 대비한 2차 검색
             if patent_url == "" and title_col:
                 clean_title = str(row[title_col]).strip().replace("-", "")
                 patent_url = hyperlink_map.get(clean_title, "")
@@ -138,7 +136,7 @@ def process_and_update_db(uploaded_file):
                     "CPC": str(row[cpc_col]) if cpc_col and pd.notna(row[cpc_col]) else "없음",
                     "발명자": str(row[inventor_col]) if inventor_col and pd.notna(row[inventor_col]) else "없음",
                     "출원인": str(row[applicant_col]) if applicant_col and pd.notna(row[applicant_col]) else "없음",
-                    "URL": patent_url  # [중요] 크로마DB 메타데이터에 하이퍼링크 주소 영구 저장
+                    "URL": patent_url
                 }],
                 ids=[doc_id]
             )
@@ -147,9 +145,9 @@ def process_and_update_db(uploaded_file):
         return 0, duplicate_count
 
 
-# --- 3. 프론트엔드 UI 구축 및 페르소나 드롭다운 컨트롤 ---
-st.set_page_config(page_title="특허 RAG 인트라넷 포털", layout="wide")
-st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
+# --- 3. 프론트엔드 UI 및 다차원 페르소나 설정 ---
+st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
+st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
 
 with st.sidebar:
     st.header("📂 데이터 관리 센터")
@@ -192,14 +190,14 @@ placeholders = {
 user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
 
 
-# --- 4. 런타임 매칭 실행 엔진 ---
-if st.button("🧬 상시 가동 가상 전문가 엔진 구동"):
+# --- 4. 런타임 하이퍼링크 매칭 및 추론 구동 엔진 ---
+if st.button("🧬 가상 전문가 엔진 구동"):
     if user_query.strip() == "":
         st.warning("분석 내용을 입력해 주세요.")
     elif collection.count() == 0:
         st.error("서버 DB에 적재된 특허 소스가 없습니다. 좌측 메뉴에서 엑셀을 먼저 등록해 주세요.")
     else:
-        with st.spinner("로컬 가상 전문가가 문헌 매칭 및 연산을 수행 중입니다..."):
+        with st.spinner("가상 전문가가 실시간 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
             n_results = 3
             if "📊" in analysis_mode:
                 n_results = min(collection.count(), 15)
@@ -223,9 +221,8 @@ if st.button("🧬 상시 가동 가상 전문가 엔진 구동"):
                     ipc = m.get('IPC', '없음')
                     cpc = m.get('CPC', '없음')
                     app_date = m.get('출원일', '없음')
-                    patent_url = m.get('URL', '') # 저장해둔 하이퍼링크 주소 파싱
+                    patent_url = m.get('URL', '')
 
-                    # [핵심 로직] 메타데이터에 URL이 있으면 출원번호와 명칭에 마크다운 링크([텍스트](주소))를 입혀서 매칭해 줍니다.
                     if patent_url and patent_url.startswith("http"):
                         display_num = f"[{app_num}]({patent_url})"
                         display_name = f"[{p_name}]({patent_url})"
@@ -254,18 +251,18 @@ if st.button("🧬 상시 가동 가상 전문가 엔진 구동"):
                 {user_query}
 
                 보고서는 마크다운 양식을 사용하여 한국어로 논리정연하게 작성해 주세요.<|eot_id|><|start_header_id|>thought<|end_header_id|>
-                Hyperlink mapping configuration complete. Generating report...<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+                Groq engine active. Generating analytical report...<|eot_id|><|start_header_id|>assistant<|end_header_id|>
                 """
                 
-                with st.spinner("🧠 가상 전문가가 하이퍼링크가 매칭된 리포트를 기술하고 있습니다..."):
-                    try:
-                        response = llm.invoke(prompt)
-                        st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
-                        st.write(response) # AI 답변 출력
-                        st.divider()
-                        with st.expander("👁️ 로컬 가상 서버가 실시간 스크리닝한 마스터 데이터 매칭 정보 (클릭 시 원문 이동 가능)"):
-                            st.markdown(context_text) # 하단 소스 보기 탭에서도 링크 클릭이 가능하도록 마크다운 변환 출력
-                    except Exception as e:
-                        st.error(f"서버 연산 보호 오류: {e}")
+                try:
+                    # ChatGroq의 인보크 결과(AIMessage객체)에서 텍스트 콘텐츠 추출
+                    response = llm.invoke(prompt)
+                    st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
+                    st.write(response.content) 
+                    st.divider()
+                    with st.expander("👁️ 로컬 가상 서버가 실시간 스크리닝한 마스터 데이터 매칭 정보 (클릭 시 원문 이동 가능)"):
+                        st.markdown(context_text) 
+                except Exception as e:
+                    st.error(f"서버 연산 보호 오류: {e}")
             else:
                 st.error("데이터 매칭 실패")
