@@ -35,7 +35,7 @@ collection = chroma_client.get_or_create_collection(
 # [중요] 사용자가 제공한 Groq API 키를 내부 런타임에 이식 완료 (메타의 고성능 Llama 3.2 3B Preview 적용)
 GROQ_API_KEY = "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"
 llm = ChatGroq(
-    model="llama-3.2-3b-preview", 
+    model="llama-3.2-3b-preview",
     groq_api_key=GROQ_API_KEY,
     temperature=0.1 # 특허 분석의 무결성을 위해 무작위성을 최소화하고 팩트 기반 기술 유도
 )
