@@ -30,38 +30,45 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 # ==========================================
 def commit_and_push_data():
     """
-    데이터 적재 또는 포맷 발생 시, 깃허브 저장소로 
-    실시간 Push를 수행하여 컨테이너 리부팅 시의 데이터 휘발을 원천 차단
+    [안정성 고도화] 변경된 크로마 DB와 마스터 엑셀을 
+    토큰 직주입 방식으로 깃허브 원격지에 강제 안착시키는 함수
     """
-    # Streamlit Secrets에 저장된 깃허브 개인 토큰 및 계정 정보 로드
-    if "GITHUB_TOKEN" not in st.secrets:
-        # 토큰 설정이 안 되어 있다면 로컬 테스트 환경으로 간주하고 스킵
+    if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
         return
         
     token = st.secrets["GITHUB_TOKEN"]
-    repo_url = st.secrets["GITHUB_REPO_URL"] # 예: github.com/username/repo_name.git
+    repo_url = st.secrets["GITHUB_REPO_URL"]
     
     try:
-        # Git 사용자 인증 설정
+        # 1. 자격 증명 전역 설정
         subprocess.run(["git", "config", "--global", "user.email", "patent-bot@streamlit.com"], check=True)
         subprocess.run(["git", "config", "--global", "user.name", "PatentRAG-Bot"], check=True)
         
-        # 원격 저장소 주소에 토큰 심기
-        remote_url = f"https://{token}@{repo_url}"
-        subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=False)
+        # 2. 새로 생성된 폴더와 파일들을 빠짐없이 스테이징 (강제 추적)
+        subprocess.run(["git", "add", "my_patent_vector_db/", "my_patent_folder/"], check=True)
         
-        # 변경 사항 스테이징 및 커밋 (Vector DB 폴더와 마스터 엑셀 폴더 포함)
-        subprocess.run(["git", "add", "my_patent_vector_db/*", "my_patent_folder/*"], check=True)
-        
-        # 변경 사항이 있을 때만 커밋 수행
+        # 3. 변경 사항이 존재하는지 사전 체크
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+        
         if status.stdout.strip():
+            # 4. 로컬 커밋 수행
             subprocess.run(["git", "commit", "-m", "🔄 [Automated Backup] Patent DB updated by Researcher"], check=True)
-            # 메인 브랜치로 푸시 (Streamlit Cloud 기본 브랜치 환경에 맞춤)
-            subprocess.run(["git", "push", "origin", "HEAD"], check=True)
-            st.toast("💾 사내 데이터 가상 웨어하우스(GitHub)에 영구 백업 완료!")
+            
+            # 5. [핵심] 푸시할 때 URL에 토큰을 직접 바인딩하여 권한 거절 원천 차단
+            authenticated_url = f"https://{token}@{repo_url}"
+            
+            # 메인 브랜치(main)로 강제 동기화 푸시
+            result = subprocess.run(["git", "push", authenticated_url, "HEAD:main"], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                st.toast("💾 사내 데이터 가상 웨어하우스(GitHub)에 영구 백업 성공!")
+            else:
+                st.error(f"⚠️ 깃허브 푸시 실패 원인: {result.stderr}")
+        else:
+            print("변경 사항 없음 - 백업 트랜잭션 패스")
+            
     except Exception as e:
-        st.error(f"⚠️ 자동 영구 백업 동기화 실패: {e}")
+        st.error(f"⚠️ 자동 백업 프로세스 예외 발생: {e}")
 
 
 # ==========================================
