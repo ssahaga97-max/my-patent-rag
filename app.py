@@ -5,11 +5,11 @@ import chromadb
 from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
 import openpyxl 
+import subprocess
 
 # ==========================================
-# [신규 추가] 0. 독립 세션 상태 제어 및 초기화
+# 0. 독립 세션 상태 제어 및 초기화
 # ==========================================
-# 다중 사용자 접속 시 상호 간섭 차단을 위한 세션 메모리 격리
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_id" not in st.session_state:
@@ -22,19 +22,52 @@ MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.x
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 
-# 페이지 기본 설정 (로그인 화면 초기 렌더링 속도 극대화)
 st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
 
 
 # ==========================================
-# [신규 추가] 1. 사내 연구원용 다중 ID/PASS 인터페이스
+# [치명적 버그 해결] GitHub 자동 동기화 백업 엔진
+# ==========================================
+def commit_and_push_data():
+    """
+    데이터 적재 또는 포맷 발생 시, 깃허브 저장소로 
+    실시간 Push를 수행하여 컨테이너 리부팅 시의 데이터 휘발을 원천 차단
+    """
+    # Streamlit Secrets에 저장된 깃허브 개인 토큰 및 계정 정보 로드
+    if "GITHUB_TOKEN" not in st.secrets:
+        # 토큰 설정이 안 되어 있다면 로컬 테스트 환경으로 간주하고 스킵
+        return
+        
+    token = st.secrets["GITHUB_TOKEN"]
+    repo_url = st.secrets["GITHUB_REPO_URL"] # 예: github.com/username/repo_name.git
+    
+    try:
+        # Git 사용자 인증 설정
+        subprocess.run(["git", "config", "--global", "user.email", "patent-bot@streamlit.com"], check=True)
+        subprocess.run(["git", "config", "--global", "user.name", "PatentRAG-Bot"], check=True)
+        
+        # 원격 저장소 주소에 토큰 심기
+        remote_url = f"https://{token}@{repo_url}"
+        subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=False)
+        
+        # 변경 사항 스테이징 및 커밋 (Vector DB 폴더와 마스터 엑셀 폴더 포함)
+        subprocess.run(["git", "add", "my_patent_vector_db/*", "my_patent_folder/*"], check=True)
+        
+        # 변경 사항이 있을 때만 커밋 수행
+        status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+        if status.stdout.strip():
+            subprocess.run(["git", "commit", "-m", "🔄 [Automated Backup] Patent DB updated by Researcher"], check=True)
+            # 메인 브랜치로 푸시 (Streamlit Cloud 기본 브랜치 환경에 맞춤)
+            subprocess.run(["git", "push", "origin", "HEAD"], check=True)
+            st.toast("💾 사내 데이터 가상 웨어하우스(GitHub)에 영구 백업 완료!")
+    except Exception as e:
+        st.error(f"⚠️ 자동 영구 백업 동기화 실패: {e}")
+
+
+# ==========================================
+# 1. 사내 연구원용 다중 ID/PASS 인터페이스
 # ==========================================
 def check_authentication():
-    """
-    Streamlit Cloud의 보안 저장소(secrets.toml)와 연동하여
-    연구원별 계정을 매핑하고 사내 인증을 수행하는 함수
-    """
-    # secrets.toml이 없거나 미설정된 경우를 대비한 대체(Fallback) 계정 정의
     if "USER_CREDENTIALS" in st.secrets:
         user_credentials = st.secrets["USER_CREDENTIALS"]
     else:
@@ -60,21 +93,16 @@ def check_authentication():
                     st.success(f"🔓 {username} 연구원님 인증 성공")
                     st.rerun()
                 else:
-                    st.error("❌ ID 또는 비밀번호가 일바르지 않습니다.")
+                    st.error("❌ ID 또는 비밀번호가 올바르지 않습니다.")
         return False
     return True
 
 
 # ==========================================
-# [신규 추가] 2. 지연 로딩(Lazy Loading) 및 인프라 바인딩 함수
+# 2. 지연 로딩(Lazy Loading) 및 인프라 바인딩 함수
 # ==========================================
 @st.cache_resource(show_spinner=False)
 def initialize_infra():
-    """
-    앱 진입 시 500MB 모델을 매번 다운로드하는 현상을 해결하기 위해,
-    로그인 완료 후 실제 인프라가 필요할 때만 호출 및 캐싱되도록 구조화
-    """
-    # ChromaDB 연결 안정화
     try:
         chroma_client = chromadb.PersistentClient(path=DB_PATH)
     except Exception:
@@ -83,7 +111,6 @@ def initialize_infra():
             shutil.rmtree(DB_PATH)
         chroma_client = chromadb.PersistentClient(path=DB_PATH)
 
-    # 대형 임베딩 모델 로드 시점을 지연(Lazy) 처리
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
@@ -93,7 +120,6 @@ def initialize_infra():
         embedding_function=sentence_transformer_ef
     )
     
-    # Groq API 및 LLM 엔진 설정 유지
     GROQ_API_KEY = "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"
     llm = ChatGroq(
         model="llama-3.3-70b-versatile", 
@@ -106,7 +132,6 @@ def initialize_infra():
 
 # --- 2. 엑셀 파싱 및 무결성 메타데이터 적재 로직 (오픈파이엑셀 연동) ---
 def extract_excel_hyperlinks(uploaded_file):
-    """엑셀 셀 내부 레이어에 숨겨져 있는 하이퍼링크 URL 주소를 매핑하여 딕셔너리로 반환"""
     link_dict = {}
     try:
         wb = openpyxl.load_workbook(uploaded_file, data_only=False)
@@ -210,10 +235,8 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 3. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    # 사용자가 인증을 마치는 순간 인프라 팩토리를 로드하여 첫 화면 지연 현상을 원천 차단
     chroma_client, collection, llm = initialize_infra()
 
-    # 상단 인터페이스 배치 조정 (현재 로그인 세션 명시 및 로그아웃 버튼 배치)
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
@@ -231,6 +254,9 @@ def run_main_portal():
             if st.button("🚀 신규 특허 무결성 적재"):
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
+                    if added > 0:
+                        # [버그 해결] 신규 적재 데이터 발생 시 깃허브 원격지로 즉시 백업 유도
+                        commit_and_push_data()
                     st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
                     st.rerun()
                     
@@ -241,6 +267,8 @@ def run_main_portal():
             try: chroma_client.delete_collection(name="competitor_patents")
             except Exception: pass
             if os.path.exists(MASTER_EXCEL_PATH): os.remove(MASTER_EXCEL_PATH)
+            # [버그 해결] 전체 초기화 시에도 파일이 지워진 상태를 깃허브에 푸시하여 무결성 동기화
+            commit_and_push_data()
             st.warning("모든 데이터가 소거되었습니다.")
             st.rerun()
 
@@ -263,7 +291,6 @@ def run_main_portal():
         "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": "통계 요약을 보고 싶은 조건이나 '전체 통계 요약해줘'라고 입력하세요."
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
-
 
     # --- 4. 런타임 하이퍼링크 매칭 및 추론 구동 엔진 ---
     if st.button("🧬 가상 전문가 엔진 구동"):
@@ -341,11 +368,7 @@ def run_main_portal():
                 else:
                     st.error("데이터 매칭 실패")
 
-# ==========================================
-# 5. 애플리케이션 진입 제어 (Entry Point)
-# ==========================================
+
 if __name__ == "__main__":
-    # 1단계: 사내 연구원 로그인 인증 검사
     if check_authentication():
-        # 2단계: 인증 통과 시에만 메인 시스템 런타임 가동
         run_main_portal()
