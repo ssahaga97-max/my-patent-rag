@@ -1,57 +1,43 @@
-import os
 import streamlit as st
 import pandas as pd
-from openpyxl import load_workbook
-from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+import os
+import chromadb
+from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
-from langchain.chains import RetrievalQA
+import openpyxl 
 
 # ==========================================
-# 0. 초기 세션 상태 및 인프라 절대경로 설정
+# [신규 추가] 0. 독립 세션 상태 제어 및 초기화
 # ==========================================
-# 다중 사용자 접속 시 세션 간섭을 차단하기 위한 독립 세션 초기화 
+# 다중 사용자 접속 시 상호 간섭 차단을 위한 세션 메모리 격리
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
 
-# 클라우드 가상 OS 환경에서 상대경로 뒤틀림으로 인한 DB 소실 방지 
+# --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_DIR = os.path.join(BASE_DIR, "chroma_db")
+DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
+MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
 
-# 페이지 기본 설정 (로그인 화면 진입 전 초기 렌더링 속도 극대화)
-st.set_page_config(page_title="PatentRAG 포털", layout="wide")
+os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 
-# ==========================================
-# 1. 차기 고도화: 임베딩 모델 지연 로딩 (Lazy Loading) 
-# ==========================================
-@st.cache_resource(show_spinner=False)
-def get_embedding_model():
-    """
-    앱 진입 시 500MB 모델을 매번 다운로드하는 지연을 방지하기 위해,
-    실제 인증 후 연산이 필요할 때만 호출되고 캐싱되는 지연 로딩 구조 
-    """
-    return HuggingFaceEmbeddings(model_name="jhgan/ko-sroberta-multitask") [cite: 1]
+# 페이지 기본 설정 (로그인 화면 초기 렌더링 속도 극대화)
+st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
+
 
 # ==========================================
-# 2. 차기 고도화: 사내 연구원용 다중 ID/PASS 인터페이스 
+# [신규 추가] 1. 사내 연구원용 다중 ID/PASS 인터페이스
 # ==========================================
 def check_authentication():
     """
     Streamlit Cloud의 보안 저장소(secrets.toml)와 연동하여
-    연구원별 계정 사전을 매핑하고 인증을 수행 
+    연구원별 계정을 매핑하고 사내 인증을 수행하는 함수
     """
-    # 로컬 테스트 및 secrets 미설정 대비용 Fallback 계정 사전 정의 
-    # 실제 운영 환경에서는 Streamlit 웹 대시보드의 Secrets에 아래 구조로 저장해야 합니다.
-    # [USER_CREDENTIALS]
-    # researcher1 = "password123!"
-    # researcher2 = "patent456!"
-    
+    # secrets.toml이 없거나 미설정된 경우를 대비한 대체(Fallback) 계정 정의
     if "USER_CREDENTIALS" in st.secrets:
         user_credentials = st.secrets["USER_CREDENTIALS"]
     else:
-        # secrets.toml이 없을 경우 기본 테스트 계정 매핑 
         user_credentials = {
             "admin": "admin123",
             "researcher01": "patent789",
@@ -59,145 +45,307 @@ def check_authentication():
         }
 
     if not st.session_state.logged_in:
-        st.title("🔒 사내 프라이빗 특허 분석 RAG 포털")
-        st.subheader("연구원 로그인 인터페이스") [cite: 10]
+        st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
+        st.subheader("🔑 사내 연구원 로그인 인증")
         
         with st.form("login_form"):
-            username = st.text_input("사내 계정 ID (User ID)", key="input_user")
-            password = st.text_input("비밀번호 (Password)", type="password", key="input_pass")
-            submit_button = st.form_submit_button("로그인")
+            username = st.text_input("사내 계정 ID", key="input_user")
+            password = st.text_input("비밀번호", type="password", key="input_pass")
+            submit_button = st.form_submit_button("인트라넷 접속")
             
             if submit_button:
                 if username in user_credentials and user_credentials[username] == password:
                     st.session_state.logged_in = True
                     st.session_state.user_id = username
-                    st.success(f"🔓 {username} 연구원님 환영합니다.")
+                    st.success(f"🔓 {username} 연구원님 인증 성공")
                     st.rerun()
                 else:
-                    st.error("❌ ID 또는 비밀번호가 올바르지 않습니다. 다시 입력해주세요.")
+                    st.error("❌ ID 또는 비밀번호가 일바르지 않습니다.")
         return False
     return True
 
-# ==========================================
-# 3. 데이터 추출 및 하이퍼링크 매칭 기법 (기존 고도화 유지) [cite: 7]
-# ==========================================
-def extract_patent_with_links(excel_path):
-    """
-    openpyxl을 사용하여 키프리스 엑셀 레이어의 원문 하이퍼링크 주소를 추출 [cite: 7]
-    """
-    wb = load_workbook(excel_path, data_only=False)
-    ws = wb.active
-    
-    # openpyxl로 링크 추출용 매핑 생성
-    link_dict = {}
-    for row in ws.iter_rows():
-        for cell in row:
-            if cell.hyperlink and cell.hyperlink.target:
-                # 셀의 텍스트 값을 키로 하여 링크 타겟 저장 [cite: 7]
-                link_dict[str(cell.value).strip()] = cell.hyperlink.target [cite: 7]
-                
-    # pandas로 데이터 프레임 로드 파트
-    df = pd.read_excel(excel_path) [cite: 1]
-    return df, link_dict
 
 # ==========================================
-# 4. 메인 RAG 대시보드 애플리케이션 화면
+# [신규 추가] 2. 지연 로딩(Lazy Loading) 및 인프라 바인딩 함수
 # ==========================================
-def main_portal():
-    # 상단 헤더 및 로그아웃 버튼 (독립 세션 제어용) 
-    col1, col2 = st.columns([8, 2])
-    with col1:
-        st.title("🚀 사내 프라이빗 특허 분석 RAG 포털 (PatentRAG)") [cite: 1]
-        st.caption(f"접속 연구원 세션: {st.session_state.user_id} | 인프라 상태: 정상 가동 중 (Python 3.11)") [cite: 4, 11]
-    with col2:
-        if st.button("로그아웃"):
+@st.cache_resource(show_spinner=False)
+def initialize_infra():
+    """
+    앱 진입 시 500MB 모델을 매번 다운로드하는 현상을 해결하기 위해,
+    로그인 완료 후 실제 인프라가 필요할 때만 호출 및 캐싱되도록 구조화
+    """
+    # ChromaDB 연결 안정화
+    try:
+        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+    except Exception:
+        import shutil
+        if os.path.exists(DB_PATH):
+            shutil.rmtree(DB_PATH)
+        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+
+    # 대형 임베딩 모델 로드 시점을 지연(Lazy) 처리
+    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="jhgan/ko-sroberta-multitask"
+    )
+
+    collection = chroma_client.get_or_create_collection(
+        name="competitor_patents", 
+        embedding_function=sentence_transformer_ef
+    )
+    
+    # Groq API 및 LLM 엔진 설정 유지
+    GROQ_API_KEY = "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"
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile", 
+        groq_api_key=GROQ_API_KEY,
+        temperature=0.1 
+    )
+    
+    return chroma_client, collection, llm
+
+
+# --- 2. 엑셀 파싱 및 무결성 메타데이터 적재 로직 (오픈파이엑셀 연동) ---
+def extract_excel_hyperlinks(uploaded_file):
+    """엑셀 셀 내부 레이어에 숨겨져 있는 하이퍼링크 URL 주소를 매핑하여 딕셔너리로 반환"""
+    link_dict = {}
+    try:
+        wb = openpyxl.load_workbook(uploaded_file, data_only=False)
+        sheet = wb.active
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.hyperlink and cell.hyperlink.target:
+                    cell_text = str(cell.value).strip().replace("-", "")
+                    link_dict[cell_text] = cell.hyperlink.target
+    except Exception as e:
+        print(f"링크 파싱 스킵: {e}")
+    return link_dict
+
+
+def process_and_update_db(uploaded_file, collection):
+    import copy
+    file_for_links = copy.deepcopy(uploaded_file)
+    hyperlink_map = extract_excel_hyperlinks(file_for_links)
+    
+    try:
+        new_df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"엑셀 파일 로드 실패: {e}")
+        return 0, 0
+    
+    columns_map = {str(col).strip().replace(" ", "").upper(): col for col in new_df.columns}
+    
+    id_col = next((v for k, v in columns_map.items() if "출원번호" in k or "번호" in k), new_df.columns[0])
+    title_col = next((v for k, v in columns_map.items() if "명칭" in k or "제목" in k or "특허명" in k), None)
+    abstract_col = next((v for k, v in columns_map.items() if "요약" in k or "초록" in k), None)
+    claims_col = next((v for k, v in columns_map.items() if "청구" in k or "범위" in k or "청구항" in k), None)
+    
+    app_date_col = next((v for k, v in columns_map.items() if "출원일" in k or "출원일자" in k), None)
+    reg_date_col = next((v for k, v in columns_map.items() if "등록일" in k or "등록일자" in k), None)
+    ipc_col = next((v for k, v in columns_map.items() if "IPC" in k), None)
+    cpc_col = next((v for k, v in columns_map.items() if "CPC" in k), None)
+    inventor_col = next((v for k, v in columns_map.items() if "발명자" in k or "발명인" in k), None)
+    applicant_col = next((v for k, v in columns_map.items() if "출원인" in k or "권리자" in k), None)
+
+    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
+        try:
+            master_df = pd.read_excel(MASTER_EXCEL_PATH)
+            existing_numbers = set(master_df[id_col].astype(str).str.replace("-", "").str.strip().tolist())
+        except Exception:
+            master_df = pd.DataFrame(columns=new_df.columns)
+            existing_numbers = set()
+    else:
+        master_df = pd.DataFrame(columns=new_df.columns)
+        existing_numbers = set()
+
+    new_records = []
+    duplicate_count = 0
+
+    for idx, row in new_df.iterrows():
+        current_number = str(row[id_col]).replace("-", "").strip()
+        if current_number == "" or current_number == "nan":
+            continue
+        if current_number in existing_numbers:
+            duplicate_count += 1
+            continue
+        new_records.append(row)
+        existing_numbers.add(current_number)
+
+    if new_records:
+        added_df = pd.DataFrame(new_records)
+        updated_master_df = added_df if master_df.empty else pd.concat([master_df, added_df], ignore_index=True)
+        updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
+        
+        for idx, row in added_df.iterrows():
+            title = str(row[title_col]).strip() if title_col and pd.notna(row[title_col]) else "정보없음"
+            abstract = str(row[abstract_col]).strip() if abstract_col and pd.notna(row[abstract_col]) else "정보없음"
+            claims = str(row[claims_col]).strip() if claims_col and pd.notna(row[claims_col]) else "정보없음"
+            
+            search_context = f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
+            doc_id = str(row[id_col]).replace("-", "").strip()
+            
+            patent_url = hyperlink_map.get(doc_id, "")
+            if patent_url == "" and title_col:
+                clean_title = str(row[title_col]).strip().replace("-", "")
+                patent_url = hyperlink_map.get(clean_title, "")
+
+            collection.add(
+                documents=[search_context],
+                metadatas=[{
+                    "출원번호": str(row[id_col]),
+                    "명칭": title,
+                    "출원일": str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
+                    "등록일": str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
+                    "IPC": str(row[ipc_col]) if ipc_col and pd.notna(row[ipc_col]) else "없음",
+                    "CPC": str(row[cpc_col]) if cpc_col and pd.notna(row[cpc_col]) else "없음",
+                    "발명자": str(row[inventor_col]) if inventor_col and pd.notna(row[inventor_col]) else "없음",
+                    "출원인": str(row[applicant_col]) if applicant_col and pd.notna(row[applicant_col]) else "없음",
+                    "URL": patent_url
+                }],
+                ids=[doc_id]
+            )
+        return len(new_records), duplicate_count
+    else:
+        return 0, duplicate_count
+
+
+# --- 3. 메인 어플리케이션 인터페이스 구동 런타임 ---
+def run_main_portal():
+    # 사용자가 인증을 마치는 순간 인프라 팩토리를 로드하여 첫 화면 지연 현상을 원천 차단
+    chroma_client, collection, llm = initialize_infra()
+
+    # 상단 인터페이스 배치 조정 (현재 로그인 세션 명시 및 로그아웃 버튼 배치)
+    col_title, col_logout = st.columns([8, 2])
+    with col_title:
+        st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 시스템 인프라 안정 구동 중")
+    with col_logout:
+        if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
             st.session_state.user_id = None
             st.rerun()
-            
-    st.markdown("---")
-    
-    # 사이드바 - 특허 데이터 업로드 및 인프라 설정 정보
-    with st.sidebar:
-        st.header("📂 특허 데이터 소스 관리")
-        uploaded_file = st.file_uploader("키프리스 특허 엑셀 파일 업로드 (.xlsx)", type=["xlsx"])
-        
-        st.markdown("---")
-        st.subheader("⚙️ 인프라 스택 명세")
-        st.markdown("""
-        - **LLM 엔진**: Groq Cloud Llama 3.3 (70B) [cite: 1, 6]
-        - **벡터 DB**: ChromaDB (영구 컨테이너 구조) [cite: 1]
-        - **임베딩**: ko-sroberta-multitask [cite: 1]
-        - **안정성**: Numpy < 2.0.0 충돌 패치 완료 
-        """)
 
-    # 메인 탭 구성 (독립 세션 메모리 보호 하에 작동) 
-    tab1, tab2 = st.tabs(["🔍 특허 지식 검색 (RAG)", "📊 데이터 현황 확인"])
-    
-    if uploaded_file is not None:
-        # 임시 파일 저장 후 openpyxl 및 pandas 파싱 [cite: 1, 7]
-        temp_path = os.path.join(BASE_DIR, "temp_patent.xlsx")
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-            
-        df, link_dict = extract_patent_with_links(temp_path)
+    with st.sidebar:
+        st.header("📂 데이터 관리 센터")
+        uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
+        if uploaded_file is not None:
+            if st.button("🚀 신규 특허 무결성 적재"):
+                with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
+                    added, dup = process_and_update_db(uploaded_file, collection)
+                    st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
+                    st.rerun()
+                    
+        st.divider()
+        st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
-        with tab2:
-            st.subheader("업로드된 특허 데이터프레임 구조")
-            st.dataframe(df.head(10))
-            
-        with tab1:
-            st.subheader("💡 연구원 맞춤형 특허 질의응답")
-            query = st.text_input("분석하고자 하는 특허 주제나 기술 키워드를 입력하세요:")
-            
-            if query:
-                with st.spinner("Groq 70B 초고속 연산 및 특허 원문 교차 검증 중..."): [cite: 1, 2, 6]
+        if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
+            try: chroma_client.delete_collection(name="competitor_patents")
+            except Exception: pass
+            if os.path.exists(MASTER_EXCEL_PATH): os.remove(MASTER_EXCEL_PATH)
+            st.warning("모든 데이터가 소거되었습니다.")
+            st.rerun()
+
+    st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
+    analysis_mode = st.selectbox(
+        "사용 목적에 맞는 전문가 관점을 선택해 주세요:",
+        [
+            "💡 단순 키워드 매칭 및 특허 검색",
+            "🔬 특정 기술 관련 심층 특허 분석",
+            "🛡️ 개발기술 침해 분석 & 진보성 회피 설계",
+            "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)"
+        ]
+    )
+
+    st.subheader("🔍 2단계: 검색 키워드 또는 질의 내용 입력")
+    placeholders = {
+        "💡 단순 키워드 매칭 및 특허 검색": "검색하고자 하는 핵심 키워드들을 입력하세요. (예: 카세트 도어 잠금장치)",
+        "🔬 특정 기술 관련 심층 특허 분석": "동향을 파악할 타겟 기술이나 모듈명을 입력하세요. (예: 센서 기반 매체 지폐 잼 장애 예측 알고리즘)",
+        "🛡️ 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
+        "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": "통계 요약을 보고 싶은 조건이나 '전체 통계 요약해줘'라고 입력하세요."
+    }
+    user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
+
+
+    # --- 4. 런타임 하이퍼링크 매칭 및 추론 구동 엔진 ---
+    if st.button("🧬 가상 전문가 엔진 구동"):
+        if user_query.strip() == "":
+            st.warning("분석 내용을 입력해 주세요.")
+        elif collection.count() == 0:
+            st.error("서버 DB에 적재된 특허 소스가 없습니다. 좌측 메뉴에서 엑셀을 먼저 등록해 주세요.")
+        else:
+            with st.spinner("가상 전문가가 실시간 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
+                n_results = 3
+                if "📊" in analysis_mode:
+                    n_results = min(collection.count(), 15)
+
+                results = collection.query(
+                    query_texts=[user_query.strip()],
+                    n_results=n_results
+                )
+                
+                if results and 'documents' in results and len(results['documents']) > 0 and len(results['documents'][0]) > 0:
+                    retrieved_docs = results['documents'][0]
+                    retrieved_metas = results['metadatas'][0]
+                    
+                    context_text = ""
+                    for i, doc in enumerate(retrieved_docs):
+                        m = retrieved_metas[i]
+                        app_num = m.get('출원번호', '번호없음')
+                        p_name = m.get('명칭', '제목없음')
+                        applicant = m.get('출원인', '미기재')
+                        inventor = m.get('발명자', '미기재')
+                        ipc = m.get('IPC', '없음')
+                        cpc = m.get('CPC', '없음')
+                        app_date = m.get('출원일', '없음')
+                        patent_url = m.get('URL', '')
+
+                        if patent_url and patent_url.startswith("http"):
+                            display_num = f"[{app_num}]({patent_url})"
+                            display_name = f"[{p_name}]({patent_url})"
+                        else:
+                            display_num = app_num
+                            display_name = p_name
+
+                        context_text += f"[특허 {i+1}] 번호: {display_num} | 명칭: {display_name} | 출원인: {applicant} | 발명자: {inventor} | IPC: {ipc} | CPC: {cpc} | 출원일: {app_date}\n{doc}\n\n"
+                    
+                    if "💡 단순 키워드" in analysis_mode:
+                        system_prompt = "당신은 신속하고 정확하게 관련 문헌을 찾아내는 '수석 특허 검색 조사관'입니다. 관련 특허를 마크다운 링크 서식과 함께 요약 브리핑하세요."
+                    elif "🔬 특정 기술" in analysis_mode:
+                        system_prompt = "당신은 수석 기술 전문 분석가입니다. 마크다운 링크를 포함한 기술 동향 보고서를 체계적으로 작성하세요."
+                    elif "🛡️ 개발기술 침해" in analysis_mode:
+                        system_prompt = "당신은 특허청 수석 심사관 및 특허법률 전문가 집단입니다. 관련 선행문헌들의 링크 주소를 명시하며 침해 가능성 및 회피설계 가이드를 작성하세요."
+                    else:
+                        system_prompt = "당신은 특허 데이터 통계 분석가입니다. 서지정보와 하이퍼링크 매칭 상태를 종합하여 다차원 통계 리포트를 작성하세요."
+
+                    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+                    {system_prompt} 답변 시 참고한 특허의 번호나 명칭을 언급할 때는 시스템이 매칭해 준 [번호](URL) 또는 [명칭](URL) 마크다운 형식을 그대로 유지하여 사용자가 클릭하면 링크로 이동할 수 있게 하세요.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+                    [참고 선행문헌 데이터]
+                    {context_text}
+
+                    [사용자 요청 내용]
+                    {user_query}
+
+                    보고서는 마크다운 양식을 사용하여 한국어로 논리정연하게 작성해 주세요.<|eot_id|><|start_header_id|>thought<|end_header_id|>
+                    Groq engine active. Generating analytical report...<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+                    """
+                    
                     try:
-                        # [지연 로딩 적용]: 사용자가 실제 쿼리를 날려 연산이 필요할 때 모델 로드 
-                        embeddings = get_embedding_model() [cite: 9]
-                        
-                        # ChromaDB persistent client 연동 [cite: 1]
-                        # 실제 고도화 환경에서는 업로드된 df 기반으로 벡터화 및 메타데이터 주입 단계를 거침
-                        # 여기서는 구조적 무결성을 위해 변수 바인딩 형태만 구현
-                        db = Chroma(persist_directory=DB_DIR, embedding_function=embeddings) [cite: 1, 3]
-                        
-                        # Groq API 기반 Meta Llama 3.3 (70B) 연결 (Temperature=0.1 고정) [cite: 1, 6]
-                        llm = ChatGroq(
-                            temperature=0.1, [cite: 1]
-                            model_name="llama-3.3-70b-versatile", [cite: 6]
-                            groq_api_key=st.secrets.get("GROQ_API_KEY", "MOCK_KEY")
-                        )
-                        
-                        # QA 체인 생성 및 실행
-                        qa_chain = RetrievalQA.from_chain_type(
-                            llm=llm,
-                            chain_type="stuff",
-                            retriever=db.as_retriever(search_kwargs={"k": 3})
-                        )
-                        
-                        response = qa_chain.run(query)
-                        
-                        # 후처리: AI 답변 내의 특허번호나 출원명을 파란색 링크 텍스트로 치환 [cite: 8]
-                        # openpyxl로 수집해둔 원문 하이퍼링크 주소 매칭 기법 반영 
-                        refined_response = response
-                        for text, url in link_dict.items():
-                            if text in refined_response and f"[{text}]" not in refined_response:
-                                refined_response = refined_response.replace(text, f"[{text}]({url})") [cite: 8]
-                                
-                        st.markdown("### 📋 AI 분석 리포트")
-                        st.markdown(refined_response) [cite: 8]
-                        
+                        response = llm.invoke(prompt)
+                        st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
+                        st.write(response.content) 
+                        st.divider()
+                        with st.expander("👁️ 로컬 가상 서버가 실시간 스크리닝한 마스터 데이터 매칭 정보 (클릭 시 원문 이동 가능)"):
+                            st.markdown(context_text) 
                     except Exception as e:
-                        st.error(f"RAG 추론 중 에러가 발생했습니다: {str(e)}")
-    else:
-        with tab1:
-            st.info("👈 사이드바에서 키프리스 특허 엑셀 파일을 먼저 업로드해 주세요.")
+                        st.error(f"서버 연산 보호 오류: {e}")
+                else:
+                    st.error("데이터 매칭 실패")
 
 # ==========================================
-# 5. 애플리케이션 진입점 (Entry Point)
+# 5. 애플리케이션 진입 제어 (Entry Point)
 # ==========================================
 if __name__ == "__main__":
-    # 1. 사내 연구원 인터페이스 인증 절차 수행 
+    # 1단계: 사내 연구원 로그인 인증 검사
     if check_authentication():
-        # 2. 인증 통과 시에만 메인 포털 구동 (이때까지 대형 임베딩 모델 로딩은 보류됨 -> 1초 미만 진입) 
-        main_portal()
+        # 2단계: 인증 통과 시에만 메인 시스템 런타임 가동
+        run_main_portal()
