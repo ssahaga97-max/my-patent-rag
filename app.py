@@ -5,7 +5,10 @@ import chromadb
 from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
 import openpyxl 
-import subprocess
+import json
+import base64
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 # ==========================================
 # 0. 독립 세션 상태 제어 및 초기화
@@ -16,7 +19,6 @@ if "user_id" not in st.session_state:
     st.session_state.user_id = None
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
-# Streamlit Cloud 배포 표준 경로(/mount/src/my-patent-rag) 자동 매핑 구조
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
@@ -27,60 +29,86 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 
 
 # ==========================================
-# [완벽 피드백 패치] 깃허브 강제 동기화 엔진
+# [인프라 버그 완전 타파] GitHub REST API 다이렉트 백업 엔진
 # ==========================================
-def commit_and_push_data():
+def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    [Shallow Clone 완벽 격파] Streamlit Cloud의 depth=1 제한을 풀고
-    깃허브 원격지와 족보(History)를 맞추어 강제 백업을 안착시키는 함수
+    Git 명령어를 쓰지 않고 GitHub REST API를 통해 
+    Private 저장소에 가상 백업 파일을 다이렉트로 업로드하는 함수
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
-        return
+        return False
         
     token = st.secrets["GITHUB_TOKEN"]
-    repo_url = st.secrets["GITHUB_REPO_URL"]
-    authenticated_url = f"https://{token}@{repo_url}"
+    # 깃허브 URL에서 'github.com/' 뒷부분 주소 추출 (예: ssahaga97-max/my-patent-rag)
+    raw_url = st.secrets["GITHUB_REPO_URL"].replace(".git", "")
+    repo_path = raw_url.split("github.com/")[-1]
+    
+    if not os.path.exists(local_file_path):
+        return False
+
+    # 파일 바이너리 로드 및 Base64 인코딩
+    with open(local_file_path, "rb") as f:
+        content = base64.b64encode(f.read()).decode("utf-8")
+        
+    api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
+    
+    # 기존 파일이 있는지 확인하여 SHA 값 받아오기 (덮어쓰기 필수 과정)
+    sha = None
+    req_get = Request(api_url, headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"})
+    try:
+        with urlopen(req_get) as response:
+            res_data = json.loads(response.read().decode())
+            sha = res_data.get("sha")
+    except HTTPError as e:
+        if e.code != 404: # 404는 파일이 없는 것이므로 새로 만들면 됨
+            print(f"SHA 획득 실패: {e.read().decode()}")
+
+    # API 업로드 데이터 페이로드 작성
+    payload = {
+        "message": f"🔄 [Automated API Backup] {github_target_path} Sync",
+        "content": content,
+        "branch": "main"
+    }
+    if sha:
+        payload["sha"] = sha
+        
+    req_put = Request(
+        api_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"token {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github.v3+json"
+        },
+        method="PUT"
+    )
     
     try:
-        # 1. 가상 컨테이너 보안 해제 및 환경 설정
-        subprocess.run(["git", "config", "--global", "--add", "safe.directory", BASE_DIR], check=True)
-        subprocess.run(["git", "config", "--global", "user.email", "patent-bot@streamlit.com"], check=True)
-        subprocess.run(["git", "config", "--global", "user.name", "PatentRAG-Bot"], check=True)
-        subprocess.run(["git", "config", "--global", "http.postBuffer", "524288000"], check=True)
-        
-        # 원격 주소 강제 업데이트
-        subprocess.run(["git", "remote", "set-url", "origin", authenticated_url], cwd=BASE_DIR, check=False)
-        
-        # 2. [★치명적 버그 해결 핵심★] Shallow 히스토리를 정식 족보로 복원하기
-        # 이미 완료된 상태면 에러가 날 수 있으므로 check=False 처리합니다.
-        subprocess.run(["git", "fetch", "--unshallow", "origin"], cwd=BASE_DIR, capture_output=True)
-        
-        # 혹시 모르니 원격 main 브랜치의 최신 상태와 싱크 맞추기
-        subprocess.run(["git", "checkout", "main"], cwd=BASE_DIR, capture_output=True)
-        subprocess.run(["git", "pull", "origin", "main"], cwd=BASE_DIR, capture_output=True)
-        
-        # 3. 데이터 폴더 추적 등록
-        subprocess.run(["git", "add", "my_patent_vector_db/", "my_patent_folder/"], cwd=BASE_DIR, check=True)
-        
-        # 변경 내역 확인
-        status = subprocess.run(["git", "status", "--porcelain"], cwd=BASE_DIR, capture_output=True, text=True)
-        
-        if status.stdout.strip():
-            # 4. 커밋 및 원격지 main으로 안전하게 푸시
-            subprocess.run(["git", "commit", "-m", "🔄 [Automated Backup] Patent DB updated by Researcher"], cwd=BASE_DIR, check=True)
-            result = subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                st.toast("💾 사내 데이터 가상 웨어하우스(GitHub)에 영구 백업 완료!")
-            else:
-                # 만약 또 꼬이면 최종 수단으로 강제 덮어쓰기 실행
-                subprocess.run(["git", "push", "origin", "main", "--force"], cwd=BASE_DIR, capture_output=True)
-                st.toast("💾 사내 데이터 가상 웨어하우스(GitHub)에 강제 동기화 완료!")
-        else:
-            print("변동 내역 없음 - 스킵")
-            
+        with urlopen(req_put) as response:
+            if response.status in [200, 201]:
+                return True
     except Exception as e:
-        st.error(f"⚠️ 자동 백업 프로세스 내부 런타임 예외 발생: {str(e)}")
+        print(f"API 전송 오류: {str(e)}")
+    return False
+
+def commit_and_push_data():
+    """
+    Watcher 오류 및 Shallow Clone을 원천 우회하여
+    마스터 엑셀 및 핵심 DB 상태를 GitHub API 레이어로 동기화
+    """
+    with st.spinner("💾 가상 웨어하우스(GitHub API)에 안전하게 데이터 동기화 중..."):
+        # 1. 마스터 엑셀 파일 동기화
+        excel_success = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
+        
+        # 2. ChromaDB 백업 파일 동기화 (가장 중요한 sqlite 파일 타겟팅)
+        chroma_sqlite_path = os.path.join(DB_PATH, "chroma.sqlite3")
+        db_success = upload_file_to_github_api(chroma_sqlite_path, "my_patent_vector_db/chroma.sqlite3")
+        
+        if excel_success or db_success:
+            st.toast("💾 사내 데이터 가상 웨어하우스(GitHub API)에 영구 백업 완료!")
+        else:
+            print("API 동기화 보류 또는 설정 미흡")
 
 
 # ==========================================
@@ -273,7 +301,7 @@ def run_main_portal():
             if st.button("🚀 신규 특허 무결성 적재"):
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
-                    # 데이터 변동과 상관없이 강제 업로드 신호를 트리거하여 깃허브 무결성을 연동
+                    # API 기반의 백업 함수 트리거
                     commit_and_push_data()
                     st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
                     st.rerun()
