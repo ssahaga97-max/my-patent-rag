@@ -556,7 +556,7 @@ def run_main_portal():
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
-        st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
+        st.title("🏛 경쟁사 특허 분석 AI")
         mode_label = "🔧 관리자" if is_admin else "👤 사용자"
         st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | 적재 특허: {collection.count()}건")
     with col_logout:
