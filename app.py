@@ -133,52 +133,47 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [충돌 해제] 무결성 싱글톤 인프라 팩토리
+# 2. [프로세스 레벨 싱글톤] @st.cache_resource 기반 인프라 팩토리
 # ==========================================
+@st.cache_resource
+def _build_infra():
+    """
+    @st.cache_resource: 프로세스당 단 한 번만 실행되어 동일 인스턴스를 모든 세션·리런에서 재사용.
+    PersistentClient를 중복 생성하려 할 때 발생하는
+    'An instance of Chroma already exists' ValueError를 구조적으로 원천 차단.
+    """
+    # ChromaDB 클라이언트 — 실패 시 디렉토리 정화 후 재시도
+    try:
+        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+    except Exception:
+        if os.path.exists(DB_PATH):
+            shutil.rmtree(DB_PATH)
+        os.makedirs(DB_PATH, exist_ok=True)
+        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+
+    # Ko-SRoBERTa 임베딩 함수 및 컬렉션
+    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="jhgan/ko-sroberta-multitask"
+    )
+    collection = chroma_client.get_or_create_collection(
+        name="competitor_patents",
+        embedding_function=sentence_transformer_ef
+    )
+
+    # Groq Cloud API 기반 Llama 3.3 엔진
+    GROQ_API_KEY = "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"
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        groq_api_key=GROQ_API_KEY,
+        temperature=0.1
+    )
+
+    return chroma_client, collection, llm
+
+
 def load_permanent_infra_singleton():
-    """
-    [커서 진단 반영 완결]
-    Settings에서 중복되는 영속성 파라미터를 완전히 거세하여 SQLite 스키마 충돌을 원천 차단하고,
-    수천 건의 시맨틱 특허 RAG 시스템의 본질인 임베딩 및 클라이언트 자원을 정상 확보합니다.
-    """
-    if "infra_loaded" not in st.session_state:
-        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
-            
-            # [단계 1] Ko-SRoBERTa 고정밀 의미론적 임베딩 함수 선언
-            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="jhgan/ko-sroberta-multitask"
-            )
-
-            # [단계 2] Settings 없이 PersistentClient 직접 호출 (버전 충돌 원천 차단)
-            try:
-                chroma_client = chromadb.PersistentClient(path=DB_PATH)
-            except Exception:
-                # SQLite 스키마 손상 시 디렉토리 완전 정화 후 재생성
-                if os.path.exists(DB_PATH):
-                    shutil.rmtree(DB_PATH)
-                os.makedirs(DB_PATH, exist_ok=True)
-                chroma_client = chromadb.PersistentClient(path=DB_PATH)
-            
-            # [단계 3] 깨끗하게 초기화된 스키마 위에 시맨틱 RAG 특허 컬렉션 안전 결합
-            collection = chroma_client.get_or_create_collection(
-                name="competitor_patents", 
-                embedding_function=sentence_transformer_ef
-            )
-
-            # [단계 4] Groq Cloud API 기반 Llama 3.3 엔진 결합
-            GROQ_API_KEY = "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"
-            llm = ChatGroq(
-                model="llama-3.3-70b-versatile", 
-                groq_api_key=GROQ_API_KEY,
-                temperature=0.1 
-            )
-            
-            st.session_state.chroma_client = chroma_client
-            st.session_state.collection = collection
-            st.session_state.llm = llm
-            st.session_state.infra_loaded = True
-
-    return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
+    with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
+        return _build_infra()
 
 
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
@@ -325,23 +320,17 @@ def run_main_portal():
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
             with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 완전 초기화 중..."):
                 try:
-                    if os.path.exists(MASTER_EXCEL_PATH): 
+                    if os.path.exists(MASTER_EXCEL_PATH):
                         os.remove(MASTER_EXCEL_PATH)
-                    
-                    try:
-                        chroma_client.reset()
-                    except Exception:
-                        if os.path.exists(DB_PATH):
-                            shutil.rmtree(DB_PATH)
-                            os.makedirs(DB_PATH, exist_ok=True)
-                    
-                    if "infra_loaded" in st.session_state:
-                        del st.session_state["infra_loaded"]
-                    if "chroma_client" in st.session_state:
-                        del st.session_state["chroma_client"]
-                    if "collection" in st.session_state:
-                        del st.session_state["collection"]
-                        
+
+                    # 물리 DB 디렉토리 정화
+                    if os.path.exists(DB_PATH):
+                        shutil.rmtree(DB_PATH)
+                    os.makedirs(DB_PATH, exist_ok=True)
+
+                    # @st.cache_resource 캐시 파기 → 다음 호출 시 새 인스턴스로 재초기화
+                    _build_infra.clear()
+
                     commit_and_push_data()
                     st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
                     st.rerun()
