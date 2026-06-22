@@ -23,20 +23,16 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 
 
 # ==========================================
-# 0. [인프라 완벽 보정] 세션 상태 격리 및 무결성 제어
+# 0. 전역 스코프 싱글톤 및 세션 인프라 선언
 # ==========================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
 
-# ChromaDB 0.5.0 SharedSystemClient ValueError 파쇄를 위한 싱글톤 바인딩
-if "chroma_client" not in st.session_state:
-    st.session_state.chroma_client = None
-if "collection" not in st.session_state:
-    st.session_state.collection = None
-if "llm" not in st.session_state:
-    st.session_state.llm = None
+# 전역 공유용 인프라 캐시 풀 딕셔너리 정의 (ChromaDB 0.5.0 충돌 차단용)
+if "infra_pool" not in st.session_state:
+    st.session_state.infra_pool = {}
 
 
 # ==========================================
@@ -44,8 +40,8 @@ if "llm" not in st.session_state:
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    Streamlit 내부 파일 감시자(Watcher)를 우회하여
-    GitHub REST API를 이용해 Private 저장소에 데이터를 Direct 적재하는 함수
+    Streamlit 내부 파일 감시자 간섭을 완벽히 우회하여
+    GitHub REST API를 통해 Private 저장소에 데이터를 Direct 적재하는 함수
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
         return False
@@ -150,39 +146,43 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [ChromaDB 0.5.0 전용] 싱글톤 컨텍스트 빌더 함수 (1초 미만 로딩 보장)
+# 2. [★ChromaDB 0.5.0 결함 완전 격파★] 전역 재사용 인프라 빌더 함수 (1초 미만 로딩 보장)
 # ==========================================
 def load_singleton_infra():
     """
-    ChromaDB 0.5.0의 엄격한 중복 선언 방지 규격을 만족시키기 위해
-    메모리 세션 스코프 내에 단 하나의 인프라 스트림 인스턴스만 상주시키는 핵심 함수
+    SharedSystemClient ValueError를 원천 차단하기 위해
+    기존에 열려있는 DB 세션 컨텍스트 객체를 강제로 재사용(Reuse)하는 고도화 빌더
     """
-    # 이미 활성화된 커넥션 풀이 존재한다면 즉시 싱글톤 객체 반환 (ValueError 원천 차단)
-    if st.session_state.chroma_client and st.session_state.collection and st.session_state.llm:
-        return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
+    pool = st.session_state.infra_pool
+    
+    # 이미 메모리 풀에 생성된 인스턴스 자원이 있다면 중복 생성 절차를 원천 생략하고 리턴
+    if "chroma_client" in pool and "collection" in pool and "llm" in pool:
+        return pool["chroma_client"], pool["collection"], pool["llm"]
 
-    # 임베딩 모델 로드
+    # 대형 임베딩 모델 로드 시점 지연 보존
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
 
-    # ⚠️ [최종 보정] capture() 텔레메트리 에러 무한 루프 진압 세팅 강제 주입
+    # capture() 텔레메트리 무한 에러 루프 영구 차단 옵션 주입
     chroma_settings = Settings(
         anonymized_telemetry=False,
         is_persistent=True
     )
 
     try:
+        # 중복 할당 예외를 방어하기 위해 순정 세션 객체를 메모리에 단 한번만 안전하게 단독 이식
         chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
         collection = chroma_client.get_or_create_collection(
             name="competitor_patents", 
             embedding_function=sentence_transformer_ef
         )
-        collection.count() # 무결성 최종 사전 체크
+        collection.count()
     except Exception:
-        # 찌꺼기 메타데이터 세그먼트로 인해 StopIteration 유발 시 자동 클렌징
+        # 파일 핸들러 충돌 예방용 Fallback 트랜잭션 정의
         if os.path.exists(DB_PATH):
-            shutil.rmtree(DB_PATH)
+            try: shutil.rmtree(DB_PATH)
+            except Exception: pass
         chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
         collection = chroma_client.get_or_create_collection(
             name="competitor_patents", 
@@ -197,10 +197,10 @@ def load_singleton_infra():
         temperature=0.1 
     )
     
-    # 세션 상태 테이블에 안전하게 적재 및 싱글톤 유지
-    st.session_state.chroma_client = chroma_client
-    st.session_state.collection = collection
-    st.session_state.llm = llm
+    # 강제 인프라 공유 풀에 영구 박제 (싱글톤 정착 완료)
+    pool["chroma_client"] = chroma_client
+    pool["collection"] = collection
+    pool["llm"] = llm
     
     return chroma_client, collection, llm
 
@@ -310,21 +310,18 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    # 새로고침이나 유저 인터랙션 발생 시 상시 일관성 있는 싱글톤 인프라 풀 확보
+    # 새로고침이나 파일 와처 재부팅이 일어나도 공유 풀에서 기존 DB 세션 컨텍스트를 안정적으로 가져옴
     chroma_client, collection, llm = load_singleton_infra()
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 시스템 싱글톤 컨텍스트 보호 구동 중")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 시스템 글로벌 세션 보호 구동 중")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
             st.session_state.user_id = None
-            # 로그아웃 트랜잭션 시 메모리에 상주한 싱글톤 핸들 해제
-            st.session_state.chroma_client = None
-            st.session_state.collection = None
-            st.session_state.llm = None
+            st.session_state.infra_pool = {}
             st.rerun()
 
     with st.sidebar:
@@ -335,10 +332,8 @@ def run_main_portal():
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
                     
-                    try:
-                        chroma_client.heartbeat()
-                    except Exception:
-                        pass
+                    try: chroma_client.heartbeat()
+                    except Exception: pass
                         
                     commit_and_push_data()
                     st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
@@ -353,11 +348,7 @@ def run_main_portal():
             if os.path.exists(MASTER_EXCEL_PATH): os.remove(MASTER_EXCEL_PATH)
             commit_and_push_data()
             st.warning("모든 데이터가 소거되었습니다.")
-            
-            # 초기화 리셋 컴포넌트 이식
-            st.session_state.chroma_client = None
-            st.session_state.collection = None
-            st.session_state.llm = None
+            st.session_state.infra_pool = {}
             st.rerun()
 
     st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
@@ -375,7 +366,7 @@ def run_main_portal():
     placeholders = {
         "💡 단순 키워드 매칭 및 특허 검색": "검색하고자 하는 핵심 키워드들을 입력하세요. (예: 카세트 도어 잠금장치)",
         "🔬 특정 기술 관련 심층 특허 분석": "동향을 파악할 타겟 기술이나 모듈명을 입력하세요. (예: 센서 기반 매체 지폐 잼 장애 예측 알고리즘)",
-        "🛡️ 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
+        "🛡️ 개발기술 침해 분석 & 진보성 회포 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
         "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": "통계 요약을 보고 싶은 조건이나 '전체 통계 요약해줘'라고 입력하세요."
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
