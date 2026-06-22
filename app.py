@@ -286,7 +286,7 @@ def check_authentication():
     if not os.path.exists(USER_REGISTRY_PATH):
         download_user_registry_from_github()
 
-    st.title("🏛 경쟁사 특허 조사 분석 AI")
+    st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
     tab_login, tab_register = st.tabs(["🔑 로그인", "📝 신규 회원 가입"])
 
     # ── 로그인 탭 ──
@@ -309,7 +309,10 @@ def check_authentication():
                 st.rerun()
             # 일반 사용자 확인 (레지스트리 해시 비교)
             elif username in registry:
-                if registry[username].get("password_hash") == _hash_pw(password):
+                user_rec = registry[username]
+                if not user_rec.get("active", True):
+                    st.error("⛔ 비활성화된 계정입니다. 관리자에게 문의하세요.")
+                elif user_rec.get("password_hash") == _hash_pw(password):
                     st.session_state.logged_in = True
                     st.session_state.user_id   = username
                     st.session_state.is_admin  = False
@@ -359,6 +362,7 @@ def check_authentication():
                     "department":    r_dept,
                     "password_hash": _hash_pw(r_pw),
                     "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "active":        True,
                 }
                 registry[r_id] = user_info
                 save_user_registry(registry)
@@ -556,7 +560,7 @@ def run_main_portal():
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
-        st.title("🏛 경쟁사 특허 분석 AI")
+        st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
         mode_label = "🔧 관리자" if is_admin else "👤 사용자"
         st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | 적재 특허: {collection.count()}건")
     with col_logout:
@@ -602,15 +606,42 @@ def run_main_portal():
             st.divider()
             st.subheader("👥 가입 회원 현황")
             registry = load_user_registry()
-            if registry:
-                for uid, info in registry.items():
-                    st.caption(f"• {uid} ({info.get('name','')}) — {info.get('department','')}")
-            else:
+            if not registry:
                 st.caption("등록된 일반 회원 없음")
+            else:
+                # 변경 상태를 session_state에 누적 후 한 번에 저장
+                if "registry_dirty" not in st.session_state:
+                    st.session_state.registry_dirty = False
+
+                updated_registry = dict(registry)
+                for uid, info in registry.items():
+                    is_active   = info.get("active", True)
+                    status_icon = "🟢" if is_active else "🔴"
+                    btn_label   = "비활성화" if is_active else "활성화"
+                    btn_type    = "secondary" if is_active else "primary"
+
+                    col_info, col_btn = st.columns([3, 1])
+                    with col_info:
+                        st.markdown(
+                            f"{status_icon} **{uid}**  \n"
+                            f"<span style='font-size:12px;color:gray'>"
+                            f"{info.get('name','')} · {info.get('department','부서없음')} · "
+                            f"{info.get('registered_at','')[:10]}</span>",
+                            unsafe_allow_html=True,
+                        )
+                    with col_btn:
+                        if st.button(btn_label, key=f"toggle_{uid}", type=btn_type):
+                            updated_registry[uid]["active"] = not is_active
+                            save_user_registry(updated_registry)
+                            upload_user_registry_to_github()
+                            action = "활성화" if not is_active else "비활성화"
+                            st.toast(f"✅ {uid} 계정을 {action}했습니다.")
+                            st.rerun()
+                    st.divider()
         else:
             st.caption("분석 기능 전용 접속 모드입니다.")
 
-    st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문가 선택")
+    st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
     analysis_mode = st.selectbox(
         "사용 목적에 맞는 전문가 관점을 선택해 주세요:",
         [
