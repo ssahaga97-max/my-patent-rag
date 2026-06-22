@@ -4,17 +4,22 @@ import os
 import chromadb
 from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
-import openpyxl 
+import openpyxl
 import json
 import base64
 import shutil
+import hashlib
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
-# /tmp 경로 사용: Streamlit Cloud에서 항상 쓰기 가능하며 git에 커밋된 구버전 SQLite 파일 충돌 원천 차단
+MASTER_EXCEL_PATH    = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
+USER_REGISTRY_PATH   = os.path.join(BASE_DIR, "my_patent_folder", "user_registry.json")
 DB_PATH = "/tmp/my_patent_vector_db"
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
@@ -30,6 +35,8 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
 
 
 # ==========================================
@@ -119,6 +126,107 @@ def commit_and_push_data():
         st.toast("⚠️ GitHub 동기화 실패 — Secrets에서 GITHUB_TOKEN을 TOML 최상위(섹션 헤더 위)에 배치했는지 확인하세요.")
 
 
+# ==========================================
+# [회원 관리] 사용자 레지스트리 엔진
+# ==========================================
+def _hash_pw(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def load_user_registry() -> dict:
+    if os.path.exists(USER_REGISTRY_PATH):
+        try:
+            with open(USER_REGISTRY_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_user_registry(registry: dict):
+    os.makedirs(os.path.dirname(USER_REGISTRY_PATH), exist_ok=True)
+    with open(USER_REGISTRY_PATH, "w", encoding="utf-8") as f:
+        json.dump(registry, f, ensure_ascii=False, indent=2)
+
+
+def download_user_registry_from_github() -> bool:
+    token, repo_url = _get_github_secrets()
+    if not token:
+        return False
+    try:
+        raw_url   = repo_url.replace(".git", "")
+        repo_path = raw_url.split("github.com/")[-1]
+        api_url   = f"https://api.github.com/repos/{repo_path}/contents/my_patent_folder/user_registry.json"
+        req = Request(api_url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("content"):
+            raw = base64.b64decode(data["content"])
+        elif data.get("download_url"):
+            with urlopen(Request(data["download_url"], headers={"Authorization": f"Bearer {token}"})) as r:
+                raw = r.read()
+        else:
+            return False
+        os.makedirs(os.path.dirname(USER_REGISTRY_PATH), exist_ok=True)
+        with open(USER_REGISTRY_PATH, "wb") as f:
+            f.write(raw)
+        return True
+    except Exception as e:
+        print(f"사용자 레지스트리 복원 실패: {e}")
+        return False
+
+
+def upload_user_registry_to_github() -> bool:
+    return upload_file_to_github_api(USER_REGISTRY_PATH, "my_patent_folder/user_registry.json")
+
+
+# ==========================================
+# [관리자 알림] 가입 이메일 발송 엔진
+# ==========================================
+def send_admin_signup_email(user_info: dict) -> bool:
+    """
+    신규 회원 가입 시 관리자 이메일로 알림 발송.
+    Streamlit Secrets에 SMTP_EMAIL, SMTP_PASSWORD, ADMIN_EMAIL 설정 필요.
+    Gmail 사용 시 앱 비밀번호(App Password) 사용 권장.
+    """
+    try:
+        smtp_email    = st.secrets.get("SMTP_EMAIL", "")
+        smtp_password = st.secrets.get("SMTP_PASSWORD", "")
+        admin_email   = st.secrets.get("ADMIN_EMAIL", "")
+        if not smtp_email or not smtp_password or not admin_email:
+            return False
+
+        msg = MIMEMultipart("alternative")
+        msg["From"]    = smtp_email
+        msg["To"]      = admin_email
+        msg["Subject"] = f"[PatentRAG] 신규 연구원 가입 알림 — {user_info['username']}"
+
+        html_body = f"""
+<html><body style="font-family:sans-serif;">
+<h2>🔔 PatentRAG 포털 신규 회원 가입 알림</h2>
+<table border="1" cellpadding="10" style="border-collapse:collapse;min-width:400px;">
+  <tr style="background:#f0f4ff;"><td><b>사용자 ID</b></td><td>{user_info['username']}</td></tr>
+  <tr><td><b>이름</b></td><td>{user_info.get('name','')}</td></tr>
+  <tr style="background:#f0f4ff;"><td><b>이메일</b></td><td>{user_info.get('email','')}</td></tr>
+  <tr><td><b>부서</b></td><td>{user_info.get('department','미입력')}</td></tr>
+  <tr style="background:#f0f4ff;"><td><b>가입 일시</b></td><td>{user_info.get('registered_at','')}</td></tr>
+</table>
+<p style="color:#888;font-size:12px;">본 메일은 PatentRAG 시스템이 자동 발송한 알림입니다.</p>
+</body></html>"""
+
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"관리자 이메일 발송 실패: {e}")
+        return False
+
+
 def download_master_excel_from_github():
     """
     컨테이너 재시작으로 로컬 파일이 소실된 경우 GitHub에서 마스터 엑셀을 내려받아 복원.
@@ -161,33 +269,112 @@ def download_master_excel_from_github():
 
 
 # ==========================================
-# 1. 사내 연구원용 로그인 인터페이스
+# 1. 인증 시스템 — 관리자/사용자 이원화
 # ==========================================
-def check_authentication():
-    if "USER_CREDENTIALS" not in st.secrets:
-        st.error("⛔ Streamlit Secrets에 [USER_CREDENTIALS] 섹션이 설정되어 있지 않습니다. 관리자에게 문의하세요.")
-        st.stop()
-    user_credentials = st.secrets["USER_CREDENTIALS"]
+def _get_admin_credentials() -> dict:
+    """Streamlit Secrets의 [USER_CREDENTIALS] 에서 관리자 자격증명 반환."""
+    if "USER_CREDENTIALS" in st.secrets:
+        return dict(st.secrets["USER_CREDENTIALS"])
+    return {}
 
-    if not st.session_state.logged_in:
-        st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
-        st.subheader("🔑 사내 연구원 로그인 인증")
-        
+
+def check_authentication():
+    if st.session_state.logged_in:
+        return True
+
+    # 앱 시작 시 사용자 레지스트리가 없으면 GitHub에서 복원
+    if not os.path.exists(USER_REGISTRY_PATH):
+        download_user_registry_from_github()
+
+    st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
+    tab_login, tab_register = st.tabs(["🔑 로그인", "📝 신규 회원 가입"])
+
+    # ── 로그인 탭 ──
+    with tab_login:
+        st.subheader("사내 연구원 로그인")
         with st.form("login_form"):
-            username = st.text_input("사내 계정 ID", key="input_user")
-            password = st.text_input("비밀번호", type="password", key="input_pass")
-            submit_button = st.form_submit_button("인트라넷 접속")
-            
-            if submit_button:
-                if username in user_credentials and user_credentials[username] == password:
+            username = st.text_input("계정 ID", key="login_id")
+            password = st.text_input("비밀번호", type="password", key="login_pw")
+            submitted = st.form_submit_button("접속")
+
+        if submitted:
+            admin_creds = _get_admin_credentials()
+            registry    = load_user_registry()
+
+            # 관리자 계정 확인 (Secrets 기반 평문 비교)
+            if username in admin_creds and admin_creds[username] == password:
+                st.session_state.logged_in = True
+                st.session_state.user_id   = username
+                st.session_state.is_admin  = True
+                st.rerun()
+            # 일반 사용자 확인 (레지스트리 해시 비교)
+            elif username in registry:
+                if registry[username].get("password_hash") == _hash_pw(password):
                     st.session_state.logged_in = True
-                    st.session_state.user_id = username
-                    st.success(f"🔓 {username} 연구원님 인증 성공")
+                    st.session_state.user_id   = username
+                    st.session_state.is_admin  = False
                     st.rerun()
                 else:
-                    st.error("❌ ID 또는 비밀번호가 올바르지 않습니다.")
-        return False
-    return True
+                    st.error("❌ 비밀번호가 올바르지 않습니다.")
+            else:
+                st.error("❌ 등록되지 않은 계정입니다. '신규 회원 가입' 탭을 이용해 주세요.")
+
+    # ── 회원가입 탭 ──
+    with tab_register:
+        st.subheader("신규 연구원 계정 등록")
+        st.caption("가입 완료 시 관리자에게 이메일로 자동 통보됩니다.")
+        with st.form("register_form"):
+            r_id   = st.text_input("사용자 ID (영문·숫자, 4자 이상)")
+            r_name = st.text_input("이름 *")
+            r_email= st.text_input("이메일 *")
+            r_dept = st.text_input("부서 (선택)")
+            r_pw   = st.text_input("비밀번호 (6자 이상)", type="password")
+            r_pw2  = st.text_input("비밀번호 확인", type="password")
+            reg_submitted = st.form_submit_button("가입 신청")
+
+        if reg_submitted:
+            admin_creds = _get_admin_credentials()
+            registry    = load_user_registry()
+            errors = []
+
+            if len(r_id) < 4:
+                errors.append("ID는 4자 이상이어야 합니다.")
+            if r_id in admin_creds or r_id in registry:
+                errors.append("이미 사용 중인 ID입니다.")
+            if not r_name or not r_email:
+                errors.append("이름과 이메일은 필수 항목입니다.")
+            if len(r_pw) < 6:
+                errors.append("비밀번호는 6자 이상이어야 합니다.")
+            if r_pw != r_pw2:
+                errors.append("비밀번호가 일치하지 않습니다.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                user_info = {
+                    "username":      r_id,
+                    "name":          r_name,
+                    "email":         r_email,
+                    "department":    r_dept,
+                    "password_hash": _hash_pw(r_pw),
+                    "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                registry[r_id] = user_info
+                save_user_registry(registry)
+
+                with st.spinner("💾 계정 정보를 저장하는 중..."):
+                    upload_user_registry_to_github()
+
+                email_ok = send_admin_signup_email(user_info)
+
+                st.success(f"✅ '{r_id}' 계정 가입이 완료되었습니다! 로그인 탭에서 접속해 주세요.")
+                if email_ok:
+                    st.info("📧 관리자에게 가입 알림 이메일이 발송되었습니다.")
+                else:
+                    st.caption("(이메일 발송 미설정 — Secrets에 SMTP_EMAIL / SMTP_PASSWORD / ADMIN_EMAIL 추가 시 활성화)")
+
+    return False
 
 
 # ==========================================
@@ -365,54 +552,63 @@ def run_main_portal():
         except Exception as e:
             st.warning(f"자동 재인덱싱 중 오류 발생: {e}")
 
+    is_admin = st.session_state.get("is_admin", False)
+
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 크로마 벡터 커널 기반 정밀 RAG 인프라 가동 중 (안정성 100%)")
+        mode_label = "🔧 관리자" if is_admin else "👤 사용자"
+        st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | 적재 특허: {collection.count()}건")
     with col_logout:
         if st.button("🔒 로그아웃"):
-            st.session_state.logged_in = False
-            st.session_state.user_id = None
+            st.session_state.logged_in   = False
+            st.session_state.user_id     = None
+            st.session_state.is_admin    = False
             st.rerun()
 
+    # ── 사이드바: 관리자 전용 데이터 관리 센터 ──
     with st.sidebar:
-        st.header("📂 데이터 관리 센터")
-        uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
-        if uploaded_file is not None:
-            if st.button("🚀 신규 특허 무결성 적재"):
-                with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
-                    added, dup = process_and_update_db(uploaded_file, collection)
-                with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중..."):
-                    commit_and_push_data()
-                st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건) — GitHub 백업 완료")
-                st.rerun()
-                    
-        st.divider()
-        st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
-        
-        if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-            with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
-                try:
-                    # 마스터 엑셀 삭제
-                    if os.path.exists(MASTER_EXCEL_PATH):
-                        os.remove(MASTER_EXCEL_PATH)
-
-                    # 물리 DB 디렉토리 정화
-                    if os.path.exists(DB_PATH):
-                        shutil.rmtree(DB_PATH)
-                    os.makedirs(DB_PATH, exist_ok=True)
-
-                    # 캐시·세션 파기 → 다음 호출 시 새 인스턴스로 재초기화
-                    _build_infra.clear()
-                    if "infra_initialized" in st.session_state:
-                        del st.session_state["infra_initialized"]
-
-                    # 삭제 완료 후 GitHub에는 빈 상태를 알리지 않음
-                    # (엑셀이 없으면 업로드할 파일 없으므로 commit 호출 생략)
-                    st.toast("✅ 데이터 웨어하우스 전체 초기화 완료. 새 엑셀을 업로드해 주세요.")
+        if is_admin:
+            st.header("📂 데이터 관리 센터")
+            uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
+            if uploaded_file is not None:
+                if st.button("🚀 신규 특허 무결성 적재"):
+                    with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
+                        added, dup = process_and_update_db(uploaded_file, collection)
+                    with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중..."):
+                        commit_and_push_data()
+                    st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건) — GitHub 백업 완료")
                     st.rerun()
-                except Exception as e:
-                    st.error(f"초기화 중 오류 발생: {e}")
+
+            st.divider()
+            st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
+
+            if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
+                with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
+                    try:
+                        if os.path.exists(MASTER_EXCEL_PATH):
+                            os.remove(MASTER_EXCEL_PATH)
+                        if os.path.exists(DB_PATH):
+                            shutil.rmtree(DB_PATH)
+                        os.makedirs(DB_PATH, exist_ok=True)
+                        _build_infra.clear()
+                        if "infra_initialized" in st.session_state:
+                            del st.session_state["infra_initialized"]
+                        st.toast("✅ 데이터 웨어하우스 전체 초기화 완료. 새 엑셀을 업로드해 주세요.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"초기화 중 오류 발생: {e}")
+
+            st.divider()
+            st.subheader("👥 가입 회원 현황")
+            registry = load_user_registry()
+            if registry:
+                for uid, info in registry.items():
+                    st.caption(f"• {uid} ({info.get('name','')}) — {info.get('department','')}")
+            else:
+                st.caption("등록된 일반 회원 없음")
+        else:
+            st.caption("분석 기능 전용 접속 모드입니다.")
 
     st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
     analysis_mode = st.selectbox(
