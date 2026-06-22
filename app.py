@@ -286,7 +286,7 @@ def check_authentication():
     if not os.path.exists(USER_REGISTRY_PATH):
         download_user_registry_from_github()
 
-    st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
+    st.title("🏛 경쟁사 특허 조사 분석 AI")
     tab_login, tab_register = st.tabs(["🔑 로그인", "📝 신규 회원 가입"])
 
     # ── 로그인 탭 ──
@@ -610,7 +610,7 @@ def run_main_portal():
         else:
             st.caption("분석 기능 전용 접속 모드입니다.")
 
-    st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
+    st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문가 선택")
     analysis_mode = st.selectbox(
         "사용 목적에 맞는 전문가 관점을 선택해 주세요:",
         [
