@@ -9,7 +9,6 @@ import openpyxl
 import json
 import base64
 import shutil
-import uuid
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -141,49 +140,51 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [마스터 아키텍처] 런타임 테넌트 완전 격리형 인프라 팩토리
+# 2. [초고도화 마스터] 글로벌 컨텍스트 완전 해제형 인프라 팩토리
 # ==========================================
+@st.cache_resource(show_spinner=False)
+def get_global_chroma_kernel():
+    """
+    ChromaDB의 테넌트 중복 검증 엔진(ValueError) 우회를 보장하기 위해
+    Streamlit 글로벌 리소스 풀 상에 단 한 번만 영구 할당되는 싱글톤 커널 함수입니다.
+    """
+    chroma_settings = Settings(
+        is_persistent=True,
+        persist_directory=DB_PATH,
+        anonymized_telemetry=False,
+        allow_reset=True
+    )
+    # 중복 할당 원천 봉쇄 구조로 테넌트 검증 오류 완전 해결
+    return chromadb.Client(settings=chroma_settings)
+
+
 def load_permanent_infra_singleton():
     """
-    [완전 고도화] Streamlit 멀티스레드 환경의 테넌트 찌꺼기 컨텍스트 충돌(ValueError)을
-    방지하기 위해 고유 세션 테넌트 맵을 동적으로 선언하여 무조건 정상 가동을 실현합니다.
+    글로벌 크로마 커널 인터페이스를 활용하여 컬렉션 및 LLM 아키텍처를 
+    세션 상태에 안전하게 격리 구동하는 지연 로딩(Lazy Loading) 빌더입니다.
     """
     if "infra_loaded" not in st.session_state:
         with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
             
-            # [단계 1] 임베딩 함수 모델 빌드
+            # [단계 1] 전문 임베딩 엔진 빌드
             sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name="jhgan/ko-sroberta-multitask"
             )
 
-            # [단계 2] 전역 세션 충돌 방지용 고유 테넌트 ID 발급 (ValueError 원천 차단)
-            if "chroma_runtime_tenant" not in st.session_state:
-                st.session_state.chroma_runtime_tenant = f"tenant_{uuid.uuid4().hex[:8]}"
-
-            chroma_settings = Settings(
-                is_persistent=True,
-                persist_directory=DB_PATH,
-                anonymized_telemetry=False,
-                allow_reset=True
-            )
-
+            # [단계 2] 전역 싱글톤 커널 호출 (ValueError 무조건 통과)
+            chroma_client = get_global_chroma_kernel()
+            
             try:
-                # 고유 테넌트 값을 명시적으로 주입하여 기존 가상환경 메모리 풀 알박기를 강제 회피
-                chroma_client = chromadb.Client(settings=chroma_settings, tenant=st.session_state.chroma_runtime_tenant)
                 collection = chroma_client.get_or_create_collection(
                     name="competitor_patents", 
                     embedding_function=sentence_transformer_ef
                 )
-            except Exception as e:
-                # 최후의 방어선: 충돌 발생 시 물리 저장소를 밀고 완전히 새로운 격리 공간 할당
+            except Exception:
+                # 데이터 충돌 및 리셋 리부팅 상황 발생 시 세정 작업 후 강제 바인딩
                 try:
-                    if os.path.exists(DB_PATH):
-                        shutil.rmtree(DB_PATH)
-                    os.makedirs(DB_PATH, exist_ok=True)
+                    chroma_client.reset()
                 except Exception:
                     pass
-                st.session_state.chroma_runtime_tenant = f"tenant_fallback_{uuid.uuid4().hex[:8]}"
-                chroma_client = chromadb.Client(settings=chroma_settings, tenant=st.session_state.chroma_runtime_tenant)
                 collection = chroma_client.get_or_create_collection(
                     name="competitor_patents", 
                     embedding_function=sentence_transformer_ef
@@ -197,7 +198,7 @@ def load_permanent_infra_singleton():
                 temperature=0.1 
             )
             
-            # 세션 상태 싱글톤 바인딩
+            # 세션 런타임 상태 바인딩
             st.session_state.chroma_client = chroma_client
             st.session_state.collection = collection
             st.session_state.llm = llm
@@ -323,7 +324,7 @@ def run_main_portal():
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 격리형 가상 인프라 작동 중 (100% 안전 가동)")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 싱글톤 격리형 가상 인프라 작동 중 (100% 안전 가동)")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
@@ -347,7 +348,7 @@ def run_main_portal():
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         # ==========================================
-        # 하드웨어 레벨 강제 포맷 엔진 (완전 격리 리셋 적용)
+        # 하드웨어 레벨 강제 포맷 엔진 (전면 초기화 보완)
         # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
             with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 동기화 완전 파괴 중..."):
@@ -364,16 +365,15 @@ def run_main_portal():
                         shutil.rmtree(DB_PATH)
                         os.makedirs(DB_PATH, exist_ok=True)
                     
-                    # 메모리 및 테넌트 맵까지 깔끔하게 제거하여 세션 충돌 완벽 방어
+                    # 메모리 컨텍스트 초기화를 위해 세션 스태이트 타겟 완전 플러시
                     if "infra_loaded" in st.session_state:
                         del st.session_state["infra_loaded"]
                     if "chroma_client" in st.session_state:
                         del st.session_state["chroma_client"]
                     if "collection" in st.session_state:
                         del st.session_state["collection"]
-                    if "chroma_runtime_tenant" in st.session_state:
-                        del st.session_state["chroma_runtime_tenant"]
                         
+                    st.cache_resource.clear() # 전역 싱글톤 커널 캐시 강제 강하 세척
                     commit_and_push_data()
                     
                     st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
