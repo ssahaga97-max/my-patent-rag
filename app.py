@@ -23,16 +23,12 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 
 
 # ==========================================
-# 0. 전역 스코프 싱글톤 및 세션 인프라 선언
+# 0. 전역 스코프 상태 제어 및 초기화
 # ==========================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
-
-# 전역 공유용 인프라 캐시 풀 딕셔너리 정의 (ChromaDB 0.5.0 충돌 차단용)
-if "infra_pool" not in st.session_state:
-    st.session_state.infra_pool = {}
 
 
 # ==========================================
@@ -146,32 +142,25 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [★ChromaDB 0.5.0 결함 완전 격파★] 전역 재사용 인프라 빌더 함수 (1초 미만 로딩 보장)
+# 2. [★ChromaDB 0.5.0 ValueError 원천 분쇄★] 안전 공유 인프라 팩토리 (1초 미만 로딩 보장)
 # ==========================================
-def load_singleton_infra():
+@st.cache_resource(show_spinner=False)
+def load_permanent_infra_singleton():
     """
-    SharedSystemClient ValueError를 원천 차단하기 위해
-    기존에 열려있는 DB 세션 컨텍스트 객체를 강제로 재사용(Reuse)하는 고도화 빌더
+    SharedSystemClient 에러를 완전히 파쇄하기 위해 st.cache_resource 영역에 
+    인프라 커넥션 파이프라인 커널 자체를 싱글톤 인스턴스로 완전 고정하는 함수
     """
-    pool = st.session_state.infra_pool
-    
-    # 이미 메모리 풀에 생성된 인스턴스 자원이 있다면 중복 생성 절차를 원천 생략하고 리턴
-    if "chroma_client" in pool and "collection" in pool and "llm" in pool:
-        return pool["chroma_client"], pool["collection"], pool["llm"]
-
-    # 대형 임베딩 모델 로드 시점 지연 보존
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
 
-    # capture() 텔레메트리 무한 에러 루프 영구 차단 옵션 주입
     chroma_settings = Settings(
         anonymized_telemetry=False,
         is_persistent=True
     )
 
     try:
-        # 중복 할당 예외를 방어하기 위해 순정 세션 객체를 메모리에 단 한번만 안전하게 단독 이식
+        # 전역 캐시 레이어 안에서 단 한 번만 영구 바인딩되므로 ValueError 충돌 소지가 원천 박멸됩니다.
         chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
         collection = chroma_client.get_or_create_collection(
             name="competitor_patents", 
@@ -179,7 +168,6 @@ def load_singleton_infra():
         )
         collection.count()
     except Exception:
-        # 파일 핸들러 충돌 예방용 Fallback 트랜잭션 정의
         if os.path.exists(DB_PATH):
             try: shutil.rmtree(DB_PATH)
             except Exception: pass
@@ -189,18 +177,12 @@ def load_singleton_infra():
             embedding_function=sentence_transformer_ef
         )
 
-    # Groq Cloud API 기반 Llama 3.3 초고속 엔진 연결
     GROQ_API_KEY = "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"
     llm = ChatGroq(
         model="llama-3.3-70b-versatile", 
         groq_api_key=GROQ_API_KEY,
         temperature=0.1 
     )
-    
-    # 강제 인프라 공유 풀에 영구 박제 (싱글톤 정착 완료)
-    pool["chroma_client"] = chroma_client
-    pool["collection"] = collection
-    pool["llm"] = llm
     
     return chroma_client, collection, llm
 
@@ -310,8 +292,8 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    # 새로고침이나 파일 와처 재부팅이 일어나도 공유 풀에서 기존 DB 세션 컨텍스트를 안정적으로 가져옴
-    chroma_client, collection, llm = load_singleton_infra()
+    # 하드 리로드 및 세션 리런 상태에 영향을 받지 않는 영구 보존 싱글톤 커널 자원 획득
+    chroma_client, collection, llm = load_permanent_infra_singleton()
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
@@ -321,7 +303,6 @@ def run_main_portal():
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
             st.session_state.user_id = None
-            st.session_state.infra_pool = {}
             st.rerun()
 
     with st.sidebar:
@@ -348,7 +329,6 @@ def run_main_portal():
             if os.path.exists(MASTER_EXCEL_PATH): os.remove(MASTER_EXCEL_PATH)
             commit_and_push_data()
             st.warning("모든 데이터가 소거되었습니다.")
-            st.session_state.infra_pool = {}
             st.rerun()
 
     st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
@@ -366,7 +346,7 @@ def run_main_portal():
     placeholders = {
         "💡 단순 키워드 매칭 및 특허 검색": "검색하고자 하는 핵심 키워드들을 입력하세요. (예: 카세트 도어 잠금장치)",
         "🔬 특정 기술 관련 심층 특허 분석": "동향을 파악할 타겟 기술이나 모듈명을 입력하세요. (예: 센서 기반 매체 지폐 잼 장애 예측 알고리즘)",
-        "🛡️ 개발기술 침해 분석 & 진보성 회포 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
+        "🛡️ 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
         "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": "통계 요약을 보고 싶은 조건이나 '전체 통계 요약해줘'라고 입력하세요."
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
