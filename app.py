@@ -140,54 +140,60 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [초고도화] 자가 치유형 전역 세션 인프라 팩토리
-# ==========================================
-# ==========================================
-# 2. [완전 격리] 자가 치유형 전역 세션 인프라 팩토리
+# 2. [초고도화 Master] 자가 정화형 인프라 커널 팩토리
 # ==========================================
 def load_permanent_infra_singleton():
     """
-    ChromaDB 내부 테넌트 검증 에러(ValueError) 및 SQLite 파일 락을 
-    완벽히 제어하여 충돌 시 스스로 스토리지 커널을 정화하고 재부팅하는 안정화 엔진입니다.
+    테넌트 중복 검증 에러(ValueError)를 원천 차단하기 위해 함수 호출 최상단에 
+    강제 물리 정화 트랙을 배치하고 Client 구성을 정렬한 마스터 빌더입니다.
     """
     if "infra_loaded" not in st.session_state:
         with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
             
-            # 1. 임베딩 함수 모델 빌드
+            # [단계 1] 구버전 인스턴스 충돌 방지를 위한 디렉토리 무조건 클린화 (최초 1회)
+            if not os.path.exists(os.path.join(DB_PATH, "chroma.sqlite3")):
+                try:
+                    if os.path.exists(DB_PATH):
+                        shutil.rmtree(DB_PATH)
+                    os.makedirs(DB_PATH, exist_ok=True)
+                except Exception:
+                    pass
+
+            # [단계 2] 임베딩 함수 정의
             sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name="jhgan/ko-sroberta-multitask"
             )
 
+            # [단계 3] ValueError 검증 에러를 우회하는 범용 Client 설정 주입
             chroma_settings = Settings(
+                is_persistent=True,
+                persist_directory=DB_PATH,
                 anonymized_telemetry=False,
                 allow_reset=True
             )
 
-            # 2. 클라이언트 생성 코어를 안전하게 예외 격리
             try:
-                # 첫 번째 정상 구동 시도
-                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                # ClientCreator 대신 전역 컨텍스트 규칙에 유연한 Client 클래스로 직접 연결
+                chroma_client = chromadb.Client(settings=chroma_settings)
                 collection = chroma_client.get_or_create_collection(
                     name="competitor_patents", 
                     embedding_function=sentence_transformer_ef
                 )
-            except Exception as core_error:
-                # _validate_tenant_database의 ValueError 또는 sqlite3.OperationalError 동시 방어
-                st.sidebar.warning("⚠️ 백엔드 데이터베이스 파일 및 테넌트 충돌 감지: 가상 커널 정화 작업 수행")
-                
-                # 물리 디렉토리 강제 소거 후 재생성하여 알박기 차단
-                if os.path.exists(DB_PATH):
-                    shutil.rmtree(DB_PATH)
+            except Exception as critical_error:
+                # 만에 하나 발생하는 모든 이기종 세션 충돌 방어 및 강제 리빌드
+                try:
+                    if os.path.exists(DB_PATH):
+                        shutil.rmtree(DB_PATH)
                     os.makedirs(DB_PATH, exist_ok=True)
-                
-                # 완전히 깨끗해진 파일 스토리지 위에서 인프라 재건축
-                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                except Exception:
+                    pass
+                chroma_client = chromadb.Client(settings=chroma_settings)
                 collection = chroma_client.get_or_create_collection(
                     name="competitor_patents", 
                     embedding_function=sentence_transformer_ef
                 )
 
-            # 3. LLM 추론 엔진 결합
+            # [단계 4] LLM 클라우드 연동
             GROQ_API_KEY = "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"
             llm = ChatGroq(
                 model="llama-3.3-70b-versatile", 
@@ -195,7 +201,7 @@ def load_permanent_infra_singleton():
                 temperature=0.1 
             )
             
-            # 4. 전역 메모리 세션 상태에 싱글톤 구조로 영구 안착
+            # 세션 상태 바인딩 완결
             st.session_state.chroma_client = chroma_client
             st.session_state.collection = collection
             st.session_state.llm = llm
@@ -311,7 +317,6 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
-    # 가상 웨어하우스로부터 복원 자동 수행
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
             with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
@@ -346,27 +351,23 @@ def run_main_portal():
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         # ==========================================
-        # [핵심 수술 플러그인] 하드웨어 레벨 강제 포맷 엔진
+        # 하드웨어 레벨 강제 포맷 엔진
         # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
             with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 동기화 완전 파괴 중..."):
                 try:
-                    # 1. 로컬 마스터 엑셀 물리 삭제
                     if os.path.exists(MASTER_EXCEL_PATH): 
                         os.remove(MASTER_EXCEL_PATH)
                     
-                    # 2. ChromaDB 내부 컬렉션 데이터 소거 및 강제 초기화
                     try:
                         chroma_client.reset()
                     except Exception:
                         pass
                     
-                    # 3. 파일 시스템 락을 우회하기 위해 디렉토리 강제 강하 삭제
                     if os.path.exists(DB_PATH):
                         shutil.rmtree(DB_PATH)
                         os.makedirs(DB_PATH, exist_ok=True)
                     
-                    # 4. 전역 메모리에 잡혀있던 싱글톤 인프라 인스턴스 완전 소거
                     if "infra_loaded" in st.session_state:
                         del st.session_state["infra_loaded"]
                     if "chroma_client" in st.session_state:
@@ -374,7 +375,6 @@ def run_main_portal():
                     if "collection" in st.session_state:
                         del st.session_state["collection"]
                         
-                    # 5. 빈 상태를 원격지 가상 웨어하우스(GitHub API)에 즉각 플러시 반영
                     commit_and_push_data()
                     
                     st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
