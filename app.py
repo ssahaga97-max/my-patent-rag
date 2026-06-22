@@ -25,7 +25,7 @@ DB_PATH = "/tmp/my_patent_vector_db"
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 os.makedirs(DB_PATH, exist_ok=True)
 
-st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
+st.set_page_config(page_title="AI 경쟁사 특허 조사 분석", layout="wide", page_icon="🔬")
 
 
 # ==========================================
@@ -227,6 +227,39 @@ def send_admin_signup_email(user_info: dict) -> bool:
         return False
 
 
+def download_logo_from_github():
+    """컨테이너 재시작 시 로고 파일이 없으면 GitHub에서 복원."""
+    logo_path = os.path.join(BASE_DIR, "atec_logo.png")
+    if os.path.exists(logo_path):
+        return True
+    token, repo_url = _get_github_secrets()
+    if not token:
+        return False
+    try:
+        raw_url   = repo_url.replace(".git", "")
+        repo_path = raw_url.split("github.com/")[-1]
+        api_url   = f"https://api.github.com/repos/{repo_path}/contents/atec_logo.png"
+        req = Request(api_url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("content"):
+            raw = base64.b64decode(data["content"])
+        elif data.get("download_url"):
+            with urlopen(Request(data["download_url"], headers={"Authorization": f"Bearer {token}"})) as r:
+                raw = r.read()
+        else:
+            return False
+        with open(logo_path, "wb") as f:
+            f.write(raw)
+        return True
+    except Exception as e:
+        print(f"로고 복원 실패: {e}")
+        return False
+
+
 def download_master_excel_from_github():
     """
     컨테이너 재시작으로 로컬 파일이 소실된 경우 GitHub에서 마스터 엑셀을 내려받아 복원.
@@ -286,7 +319,10 @@ def check_authentication():
     if not os.path.exists(USER_REGISTRY_PATH):
         download_user_registry_from_github()
 
-    st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
+    logo_path = os.path.join(BASE_DIR, "atec_logo.png")
+    if os.path.exists(logo_path):
+        st.image(logo_path, width=160)
+    st.title("AI 경쟁사 특허 조사 분석")
     tab_login, tab_register = st.tabs(["🔑 로그인", "📝 신규 회원 가입"])
 
     # ── 로그인 탭 ──
@@ -540,6 +576,9 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
+    # 컨테이너 재시작 시 로고 파일 자동 복원
+    download_logo_from_github()
+
     # [데이터 휘발 방지] 컨테이너 재시작 후 로컬 엑셀이 없으면 GitHub에서 즉시 복원
     if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
         with st.spinner("🔄 GitHub 데이터 웨어하우스에서 마스터 엑셀 복원 중..."):
@@ -558,9 +597,13 @@ def run_main_portal():
 
     is_admin = st.session_state.get("is_admin", False)
 
-    col_title, col_logout = st.columns([8, 2])
+    col_logo, col_title, col_logout = st.columns([1, 7, 2])
+    with col_logo:
+        logo_path = os.path.join(BASE_DIR, "atec_logo.png")
+        if os.path.exists(logo_path):
+            st.image(logo_path, width=110)
     with col_title:
-        st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
+        st.title("AI 경쟁사 특허 조사 분석")
         mode_label = "🔧 관리자" if is_admin else "👤 사용자"
         st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | 적재 특허: {collection.count()}건")
     with col_logout:
@@ -641,7 +684,7 @@ def run_main_portal():
         else:
             st.caption("분석 기능 전용 접속 모드입니다.")
 
-    st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
+    st.subheader("⚙️ 1단계: AI 전문가 선택")
     analysis_mode = st.selectbox(
         "사용 목적에 맞는 전문가 관점을 선택해 주세요:",
         [
