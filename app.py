@@ -142,58 +142,64 @@ def check_authentication():
 # ==========================================
 # 2. [초고도화] 자가 치유형 전역 세션 인프라 팩토리
 # ==========================================
+# ==========================================
+# 2. [완전 격리] 자가 치유형 전역 세션 인프라 팩토리
+# ==========================================
 def load_permanent_infra_singleton():
     """
-    부팅 시 구버전 SQLite 파일 락 및 손상(sqlite3.OperationalError)을 감지하면
-    스스로 폴더를 청소하고 인프라를 정상 구동하는 자가 치유형 엔진입니다.
+    ChromaDB 내부 테넌트 검증 에러(ValueError) 및 SQLite 파일 락을 
+    완벽히 제어하여 충돌 시 스스로 스토리지 커널을 정화하고 재부팅하는 안정화 엔진입니다.
     """
     if "infra_loaded" not in st.session_state:
-        # 무거운 모델 로드를 외부 루프 블록으로 안전화
-        sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="jhgan/ko-sroberta-multitask"
-        )
-
-        chroma_settings = Settings(
-            anonymized_telemetry=False,
-            allow_reset=True
-        )
-
-        # 자가 치유(Self-Healing) 내부 함수 정의
-        def init_chroma_core():
-            return chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
-
-        try:
-            chroma_client = init_chroma_core()
-            collection = chroma_client.get_or_create_collection(
-                name="competitor_patents", 
-                embedding_function=sentence_transformer_ef
-            )
-        except Exception as infra_error:
-            # sqlite3.OperationalError 또는 다른 세션 충돌 시 물리 디렉토리 강제 정화
-            st.sidebar.warning("⚠️ 백엔드 데이터베이스 파일 충돌 감지: 자가 정화 커널 작동")
-            if os.path.exists(DB_PATH):
-                shutil.rmtree(DB_PATH)
-                os.makedirs(DB_PATH, exist_ok=True)
+        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
             
-            # 클린 스토리지 환경에서 인프라 핵심 재부팅
-            chroma_client = init_chroma_core()
-            collection = chroma_client.get_or_create_collection(
-                name="competitor_patents", 
-                embedding_function=sentence_transformer_ef
+            # 1. 임베딩 함수 모델 빌드
+            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name="jhgan/ko-sroberta-multitask"
             )
 
-        GROQ_API_KEY = "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"
-        llm = ChatGroq(
-            model="llama-3.3-70b-versatile", 
-            groq_api_key=GROQ_API_KEY,
-            temperature=0.1 
-        )
-        
-        # 세션에 인프라 싱글톤 바인딩 완결
-        st.session_state.chroma_client = chroma_client
-        st.session_state.collection = collection
-        st.session_state.llm = llm
-        st.session_state.infra_loaded = True
+            chroma_settings = Settings(
+                anonymized_telemetry=False,
+                allow_reset=True
+            )
+
+            # 2. 클라이언트 생성 코어를 안전하게 예외 격리
+            try:
+                # 첫 번째 정상 구동 시도
+                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                collection = chroma_client.get_or_create_collection(
+                    name="competitor_patents", 
+                    embedding_function=sentence_transformer_ef
+                )
+            except Exception as core_error:
+                # _validate_tenant_database의 ValueError 또는 sqlite3.OperationalError 동시 방어
+                st.sidebar.warning("⚠️ 백엔드 데이터베이스 파일 및 테넌트 충돌 감지: 가상 커널 정화 작업 수행")
+                
+                # 물리 디렉토리 강제 소거 후 재생성하여 알박기 차단
+                if os.path.exists(DB_PATH):
+                    shutil.rmtree(DB_PATH)
+                    os.makedirs(DB_PATH, exist_ok=True)
+                
+                # 완전히 깨끗해진 파일 스토리지 위에서 인프라 재건축
+                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                collection = chroma_client.get_or_create_collection(
+                    name="competitor_patents", 
+                    embedding_function=sentence_transformer_ef
+                )
+
+            # 3. LLM 추론 엔진 결합
+            GROQ_API_KEY = "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"
+            llm = ChatGroq(
+                model="llama-3.3-70b-versatile", 
+                groq_api_key=GROQ_API_KEY,
+                temperature=0.1 
+            )
+            
+            # 4. 전역 메모리 세션 상태에 싱글톤 구조로 영구 안착
+            st.session_state.chroma_client = chroma_client
+            st.session_state.collection = collection
+            st.session_state.llm = llm
+            st.session_state.infra_loaded = True
 
     return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
 
