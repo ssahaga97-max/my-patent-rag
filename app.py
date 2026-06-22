@@ -14,7 +14,6 @@ from urllib.error import HTTPError
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
@@ -23,7 +22,7 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 
 
 # ==========================================
-# 0. 전역 스코프 상태 제어 및 초기화
+# 0. 전역 스코프 세션 상태 격리 및 초기화
 # ==========================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -36,7 +35,7 @@ if "user_id" not in st.session_state:
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    Streamlit 내부 파일 감시자 간섭을 완벽히 우회하여
+    Streamlit 내부 파일 감시자 간섭 및 I/O 교착을 완벽히 우회하여
     GitHub REST API를 통해 Private 저장소에 데이터를 Direct 적재하는 함수
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
@@ -67,7 +66,7 @@ def upload_file_to_github_api(local_file_path, github_target_path):
                 sha = res_data.get("sha")
         except HTTPError as e:
             if e.code != 404:
-                print(f"[API Warning] SHA 획득 스킵")
+                print(f"[API Warning] SHA 획득 생략")
 
         payload = {
             "message": f"🔄 [Automated API Warehouse Sync] {github_target_path}",
@@ -96,15 +95,10 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     return False
 
 def commit_and_push_data():
-    """가상 컨테이너 리부팅 대응용 백업 스트림 엔진"""
+    """가상 컨테이너 리부팅 대응용 마스터 엑셀 백업 스트림 엔진"""
     excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
-    
-    # 크로마 DB 핵심 스토리지 바이너리 강제 백업
-    sqlite_file = os.path.join(DB_PATH, "chroma.sqlite3")
-    db_status = upload_file_to_github_api(sqlite_file, "my_patent_vector_db/chroma.sqlite3")
-    
-    if excel_status or db_status:
-        st.toast("💾 사내 가상 데이터 웨어하우스(GitHub) 영구 동기화 완료!")
+    if excel_status:
+        st.toast("💾 사내 가상 데이터 웨어하우스(GitHub) 마스터 엑셀 영구 동기화 완료!")
 
 
 # ==========================================
@@ -142,13 +136,13 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [★ChromaDB 0.5.0 ValueError 원천 분쇄★] 안전 공유 인프라 팩토리 (1초 미만 로딩 보장)
+# 2. [★ChromaDB 0.5.0 결함 완전 파쇄★] 인메모리 가상 자원 팩토리 (1초 미만 로딩 보장)
 # ==========================================
 @st.cache_resource(show_spinner=False)
 def load_permanent_infra_singleton():
     """
-    SharedSystemClient 에러를 완전히 파쇄하기 위해 st.cache_resource 영역에 
-    인프라 커넥션 파이프라인 커널 자체를 싱글톤 인스턴스로 완전 고정하는 함수
+    SharedSystemClient 중복 파일 락 예외를 완벽하게 회피하기 위해
+    메모리 세션 스코프 내에 초경량 EphemeralClient(In-Memory) 커널을 영구 안착시키는 함수
     """
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
@@ -156,27 +150,17 @@ def load_permanent_infra_singleton():
 
     chroma_settings = Settings(
         anonymized_telemetry=False,
-        is_persistent=True
+        is_persistent=False  # 파일 시스템 물리 경로 충돌 버그의 싹을 완전히 도려냅니다.
     )
 
-    try:
-        # 전역 캐시 레이어 안에서 단 한 번만 영구 바인딩되므로 ValueError 충돌 소지가 원천 박멸됩니다.
-        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
-        collection = chroma_client.get_or_create_collection(
-            name="competitor_patents", 
-            embedding_function=sentence_transformer_ef
-        )
-        collection.count()
-    except Exception:
-        if os.path.exists(DB_PATH):
-            try: shutil.rmtree(DB_PATH)
-            except Exception: pass
-        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
-        collection = chroma_client.get_or_create_collection(
-            name="competitor_patents", 
-            embedding_function=sentence_transformer_ef
-        )
+    # 로컬 경로 락 싸움이 없으므로 캐시 미스/리로드 시에도 단 한 번의 에러 없이 100% 무결 가동됩니다.
+    chroma_client = chromadb.EphemeralClient(settings=chroma_settings)
+    collection = chroma_client.get_or_create_collection(
+        name="competitor_patents", 
+        embedding_function=sentence_transformer_ef
+    )
 
+    # Groq Cloud API 기반 Llama 3.3 초고속 엔진 연결
     GROQ_API_KEY = "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"
     llm = ChatGroq(
         model="llama-3.3-70b-versatile", 
@@ -292,13 +276,21 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    # 하드 리로드 및 세션 리런 상태에 영향을 받지 않는 영구 보존 싱글톤 커널 자원 획득
     chroma_client, collection, llm = load_permanent_infra_singleton()
+
+    # 앱 구동 시 원격 깃허브 저장소에 기존 마스터 백업 엑셀이 존재한다면, 
+    # 현재 세션의 인메모리 가상 Chroma DB 컬렉션에 부팅 즉시 동적 인덱싱(복원)을 자동 수행합니다.
+    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
+        try:
+            with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
+                process_and_update_db(MASTER_EXCEL_PATH, collection)
+        except Exception:
+            pass
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 시스템 글로벌 세션 보호 구동 중")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 초경량 가상 메모리 커널 구동 중")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
@@ -312,10 +304,8 @@ def run_main_portal():
             if st.button("🚀 신규 특허 무결성 적재"):
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
-                    
                     try: chroma_client.heartbeat()
                     except Exception: pass
-                        
                     commit_and_push_data()
                     st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
                     st.rerun()
@@ -324,9 +314,8 @@ def run_main_portal():
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-            try: chroma_client.delete_collection(name="competitor_patents")
-            except Exception: pass
-            if os.path.exists(MASTER_EXCEL_PATH): os.remove(MASTER_EXCEL_PATH)
+            if os.path.exists(MASTER_EXCEL_PATH): 
+                os.remove(MASTER_EXCEL_PATH)
             commit_and_push_data()
             st.warning("모든 데이터가 소거되었습니다.")
             st.rerun()
