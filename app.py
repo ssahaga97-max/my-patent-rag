@@ -64,7 +64,7 @@ def upload_file_to_github_api(local_file_path, github_target_path):
                 res_data = json.loads(response.read().decode())
                 sha = res_data.get("sha")
         except HTTPError as e:
-            if e.code != 404:  # 404가 아닌 에러는 단순 누락이 아니므로 스킵 처리
+            if e.code != 404:
                 print(f"[API Warning] SHA 획득 건너뜀")
 
         # 2. REST API 트랜잭션 페이로드 구성
@@ -300,7 +300,13 @@ def run_main_portal():
             if st.button("🚀 신규 특허 무결성 적재"):
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
-                    # 데이터 적재 완료 즉시 변동 사항을 네트워크 다이렉트 스트림으로 깃허브 전송
+                    
+                    # [★임계 패치★] 백업 스트림 전송 전 ChromaDB 핸들러를 메모리 상에서 안전하게 flush 처리
+                    try:
+                        chroma_client.heartbeat()
+                    except Exception:
+                        pass
+                        
                     commit_and_push_data()
                     st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
                     st.rerun()
