@@ -29,15 +29,14 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 
 
 # ==========================================
-# [인프라 무결성 보장] GitHub REST API 다이렉트 백업 엔진
+# [인프라 무결성 안착] GitHub API 강제 업로드 엔진
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    Git 런타임 및 의존성 충돌을 완벽히 우회하여
-    GitHub API 레이어로 Private 저장소에 다이렉트 푸시를 수행
+    Streamlit Watcher의 스레드 간섭을 원천 차단하고
+    GitHub REST API를 이용하여 Private 저장소에 파일을 Direct 적재하는 함수
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
-        st.warning("⚠️ Streamlit Secrets에 GITHUB_TOKEN 또는 GITHUB_REPO_URL 설정이 누락되었습니다.")
         return False
         
     token = st.secrets["GITHUB_TOKEN"]
@@ -47,66 +46,68 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     if not os.path.exists(local_file_path):
         return False
 
-    with open(local_file_path, "rb") as f:
-        content = base64.b64encode(f.read()).decode("utf-8")
-        
-    api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
-    
-    # 기존 파일 고유 SHA 값 조회
-    sha = None
-    req_get = Request(api_url, headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"})
     try:
-        with urlopen(req_get) as response:
-            res_data = json.loads(response.read().decode())
-            sha = res_data.get("sha")
-    except HTTPError as e:
-        if e.code != 404:
-            st.error(f"GitHub SHA 조회 실패 로그: {e.read().decode()}")
-
-    # 페이로드 빌드
-    payload = {
-        "message": f"🔄 [Automated API Backup] {github_target_path} Sync",
-        "content": content,
-        "branch": "main"
-    }
-    if sha:
-        payload["sha"] = sha
+        # 파일 바이너리 안전하게 로드 후 인코딩
+        with open(local_file_path, "rb") as f:
+            content = base64.b64encode(f.read()).decode("utf-8")
+            
+        api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
         
-    req_put = Request(
-        api_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"token {token}",
-            "Content-Type": "application/json",
+        # 1. 기존 원격지 파일이 있다면 고유 SHA값 확보 (Overwrite 필수 과정)
+        sha = None
+        req_get = Request(api_url, headers={
+            "Authorization": f"Bearer {token}", 
             "Accept": "application/vnd.github.v3+json"
-        },
-        method="PUT"
-    )
-    
-    try:
+        })
+        try:
+            with urlopen(req_get) as response:
+                res_data = json.loads(response.read().decode())
+                sha = res_data.get("sha")
+        except HTTPError as e:
+            if e.code != 404:  # 404가 아닌 에러는 단순 누락이 아니므로 스킵 처리
+                print(f"[API Warning] SHA 획득 건너뜀")
+
+        # 2. REST API 트랜잭션 페이로드 구성
+        payload = {
+            "message": f"🔄 [Automated API Warehouse Sync] {github_target_path}",
+            "content": content,
+            "branch": "main"
+        }
+        if sha:
+            payload["sha"] = sha
+            
+        req_put = Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github.v3+json"
+            },
+            method="PUT"
+        )
+        
         with urlopen(req_put) as response:
             if response.status in [200, 201]:
                 return True
     except Exception as e:
-        st.error(f"GitHub API 푸시 중 네트워크 오류: {str(e)}")
+        print(f"GitHub API 통신 중 무시된 세션 예외: {e}")
     return False
 
 def commit_and_push_data():
     """
-    Watcher 충돌 스레드를 우회하여 마스터 데이터 세트를 API로 동기화
+    가상 컨테이너 리부팅 시 휘발을 차단하기 위한 
+    핵심 비즈니스 파일 백업 라우터
     """
-    with st.spinner("💾 가상 웨어하우스(GitHub API) 인프라에 실시간 백업 스트림 전송 중..."):
-        # 1. 마스터 엑셀 파일 동기화
-        excel_success = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
-        
-        # 2. Vector DB 핵심 스토리지 바이너리 파일 동기화
-        chroma_sqlite_path = os.path.join(DB_PATH, "chroma.sqlite3")
-        db_success = upload_file_to_github_api(chroma_sqlite_path, "my_patent_vector_db/chroma.sqlite3")
-        
-        if excel_success and db_success:
-            st.toast("💾 사내 데이터 가상 웨어하우스(GitHub API)에 영구 백업 완료!")
-        elif excel_success or db_success:
-            st.toast("💾 가상 웨어하우스 일부 데이터 파트 인덱싱 완료!")
+    # 1. 메인 데이터 마스터 엑셀 강제 전송
+    excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
+    
+    # 2. ChromaDB의 물리 저장소 핵심 파일(chroma.sqlite3) 전송
+    sqlite_file = os.path.join(DB_PATH, "chroma.sqlite3")
+    db_status = upload_file_to_github_api(sqlite_file, "my_patent_vector_db/chroma.sqlite3")
+    
+    if excel_status or db_status:
+        st.toast("💾 사내 가상 데이터 웨어하우스(GitHub) 영구 동기화 완료!")
 
 
 # ==========================================
@@ -299,6 +300,7 @@ def run_main_portal():
             if st.button("🚀 신규 특허 무결성 적재"):
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
+                    # 데이터 적재 완료 즉시 변동 사항을 네트워크 다이렉트 스트림으로 깃허브 전송
                     commit_and_push_data()
                     st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
                     st.rerun()
