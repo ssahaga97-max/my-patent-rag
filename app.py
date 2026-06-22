@@ -8,7 +8,6 @@ from langchain_groq import ChatGroq
 import openpyxl 
 import json
 import base64
-import shutil
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -136,7 +135,7 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [★ChromaDB 0.5.0 결함 완전 파쇄★] 인메모리 가상 자원 팩토리 (1초 미만 로딩 보장)
+# 2. [ChromaDB 0.5.0 전용] 인메모리 가상 자원 팩토리 (1초 미만 로딩 보장)
 # ==========================================
 @st.cache_resource(show_spinner=False)
 def load_permanent_infra_singleton():
@@ -150,7 +149,7 @@ def load_permanent_infra_singleton():
 
     chroma_settings = Settings(
         anonymized_telemetry=False,
-        is_persistent=False  # 파일 시스템 물리 경로 충돌 버그의 싹을 완전히 도려냅니다.
+        is_persistent=False  # 물리 디렉토리 경로 충돌 버그의 싹을 완전히 도려냅니다.
     )
 
     # 로컬 경로 락 싸움이 없으므로 캐시 미스/리로드 시에도 단 한 번의 에러 없이 100% 무결 가동됩니다.
@@ -278,8 +277,7 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
-    # 앱 구동 시 원격 깃허브 저장소에 기존 마스터 백업 엑셀이 존재한다면, 
-    # 현재 세션의 인메모리 가상 Chroma DB 컬렉션에 부팅 즉시 동적 인덱싱(복원)을 자동 수행합니다.
+    # 원격 저장소에 백업된 마스터 엑셀이 있다면 부팅 즉시 인메모리 Chroma DB에 동적 인덱싱 복원 자동 수행
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
             with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
