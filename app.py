@@ -7,6 +7,7 @@ from langchain_groq import ChatGroq
 import openpyxl 
 import json
 import base64
+import shutil
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -33,8 +34,8 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    Streamlit Watcher의 스레드 간섭을 원천 차단하고
-    GitHub REST API를 이용하여 Private 저장소에 파일을 Direct 적재하는 함수
+    Streamlit Cloud 인프라 특성을 우회하여
+    GitHub REST API를 이용해 Private 저장소에 파일을 Direct 적재하는 함수
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
         return False
@@ -47,13 +48,12 @@ def upload_file_to_github_api(local_file_path, github_target_path):
         return False
 
     try:
-        # 파일 바이너리 안전하게 로드 후 인코딩
         with open(local_file_path, "rb") as f:
             content = base64.b64encode(f.read()).decode("utf-8")
             
         api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
         
-        # 1. 기존 원격지 파일이 있다면 고유 SHA값 확보 (Overwrite 필수 과정)
+        # 원격지 기존 파일 SHA값 확보
         sha = None
         req_get = Request(api_url, headers={
             "Authorization": f"Bearer {token}", 
@@ -65,9 +65,8 @@ def upload_file_to_github_api(local_file_path, github_target_path):
                 sha = res_data.get("sha")
         except HTTPError as e:
             if e.code != 404:
-                print(f"[API Warning] SHA 획득 건너뜀")
+                print(f"[API Warning] SHA 조회 건너뜀")
 
-        # 2. REST API 트랜잭션 페이로드 구성
         payload = {
             "message": f"🔄 [Automated API Warehouse Sync] {github_target_path}",
             "content": content,
@@ -91,18 +90,14 @@ def upload_file_to_github_api(local_file_path, github_target_path):
             if response.status in [200, 201]:
                 return True
     except Exception as e:
-        print(f"GitHub API 통신 중 무시된 세션 예외: {e}")
+        print(f"GitHub API 통신 예외 수용: {e}")
     return False
 
 def commit_and_push_data():
-    """
-    가상 컨테이너 리부팅 시 휘발을 차단하기 위한 
-    핵심 비즈니스 파일 백업 라우터
-    """
-    # 1. 메인 데이터 마스터 엑셀 강제 전송
+    """가상 컨테이너 백업 동기화 라우터"""
     excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
     
-    # 2. ChromaDB의 물리 저장소 핵심 파일(chroma.sqlite3) 전송
+    # ChromaDB 가상 스토리지의 유효 파일 전송
     sqlite_file = os.path.join(DB_PATH, "chroma.sqlite3")
     db_status = upload_file_to_github_api(sqlite_file, "my_patent_vector_db/chroma.sqlite3")
     
@@ -145,27 +140,36 @@ def check_authentication():
 
 
 # ==========================================
-# 2. 지연 로딩(Lazy Loading) 및 인프라 바인딩 함수
+# 2. [치명적 버그 전면 격파] 지연 로딩 및 자가 회복 인프라 함수
 # ==========================================
 @st.cache_resource(show_spinner=False)
 def initialize_infra():
-    try:
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
-    except Exception:
-        import shutil
-        if os.path.exists(DB_PATH):
-            shutil.rmtree(DB_PATH)
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
-
+    """
+    StopIteration 메타데이터 깨짐 현상 발생 시, 
+    스스로 기존 소실 디렉토리를 밀어버리고 무결성 순정 규격으로 초기화하는 복구 로직 추가
+    """
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
 
-    collection = chroma_client.get_or_create_collection(
-        name="competitor_patents", 
-        embedding_function=sentence_transformer_ef
-    )
-    
+    try:
+        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+        collection = chroma_client.get_or_create_collection(
+            name="competitor_patents", 
+            embedding_function=sentence_transformer_ef
+        )
+        # [테스트 트리거] 에러가 나는 count 함수를 미리 찔러보아 무결성 사전 검증
+        collection.count()
+    except (StopIteration, Exception) as e:
+        # ⚠️ StopIteration 또는 파일 결함 감지 시 무조건 강제 포맷 후 갱신
+        if os.path.exists(DB_PATH):
+            shutil.rmtree(DB_PATH)
+        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+        collection = chroma_client.get_or_create_collection(
+            name="competitor_patents", 
+            embedding_function=sentence_transformer_ef
+        )
+
     GROQ_API_KEY = "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"
     llm = ChatGroq(
         model="llama-3.3-70b-versatile", 
@@ -176,7 +180,7 @@ def initialize_infra():
     return chroma_client, collection, llm
 
 
-# --- 2. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
+# --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
 def extract_excel_hyperlinks(uploaded_file):
     link_dict = {}
     try:
@@ -279,7 +283,7 @@ def process_and_update_db(uploaded_file, collection):
         return 0, duplicate_count
 
 
-# --- 3. 메인 어플리케이션 인터페이스 구동 런타임 ---
+# --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
     chroma_client, collection, llm = initialize_infra()
 
@@ -301,7 +305,6 @@ def run_main_portal():
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
                     
-                    # [★임계 패치★] 백업 스트림 전송 전 ChromaDB 핸들러를 메모리 상에서 안전하게 flush 처리
                     try:
                         chroma_client.heartbeat()
                     except Exception:
@@ -342,7 +345,6 @@ def run_main_portal():
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
 
-    # --- 4. 런타임 하이퍼링크 매칭 및 추론 구동 엔진 ---
     if st.button("🧬 가상 전문가 엔진 구동"):
         if user_query.strip() == "":
             st.warning("분석 내용을 입력해 주세요.")
