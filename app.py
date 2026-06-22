@@ -23,14 +23,14 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 
 
 # ==========================================
-# 0. [인프라 완벽 보정] 싱글톤 패턴 기반 세션 상태 격리 및 초기화
+# 0. [인프라 완벽 보정] 세션 상태 격리 및 무결성 제어
 # ==========================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
 
-# ChromaDB SharedSystemClient 중복 선언 에러(ValueError) 방지를 위한 전역 싱글톤 바인딩
+# ChromaDB 0.5.0 SharedSystemClient ValueError 파쇄를 위한 싱글톤 바인딩
 if "chroma_client" not in st.session_state:
     st.session_state.chroma_client = None
 if "collection" not in st.session_state:
@@ -44,8 +44,8 @@ if "llm" not in st.session_state:
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    Streamlit 내부 스레드 간섭을 원천 차단하고
-    GitHub REST API를 이용하여 Private 저장소에 파일을 Direct 적재하는 함수
+    Streamlit 내부 파일 감시자(Watcher)를 우회하여
+    GitHub REST API를 이용해 Private 저장소에 데이터를 Direct 적재하는 함수
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
         return False
@@ -58,13 +58,12 @@ def upload_file_to_github_api(local_file_path, github_target_path):
         return False
 
     try:
-        # 파일 바이너리 로드 후 인코딩
         with open(local_file_path, "rb") as f:
             content = base64.b64encode(f.read()).decode("utf-8")
             
         api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
         
-        # 원격지 기존 파일 SHA값 확보 (Overwrite 필수 과정)
+        # 원격지 기존 파일 SHA값 확보
         sha = None
         req_get = Request(api_url, headers={
             "Authorization": f"Bearer {token}", 
@@ -76,9 +75,8 @@ def upload_file_to_github_api(local_file_path, github_target_path):
                 sha = res_data.get("sha")
         except HTTPError as e:
             if e.code != 404:
-                print(f"[API Warning] SHA 획득 생략")
+                print(f"[API Warning] SHA 획득 스킵")
 
-        # REST API 트랜잭션 페이로드 구성
         payload = {
             "message": f"🔄 [Automated API Warehouse Sync] {github_target_path}",
             "content": content,
@@ -102,14 +100,14 @@ def upload_file_to_github_api(local_file_path, github_target_path):
             if response.status in [200, 201]:
                 return True
     except Exception as e:
-        print(f"GitHub API 통신 중 무시된 세션 예외: {e}")
+        print(f"GitHub API 통신 중 예외 제어: {e}")
     return False
 
 def commit_and_push_data():
     """가상 컨테이너 리부팅 대응용 백업 스트림 엔진"""
     excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
     
-    # 크로마 DB 핵심 파일 강제 API 백업
+    # 크로마 DB 핵심 스토리지 바이너리 강제 백업
     sqlite_file = os.path.join(DB_PATH, "chroma.sqlite3")
     db_status = upload_file_to_github_api(sqlite_file, "my_patent_vector_db/chroma.sqlite3")
     
@@ -152,23 +150,23 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [★치명적 해결책★] 싱글톤 패턴 인프라 빌더 함수 (초기 로딩 1초 미만 완벽 보장)
+# 2. [ChromaDB 0.5.0 전용] 싱글톤 컨텍스트 빌더 함수 (1초 미만 로딩 보장)
 # ==========================================
 def load_singleton_infra():
     """
-    SharedSystemClient 에러를 완전히 파쇄하기 위해
-    메모리 세션 스코프 내에 단 하나의 인프라 스트림 인스턴스만 유지하는 핵심 함수
+    ChromaDB 0.5.0의 엄격한 중복 선언 방지 규격을 만족시키기 위해
+    메모리 세션 스코프 내에 단 하나의 인프라 스트림 인스턴스만 상주시키는 핵심 함수
     """
-    # 이미 세션이 정상적으로 수립되어 있다면 즉시 싱글톤 반환하여 중복 생성 방지
+    # 이미 활성화된 커넥션 풀이 존재한다면 즉시 싱글톤 객체 반환 (ValueError 원천 차단)
     if st.session_state.chroma_client and st.session_state.collection and st.session_state.llm:
         return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
 
-    # 임베딩 모델 가중치 로드
+    # 임베딩 모델 로드
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
 
-    # 오작동 및 텔레메트리 노이즈를 제어하는 크로마 설정 정의
+    # ⚠️ [최종 보정] capture() 텔레메트리 에러 무한 루프 진압 세팅 강제 주입
     chroma_settings = Settings(
         anonymized_telemetry=False,
         is_persistent=True
@@ -180,9 +178,9 @@ def load_singleton_infra():
             name="competitor_patents", 
             embedding_function=sentence_transformer_ef
         )
-        collection.count() # 무결성 검증
+        collection.count() # 무결성 최종 사전 체크
     except Exception:
-        # 혹시 기존 찌꺼기 파일로 인해 충돌 시 자동 초기화 복구
+        # 찌꺼기 메타데이터 세그먼트로 인해 StopIteration 유발 시 자동 클렌징
         if os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
         chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
@@ -191,7 +189,7 @@ def load_singleton_infra():
             embedding_function=sentence_transformer_ef
         )
 
-    # Groq API 및 고성능 Llama 3.3 엔진 연결
+    # Groq Cloud API 기반 Llama 3.3 초고속 엔진 연결
     GROQ_API_KEY = "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"
     llm = ChatGroq(
         model="llama-3.3-70b-versatile", 
@@ -199,7 +197,7 @@ def load_singleton_infra():
         temperature=0.1 
     )
     
-    # 전역 세션 메모리에 안전하게 인스턴스 박제 (싱글톤 정착)
+    # 세션 상태 테이블에 안전하게 적재 및 싱글톤 유지
     st.session_state.chroma_client = chroma_client
     st.session_state.collection = collection
     st.session_state.llm = llm
@@ -312,7 +310,7 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    # 새로고침이나 유저 동작과 무관하게 언제나 전역 메모리 스코프의 싱글톤 인프라 스트림을 획득
+    # 새로고침이나 유저 인터랙션 발생 시 상시 일관성 있는 싱글톤 인프라 풀 확보
     chroma_client, collection, llm = load_singleton_infra()
 
     col_title, col_logout = st.columns([8, 2])
@@ -323,7 +321,7 @@ def run_main_portal():
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
             st.session_state.user_id = None
-            # 로그아웃 시 기존 메모리 싱글톤 안전 해제 조치
+            # 로그아웃 트랜잭션 시 메모리에 상주한 싱글톤 핸들 해제
             st.session_state.chroma_client = None
             st.session_state.collection = None
             st.session_state.llm = None
@@ -355,7 +353,8 @@ def run_main_portal():
             if os.path.exists(MASTER_EXCEL_PATH): os.remove(MASTER_EXCEL_PATH)
             commit_and_push_data()
             st.warning("모든 데이터가 소거되었습니다.")
-            # 데이터 전체 초기화 후 세션 클린 징팅을 유도하여 에러 소지 사전 예방
+            
+            # 초기화 리셋 컴포넌트 이식
             st.session_state.chroma_client = None
             st.session_state.collection = None
             st.session_state.llm = None
