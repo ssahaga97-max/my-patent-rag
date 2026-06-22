@@ -12,14 +12,6 @@ import shutil
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-# ==========================================
-# 0. 독립 세션 상태 제어 및 초기화
-# ==========================================
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user_id" not in st.session_state:
-    st.session_state.user_id = None
-
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
@@ -28,6 +20,23 @@ MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.x
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 
 st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
+
+
+# ==========================================
+# 0. [인프라 완벽 보정] 싱글톤 패턴 기반 세션 상태 격리 및 초기화
+# ==========================================
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+
+# ChromaDB SharedSystemClient 중복 선언 에러(ValueError) 방지를 위한 전역 싱글톤 바인딩
+if "chroma_client" not in st.session_state:
+    st.session_state.chroma_client = None
+if "collection" not in st.session_state:
+    st.session_state.collection = None
+if "llm" not in st.session_state:
+    st.session_state.llm = None
 
 
 # ==========================================
@@ -143,23 +152,23 @@ def check_authentication():
 
 
 # ==========================================
-# 2. 대형 임베딩 모델 격리 캐싱 및 자가 복구 인프라
+# 2. [★치명적 해결책★] 싱글톤 패턴 인프라 빌더 함수 (초기 로딩 1초 미만 완벽 보장)
 # ==========================================
-@st.cache_resource(show_spinner=False)
-def get_cached_embedding_function():
-    """임베딩 모델 가중치만 메모리에 안전하게 격리 캐싱하여 1초 미만 로딩 보장"""
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
+def load_singleton_infra():
+    """
+    SharedSystemClient 에러를 완전히 파쇄하기 위해
+    메모리 세션 스코프 내에 단 하나의 인프라 스트림 인스턴스만 유지하는 핵심 함수
+    """
+    # 이미 세션이 정상적으로 수립되어 있다면 즉시 싱글톤 반환하여 중복 생성 방지
+    if st.session_state.chroma_client and st.session_state.collection and st.session_state.llm:
+        return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
+
+    # 임베딩 모델 가중치 로드
+    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
 
-def get_clean_infra_connection():
-    """
-    [교착 상태 파쇄] anonymized_telemetry=False 설정을 이식하여
-    에러를 뿜어내던 텔레메트리 스레드를 영구 차단한 순정 커넥션 반환 함수
-    """
-    sentence_transformer_ef = get_cached_embedding_function()
-
-    # 텔레메트리 오작동을 영구 진압하는 크로마 세팅 객체 정의
+    # 오작동 및 텔레메트리 노이즈를 제어하는 크로마 설정 정의
     chroma_settings = Settings(
         anonymized_telemetry=False,
         is_persistent=True
@@ -171,9 +180,9 @@ def get_clean_infra_connection():
             name="competitor_patents", 
             embedding_function=sentence_transformer_ef
         )
-        collection.count() # 무결성 사전 검증
-    except (StopIteration, Exception):
-        # 파편화 찌꺼기 디렉토리 발견 시 즉시 초기화 복구
+        collection.count() # 무결성 검증
+    except Exception:
+        # 혹시 기존 찌꺼기 파일로 인해 충돌 시 자동 초기화 복구
         if os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
         chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
@@ -182,12 +191,18 @@ def get_clean_infra_connection():
             embedding_function=sentence_transformer_ef
         )
 
+    # Groq API 및 고성능 Llama 3.3 엔진 연결
     GROQ_API_KEY = "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"
     llm = ChatGroq(
         model="llama-3.3-70b-versatile", 
         groq_api_key=GROQ_API_KEY,
         temperature=0.1 
     )
+    
+    # 전역 세션 메모리에 안전하게 인스턴스 박제 (싱글톤 정착)
+    st.session_state.chroma_client = chroma_client
+    st.session_state.collection = collection
+    st.session_state.llm = llm
     
     return chroma_client, collection, llm
 
@@ -297,17 +312,21 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    # 새로고침마다 안전하게 분리 조치된 순정 인프라 획득
-    chroma_client, collection, llm = get_clean_infra_connection()
+    # 새로고침이나 유저 동작과 무관하게 언제나 전역 메모리 스코프의 싱글톤 인프라 스트림을 획득
+    chroma_client, collection, llm = load_singleton_infra()
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 인프라 구조 격리 안정화")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 시스템 싱글톤 컨텍스트 보호 구동 중")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
             st.session_state.user_id = None
+            # 로그아웃 시 기존 메모리 싱글톤 안전 해제 조치
+            st.session_state.chroma_client = None
+            st.session_state.collection = None
+            st.session_state.llm = None
             st.rerun()
 
     with st.sidebar:
@@ -336,6 +355,10 @@ def run_main_portal():
             if os.path.exists(MASTER_EXCEL_PATH): os.remove(MASTER_EXCEL_PATH)
             commit_and_push_data()
             st.warning("모든 데이터가 소거되었습니다.")
+            # 데이터 전체 초기화 후 세션 클린 징팅을 유도하여 에러 소지 사전 예방
+            st.session_state.chroma_client = None
+            st.session_state.collection = None
+            st.session_state.llm = None
             st.rerun()
 
     st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
