@@ -35,21 +35,40 @@ if "user_id" not in st.session_state:
 # ==========================================
 # [인프라 무결성 안착] GitHub API 강제 업로드 엔진
 # ==========================================
+def _get_github_secrets():
+    """
+    TOML 최상위 키로 설정된 GITHUB_TOKEN / GITHUB_REPO_URL을 안전하게 반환.
+    섹션 헤더([USER_CREDENTIALS]) 뒤에 배치하면 해당 섹션 하위에 귀속되어
+    st.secrets["GITHUB_TOKEN"]으로 접근이 불가능해지므로, 반드시 TOML 최상위에 위치해야 함.
+    """
+    try:
+        token = st.secrets["GITHUB_TOKEN"]
+        repo_url = st.secrets["GITHUB_REPO_URL"]
+        if not token or token.startswith("ghp_본인의"):
+            return None, None
+        # https:// 누락 방어
+        if not repo_url.startswith("https://"):
+            repo_url = "https://" + repo_url.lstrip("http://")
+        return token, repo_url
+    except Exception:
+        return None, None
+
+
 def upload_file_to_github_api(local_file_path, github_target_path):
-    if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
+    token, repo_url = _get_github_secrets()
+    if not token:
         return False
         
-    token = st.secrets["GITHUB_TOKEN"]
-    raw_url = st.secrets["GITHUB_REPO_URL"].replace(".git", "")
+    raw_url = repo_url.replace(".git", "")
     repo_path = raw_url.split("github.com/")[-1]
-    
+
     if not os.path.exists(local_file_path):
         return False
 
     try:
         with open(local_file_path, "rb") as f:
             content = base64.b64encode(f.read()).decode("utf-8")
-            
+
         api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
         
         sha = None
@@ -92,9 +111,40 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     return False
 
 def commit_and_push_data():
+    """마스터 엑셀을 GitHub에 업로드하여 컨테이너 재시작 후에도 데이터가 복원될 수 있도록 보존."""
     excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
     if excel_status:
-        st.toast("💾 사내 가상 데이터 웨어하우스(GitHub) 마스터 엑셀 영구 동기화 완료!")
+        st.toast("💾 GitHub 데이터 웨어하우스 동기화 완료 — 재시작 후 자동 복원 보장!")
+    else:
+        st.toast("⚠️ GitHub 동기화 실패 — Secrets에서 GITHUB_TOKEN을 TOML 최상위(섹션 헤더 위)에 배치했는지 확인하세요.")
+
+
+def download_master_excel_from_github():
+    """
+    컨테이너 재시작으로 로컬 파일이 소실된 경우 GitHub에서 마스터 엑셀을 내려받아 복원.
+    성공 여부를 bool로 반환.
+    """
+    token, repo_url = _get_github_secrets()
+    if not token:
+        return False
+    try:
+        raw_url = repo_url.replace(".git", "")
+        repo_path = raw_url.split("github.com/")[-1]
+        api_url = f"https://api.github.com/repos/{repo_path}/contents/my_patent_folder/master_patents.xlsx"
+        req = Request(api_url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+        with urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            raw_content = base64.b64decode(data["content"])
+        os.makedirs(os.path.dirname(MASTER_EXCEL_PATH), exist_ok=True)
+        with open(MASTER_EXCEL_PATH, "wb") as f:
+            f.write(raw_content)
+        return True
+    except Exception as e:
+        print(f"GitHub 마스터 엑셀 복원 실패: {e}")
+        return False
 
 
 # ==========================================
@@ -284,12 +334,21 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
+    # [데이터 휘발 방지] 컨테이너 재시작 후 로컬 엑셀이 없으면 GitHub에서 즉시 복원
+    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
+        with st.spinner("🔄 GitHub 데이터 웨어하우스에서 마스터 엑셀 복원 중..."):
+            restored = download_master_excel_from_github()
+            if restored:
+                st.toast("✅ GitHub로부터 마스터 데이터 복원 완료!")
+
+    # 엑셀은 있지만 /tmp ChromaDB가 비어 있으면(재시작) 자동 재인덱싱
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
-            with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
+            with st.spinner("📦 마스터 데이터 기반 벡터 DB 자동 재인덱싱 중... (첫 접속 시 1~2분 소요)"):
                 process_and_update_db(MASTER_EXCEL_PATH, collection)
-        except Exception:
-            pass
+            st.toast(f"✅ 벡터 DB 복원 완료! ({collection.count()}건 인덱싱됨)")
+        except Exception as e:
+            st.warning(f"자동 재인덱싱 중 오류 발생: {e}")
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
@@ -308,11 +367,10 @@ def run_main_portal():
             if st.button("🚀 신규 특허 무결성 적재"):
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                     added, dup = process_and_update_db(uploaded_file, collection)
-                    try: chroma_client.heartbeat()
-                    except Exception: pass
+                with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중..."):
                     commit_and_push_data()
-                    st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
-                    st.rerun()
+                st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건) — GitHub 백업 완료")
+                st.rerun()
                     
         st.divider()
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
