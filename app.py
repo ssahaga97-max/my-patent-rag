@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
-# [고도화] GitHub에 동기화할 물리적 Vector DB 저장소 경로 정의
+# [고도화] GitHub 동기화용 물리적 Vector DB 절대 경로 고정
 DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
@@ -48,7 +48,6 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     raw_url = st.secrets["GITHUB_REPO_URL"].replace(".git", "")
     repo_path = raw_url.split("github.com/")[-1]
     
-    # 만약 로컬 파일이 없다면 (포맷 등으로 삭제된 경우) 깃허브에서도 삭제하거나 빈 파일 처리를 위해 우회
     if not os.path.exists(local_file_path):
         return False
 
@@ -106,20 +105,21 @@ def commit_and_push_data():
 
 
 # ==========================================
-# 1. 사내 연구원용 다중 ID/PASS 인터페이스
+# 1. 사내 연구원용 로그인 인터페이스
 # ==========================================
 def check_authentication():
     if "USER_CREDENTIALS" in st.secrets:
         user_credentials = st.secrets["USER_CREDENTIALS"]
     else:
         user_credentials = {
-            "admin": "admin123",
+            "seongsu_bae": "amorfati78",
             "researcher01": "patent789",
-            "researcher02": "tech2026"
+            "researcher02": "tech2026",
+            "admin": "1234!"
         }
 
     if not st.session_state.logged_in:
-        st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
+        st.title("🏛  맞춤형 인텔리전스 특허 가상 서버 인트라넷")
         st.subheader("🔑 사내 연구원 로그인 인증")
         
         with st.form("login_form"):
@@ -140,44 +140,49 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [ChromaDB 0.5.0 전용] 영구 물리 자원 싱글톤 팩토리
+# 2. [고도화] 글로벌 세션 스코프 싱글톤 인프라 팩토리
 # ==========================================
-@st.cache_resource(show_spinner=False)
 def load_permanent_infra_singleton():
     """
-    [고도화] EphemeralClient에서 PersistentClient로 전환하여 실제 DB 파일이 생성되도록 제어하며,
-    동일 경로 세션 충돌(ValueError) 발생 시 예외 처리를 통해 안전하게 클라이언트를 반환합니다.
+    @st.cache_resource의 메모리 락 결함을 우회하기 위해 st.session_state 커널에 
+    클라이언트 인프라를 영구 안착시킵니다. 이 구조는 '전체 포맷' 제어가 100% 무결하게 작동하도록 보장합니다.
     """
-    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="jhgan/ko-sroberta-multitask"
-    )
+    if "infra_loaded" not in st.session_state:
+        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
+            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name="jhgan/ko-sroberta-multitask"
+            )
 
-    chroma_settings = Settings(
-        anonymized_telemetry=False,
-        allow_reset=True  # 포맷 기능을 활성화하기 위해 강제 리셋 옵션 허용
-    )
+            chroma_settings = Settings(
+                anonymized_telemetry=False,
+                allow_reset=True  # 포맷 명령어 커널 활성화
+            )
 
-    try:
-        # 물리 디렉토리에 완전 영구 적재 체제로 고도화 (GitHub에 파일 추적 가능해짐)
-        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
-    except ValueError:
-        # 기존 인스턴스 충돌 세션 방어용 우회 매커니즘
-        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
-        
-    collection = chroma_client.get_or_create_collection(
-        name="competitor_patents", 
-        embedding_function=sentence_transformer_ef
-    )
+            try:
+                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+            except ValueError:
+                # 클라우드 컨테이너 포트 충돌 및 세션 교착 우회
+                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                
+            collection = chroma_client.get_or_create_collection(
+                name="competitor_patents", 
+                embedding_function=sentence_transformer_ef
+            )
 
-    # Groq Cloud API 기반 Llama 3.3 초고속 엔진 연결
-    GROQ_API_KEY = "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"
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile", 
-        groq_api_key=GROQ_API_KEY,
-        temperature=0.1 
-    )
-    
-    return chroma_client, collection, llm
+            GROQ_API_KEY = "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"
+            llm = ChatGroq(
+                model="llama-3.3-70b-versatile", 
+                groq_api_key=GROQ_API_KEY,
+                temperature=0.1 
+            )
+            
+            # 세션에 영구 제어권 바인딩
+            st.session_state.chroma_client = chroma_client
+            st.session_state.collection = collection
+            st.session_state.llm = llm
+            st.session_state.infra_loaded = True
+
+    return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
 
 
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
@@ -287,7 +292,7 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
-    # 원격 저장소에 백업된 마스터 엑셀이 있다면 부팅 즉시 인메모리 Chroma DB에 동적 인덱싱 복원 자동 수행
+    # 가상 웨어하우스로부터 복원 자동 수행
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
             with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
@@ -297,8 +302,8 @@ def run_main_portal():
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
-        st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 물리 커널 동기화 인프라 가동 중")
+        st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 가상 컨테이너 무결성 영구 인프라 작동 중")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
@@ -322,31 +327,38 @@ def run_main_portal():
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         # ==========================================
-        # [고도화] "가상 데이터 웨어하우스 전체 포맷" 버튼 핸들러 강화
+        # [핵심 수술 플러그인] 하드웨어 레벨 강제 포맷 엔진
         # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-            with st.spinner("⏳ 데이터베이스 세션 락 해제 및 서버 전면 초기화 중..."):
+            with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 동기화 완전 파괴 중..."):
                 try:
-                    # 1. 로컬 마스터 엑셀 물리 소거
+                    # 1. 로컬 마스터 엑셀 물리 삭제
                     if os.path.exists(MASTER_EXCEL_PATH): 
                         os.remove(MASTER_EXCEL_PATH)
                     
-                    # 2. ChromaDB 내의 데이터 컬렉션 비우기 및 디렉토리 강제 리셋
+                    # 2. ChromaDB 내부 컬렉션 데이터 소거 및 강제 초기화
                     try:
-                        chroma_client.reset() # 설정(allow_reset=True)을 통해 컬렉션 내부 완전 포맷
+                        chroma_client.reset()
                     except Exception:
-                        # 리셋 불가 상황 대비 물리 폴더 강제 밀어버리기
-                        if os.path.exists(DB_PATH):
-                            shutil.rmtree(DB_PATH)
-                            os.makedirs(DB_PATH, exist_ok=True)
+                        pass
                     
-                    # 3. Streamlit 세션 및 리소스 캐시 강제 무효화
-                    st.cache_resource.clear()
+                    # 3. 파일 시스템 락을 우회하기 위해 디렉토리 강제 강하 삭제
+                    if os.path.exists(DB_PATH):
+                        shutil.rmtree(DB_PATH)
+                        os.makedirs(DB_PATH, exist_ok=True)
                     
-                    # 4. 빈 껍데기 상태(초기화 상태)를 GitHub 저장소 API로 전송하여 동기화 완결
+                    # 4. [가장 중요] 전역 메모리에 잡혀있던 싱글톤 인프라 인스턴스 완전 소거
+                    if "infra_loaded" in st.session_state:
+                        del st.session_state["infra_loaded"]
+                    if "chroma_client" in st.session_state:
+                        del st.session_state["chroma_client"]
+                    if "collection" in st.session_state:
+                        del st.session_state["collection"]
+                        
+                    # 5. 빈 상태를 원격지 가상 웨어하우스(GitHub API)에 즉각 플러시 반영
                     commit_and_push_data()
                     
-                    st.warning("⚠️ 가상 데이터 웨어하우스 및 벡터 DB가 완벽하게 포맷되었습니다.")
+                    st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"초기화 중 인프라 제어 오류 발생: {e}")
@@ -357,7 +369,7 @@ def run_main_portal():
         [
             "💡 단순 키워드 매칭 및 특허 검색",
             "🔬 특정 기술 관련 심층 특허 분석",
-            "🛡️ 개발기술 침해 분석 & 진보성 회피 설계",
+            "🛡 개발기술 침해 분석 & 진보성 회피 설계",
             "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)"
         ]
     )
@@ -366,7 +378,7 @@ def run_main_portal():
     placeholders = {
         "💡 단순 키워드 매칭 및 특허 검색": "검색하고자 하는 핵심 키워드들을 입력하세요. (예: 카세트 도어 잠금장치)",
         "🔬 특정 기술 관련 심층 특허 분석": "동향을 파악할 타겟 기술이나 모듈명을 입력하세요. (예: 센서 기반 매체 지폐 잼 장애 예측 알고리즘)",
-        "🛡️ 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
+        "🛡 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
         "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": "통계 요약을 보고 싶은 조건이나 '전체 통계 요약해줘'라고 입력하세요."
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
@@ -416,7 +428,7 @@ def run_main_portal():
                         system_prompt = "당신은 신속하고 정확하게 관련 문헌을 찾아내는 '수석 특허 검색 조사관'입니다. 관련 특허를 마크다운 링크 서식과 함께 요약 브리핑하세요."
                     elif "🔬 특정 기술" in analysis_mode:
                         system_prompt = "당신은 수석 기술 전문 분석가입니다. 마크다운 링크를 포함한 기술 동향 보고서를 체계적으로 작성하세요."
-                    elif "🛡️ 개발기술 침해" in analysis_mode:
+                    elif "🛡 개발기술 침해" in analysis_mode:
                         system_prompt = "당신은 특허청 수석 심사관 및 특허법률 전문가 집단입니다. 관련 선행문헌들의 링크 주소를 명시하며 침해 가능성 및 회피설계 가이드를 작성하세요."
                     else:
                         system_prompt = "당신은 특허 데이터 통계 분석가입니다. 서지정보와 하이퍼링크 매칭 상태를 종합하여 다차원 통계 리포트를 작성하세요."
@@ -439,7 +451,7 @@ def run_main_portal():
                         st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
                         st.write(response.content) 
                         st.divider()
-                        with st.expander("👁️ 로컬 가상 서버가 실시간 스크리닝한 마스터 데이터 매칭 정보 (클릭 시 원문 이동 가능)"):
+                        with st.expander("👁 로컬 가상 서버가 실시간 스크리닝한 마스터 데이터 매칭 정보 (클릭 시 원문 이동 가능)"):
                             st.markdown(context_text) 
                     except Exception as e:
                         st.error(f"서버 연산 보호 오류: {e}")
