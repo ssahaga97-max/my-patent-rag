@@ -137,7 +137,20 @@ def download_master_excel_from_github():
         })
         with urlopen(req) as response:
             data = json.loads(response.read().decode())
+
+        # GitHub Contents API는 1MB 초과 파일의 content 필드를 비워 반환
+        # → download_url로 폴백하여 대용량 엑셀도 안전하게 처리
+        if data.get("content"):
             raw_content = base64.b64decode(data["content"])
+        elif data.get("download_url"):
+            dl_req = Request(data["download_url"], headers={
+                "Authorization": f"Bearer {token}"
+            })
+            with urlopen(dl_req) as dl_resp:
+                raw_content = dl_resp.read()
+        else:
+            return False
+
         os.makedirs(os.path.dirname(MASTER_EXCEL_PATH), exist_ok=True)
         with open(MASTER_EXCEL_PATH, "wb") as f:
             f.write(raw_content)
@@ -151,15 +164,10 @@ def download_master_excel_from_github():
 # 1. 사내 연구원용 로그인 인터페이스
 # ==========================================
 def check_authentication():
-    if "USER_CREDENTIALS" in st.secrets:
-        user_credentials = st.secrets["USER_CREDENTIALS"]
-    else:
-        user_credentials = {
-            "seongsu_bae": "amorfati78",
-            "researcher01": "patent789",
-            "researcher02": "tech2026",
-            "admin": "1234!"
-        }
+    if "USER_CREDENTIALS" not in st.secrets:
+        st.error("⛔ Streamlit Secrets에 [USER_CREDENTIALS] 섹션이 설정되어 있지 않습니다. 관리자에게 문의하세요.")
+        st.stop()
+    user_credentials = st.secrets["USER_CREDENTIALS"]
 
     if not st.session_state.logged_in:
         st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
@@ -210,11 +218,13 @@ def _build_infra():
         embedding_function=sentence_transformer_ef
     )
 
-    # Groq Cloud API 기반 Llama 3.3 엔진
-    GROQ_API_KEY = "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"
+    # Groq Cloud API 기반 Llama 3.3 엔진 (키는 반드시 Streamlit Secrets에서 로드)
+    groq_api_key = st.secrets.get("GROQ_API_KEY", "")
+    if not groq_api_key:
+        raise ValueError("Streamlit Secrets에 GROQ_API_KEY가 설정되어 있지 않습니다.")
     llm = ChatGroq(
         model="llama-3.3-70b-versatile",
-        groq_api_key=GROQ_API_KEY,
+        groq_api_key=groq_api_key,
         temperature=0.1
     )
 
@@ -222,8 +232,13 @@ def _build_infra():
 
 
 def load_permanent_infra_singleton():
-    with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
-        return _build_infra()
+    # 최초 1회만 스피너 표시 — 이후 캐시 히트 시 즉시 반환
+    if "infra_initialized" not in st.session_state:
+        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
+            result = _build_infra()
+        st.session_state.infra_initialized = True
+        return result
+    return _build_infra()
 
 
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
@@ -376,8 +391,9 @@ def run_main_portal():
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-            with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 완전 초기화 중..."):
+            with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
                 try:
+                    # 마스터 엑셀 삭제
                     if os.path.exists(MASTER_EXCEL_PATH):
                         os.remove(MASTER_EXCEL_PATH)
 
@@ -386,14 +402,17 @@ def run_main_portal():
                         shutil.rmtree(DB_PATH)
                     os.makedirs(DB_PATH, exist_ok=True)
 
-                    # @st.cache_resource 캐시 파기 → 다음 호출 시 새 인스턴스로 재초기화
+                    # 캐시·세션 파기 → 다음 호출 시 새 인스턴스로 재초기화
                     _build_infra.clear()
+                    if "infra_initialized" in st.session_state:
+                        del st.session_state["infra_initialized"]
 
-                    commit_and_push_data()
-                    st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
+                    # 삭제 완료 후 GitHub에는 빈 상태를 알리지 않음
+                    # (엑셀이 없으면 업로드할 파일 없으므로 commit 호출 생략)
+                    st.toast("✅ 데이터 웨어하우스 전체 초기화 완료. 새 엑셀을 업로드해 주세요.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"초기화 중 인프라 제어 오류 발생: {e}")
+                    st.error(f"초기화 중 오류 발생: {e}")
 
     st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
     analysis_mode = st.selectbox(
@@ -422,73 +441,135 @@ def run_main_portal():
             st.error("서버 DB에 적재된 특허 소스가 없습니다. 좌측 메뉴에서 엑셀을 먼저 등록해 주세요.")
         else:
             with st.spinner("가상 전문가가 실시간 시맨틱 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
-                n_results = 3
-                if "📊" in analysis_mode:
-                    n_results = min(collection.count(), 15)
 
-                results = collection.query(
-                    query_texts=[user_query.strip()],
-                    n_results=n_results
-                )
-                
-                if results and 'documents' in results and len(results['documents']) > 0 and len(results['documents'][0]) > 0:
-                    retrieved_docs = results['documents'][0]
-                    retrieved_metas = results['metadatas'][0]
-                    
+                # ── 통계 모드: 전체 메타데이터 pandas 집계 후 요약 컨텍스트 구성 ──
+                if "📊" in analysis_mode:
+                    all_data = collection.get(include=["metadatas"])
+                    all_metas = all_data.get("metadatas", [])
+                    total_count = len(all_metas)
+
+                    if total_count == 0:
+                        st.error("서버 DB에 적재된 특허 소스가 없습니다.")
+                        st.stop()
+
+                    stats_df = pd.DataFrame(all_metas)
+
+                    def top_counts(series, n=10):
+                        return series.replace("없음", pd.NA).dropna().value_counts().head(n).to_string()
+
+                    applicant_stat = top_counts(stats_df.get("출원인", pd.Series(dtype=str)))
+                    ipc_stat       = top_counts(stats_df.get("IPC", pd.Series(dtype=str)))
+                    inventor_stat  = top_counts(stats_df.get("발명자", pd.Series(dtype=str)))
+
+                    year_series = stats_df.get("출원일", pd.Series(dtype=str)).str[:4]
+                    year_stat   = year_series.replace("", pd.NA).dropna().value_counts().sort_index().to_string()
+
+                    context_text = f"""[전체 DB 통계 요약] 총 {total_count}건
+
+■ 출원인별 상위 10 현황
+{applicant_stat}
+
+■ IPC 분류별 상위 10 현황
+{ipc_stat}
+
+■ 주요 발명자 상위 10 현황
+{inventor_stat}
+
+■ 출원 연도별 건수 추이
+{year_stat}
+"""
+                    # 질의 관련 시맨틱 매칭 상위 특허도 추가
+                    sem_results = collection.query(
+                        query_texts=[user_query.strip()],
+                        n_results=min(total_count, 10)
+                    )
+                    if sem_results and sem_results["documents"][0]:
+                        context_text += "\n■ 질의 관련 시맨틱 매칭 상위 특허\n"
+                        for i, m in enumerate(sem_results["metadatas"][0]):
+                            context_text += f"  [{i+1}] {m.get('출원번호','')} | {m.get('명칭','')} | {m.get('출원인','')}\n"
+
+                    system_prompt = (
+                        "당신은 특허 데이터 통계 전문 분석가입니다. "
+                        "아래 집계 통계를 기반으로 출원 동향, 핵심 출원인, 기술 분야 분포를 "
+                        "마크다운 표와 함께 체계적인 다차원 통계 리포트로 작성하세요."
+                    )
+
+                # ── 일반 모드: 시맨틱 RAG 검색 ──
+                else:
+                    # 침해 분석은 7건, 나머지는 5건으로 품질 향상
+                    n_results = 7 if "🛡" in analysis_mode else 5
+                    n_results = min(n_results, collection.count())
+
+                    results = collection.query(
+                        query_texts=[user_query.strip()],
+                        n_results=n_results
+                    )
+
+                    if not (results and results["documents"] and results["documents"][0]):
+                        st.error("관련 특허를 찾지 못했습니다. 다른 키워드로 시도해 보세요.")
+                        st.stop()
+
+                    retrieved_docs  = results["documents"][0]
+                    retrieved_metas = results["metadatas"][0]
+
                     context_text = ""
-                    for i, doc in enumerate(retrieved_docs):
-                        m = retrieved_metas[i]
-                        app_num = m.get('출원번호', '번호없음')
-                        p_name = m.get('명칭', '제목없음')
-                        applicant = m.get('출원인', '미기재')
-                        inventor = m.get('발명자', '미기재')
-                        ipc = m.get('IPC', '없음')
-                        cpc = m.get('CPC', '없음')
-                        app_date = m.get('출원일', '없음')
-                        patent_url = m.get('URL', '')
+                    for i, (doc, m) in enumerate(zip(retrieved_docs, retrieved_metas)):
+                        app_num    = m.get("출원번호", "번호없음")
+                        p_name     = m.get("명칭", "제목없음")
+                        applicant  = m.get("출원인", "미기재")
+                        inventor   = m.get("발명자", "미기재")
+                        ipc        = m.get("IPC", "없음")
+                        cpc        = m.get("CPC", "없음")
+                        app_date   = m.get("출원일", "없음")
+                        patent_url = m.get("URL", "")
 
                         if patent_url and patent_url.startswith("http"):
-                            display_num = f"[{app_num}]({patent_url})"
+                            display_num  = f"[{app_num}]({patent_url})"
                             display_name = f"[{p_name}]({patent_url})"
                         else:
-                            display_num = app_num
+                            display_num  = app_num
                             display_name = p_name
 
-                        context_text += f"[특허 {i+1}] 번호: {display_num} | 명칭: {display_name} | 출원인: {applicant} | 발명자: {inventor} | IPC: {ipc} | CPC: {cpc} | 출원일: {app_date}\n{doc}\n\n"
-                    
+                        context_text += (
+                            f"[특허 {i+1}] 번호: {display_num} | 명칭: {display_name} | "
+                            f"출원인: {applicant} | 발명자: {inventor} | "
+                            f"IPC: {ipc} | CPC: {cpc} | 출원일: {app_date}\n{doc}\n\n"
+                        )
+
                     if "💡 단순 키워드" in analysis_mode:
-                        system_prompt = "당신은 신속하고 정확하게 관련 문헌을 찾아내는 '수석 특허 검색 조사관'입니다. 관련 특허를 마크다운 링크 서식과 함께 요약 브리핑하세요."
+                        system_prompt = (
+                            "당신은 신속하고 정확하게 관련 문헌을 찾아내는 '수석 특허 검색 조사관'입니다. "
+                            "관련 특허를 마크다운 링크 서식과 함께 요약 브리핑하세요."
+                        )
                     elif "🔬 특정 기술" in analysis_mode:
-                        system_prompt = "당신은 수석 기술 전문 분석가입니다. 마크다운 링크를 포함한 기술 동향 보고서를 체계적으로 작성하세요."
-                    elif "🛡 개발기술 침해" in analysis_mode:
-                        system_prompt = "당신은 특허청 수석 심사관 및 특허법률 전문가 집단입니다. 관련 선행문헌들의 링크 주소를 명시하며 침해 가능성 및 회피설계 가이드를 작성하세요."
+                        system_prompt = (
+                            "당신은 수석 기술 전문 분석가입니다. "
+                            "마크다운 링크를 포함한 기술 동향 보고서를 체계적으로 작성하세요."
+                        )
                     else:
-                        system_prompt = "당신은 특허 데이터 통계 분석가입니다. 서지정보와 하이퍼링크 매칭 상태를 종합하여 다차원 통계 리포트를 작성하세요."
+                        system_prompt = (
+                            "당신은 특허청 수석 심사관 및 특허법률 전문가 집단입니다. "
+                            "관련 선행문헌들의 링크 주소를 명시하며 침해 가능성 및 "
+                            "회피설계 가이드를 구성요소 완비 법칙에 근거하여 작성하세요."
+                        )
 
-                    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-                    {system_prompt} 답변 시 참고한 특허의 번호나 명칭을 언급할 때는 시스템이 매칭해 준 [번호](URL) 또는 [명칭](URL) 마크다운 형식을 그대로 유지하여 사용자가 클릭하면 링크로 이동할 수 있게 하세요.<|eot_id|><|start_header_id|>user<|end_header_id|>
+                prompt = (
+                    f"[SYSTEM] {system_prompt}\n"
+                    "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요.\n\n"
+                    f"[참고 데이터]\n{context_text}\n\n"
+                    f"[사용자 요청]\n{user_query}\n\n"
+                    "보고서는 마크다운 양식으로 한국어로 작성하세요."
+                )
 
-                    [참고 선행문헌 데이터]
-                    {context_text}
-
-                    [사용자 요청 내용]
-                    {user_query}
-
-                    보고서는 마크다운 양식을 사용하여 한국어로 논리정연하게 작성해 주세요.<|eot_id|><|start_header_id|>thought<|end_header_id|>
-                    Groq engine active. Generating analytical report...<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-                    """
-                    
-                    try:
-                        response = llm.invoke(prompt)
-                        st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
-                        st.write(response.content) 
-                        st.divider()
-                        with st.expander("👁 로컬 가상 서버가 실시간 스크리닝한 마스터 데이터 매칭 정보 (클릭 시 원문 이동 가능)"):
-                            st.markdown(context_text) 
-                    except Exception as e:
-                        st.error(f"서버 연산 보호 오류: {e}")
-                else:
-                    st.error("데이터 매칭 실패")
+                try:
+                    response = llm.invoke(prompt)
+                    st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
+                    st.write(response.content)
+                    st.divider()
+                    with st.expander("👁 시스템이 매칭한 원천 데이터 (클릭 시 원문 이동 가능)"):
+                        st.markdown(context_text)
+                except Exception as e:
+                    st.error(f"AI 추론 중 오류: {e}")
 
 
 if __name__ == "__main__":
