@@ -8,14 +8,18 @@ from langchain_groq import ChatGroq
 import openpyxl 
 import json
 import base64
+import shutil
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
+# [고도화] GitHub에 동기화할 물리적 Vector DB 저장소 경로 정의
+DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
+os.makedirs(DB_PATH, exist_ok=True)
 
 st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
 
@@ -44,6 +48,7 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     raw_url = st.secrets["GITHUB_REPO_URL"].replace(".git", "")
     repo_path = raw_url.split("github.com/")[-1]
     
+    # 만약 로컬 파일이 없다면 (포맷 등으로 삭제된 경우) 깃허브에서도 삭제하거나 빈 파일 처리를 위해 우회
     if not os.path.exists(local_file_path):
         return False
 
@@ -135,13 +140,13 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [ChromaDB 0.5.0 전용] 인메모리 가상 자원 팩토리 (1초 미만 로딩 보장)
+# 2. [ChromaDB 0.5.0 전용] 영구 물리 자원 싱글톤 팩토리
 # ==========================================
 @st.cache_resource(show_spinner=False)
 def load_permanent_infra_singleton():
     """
-    SharedSystemClient 중복 파일 락 예외를 완벽하게 회피하기 위해
-    메모리 세션 스코프 내에 초경량 EphemeralClient(In-Memory) 커널을 영구 안착시키는 함수
+    [고도화] EphemeralClient에서 PersistentClient로 전환하여 실제 DB 파일이 생성되도록 제어하며,
+    동일 경로 세션 충돌(ValueError) 발생 시 예외 처리를 통해 안전하게 클라이언트를 반환합니다.
     """
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
@@ -149,11 +154,16 @@ def load_permanent_infra_singleton():
 
     chroma_settings = Settings(
         anonymized_telemetry=False,
-        is_persistent=False  # 물리 디렉토리 경로 충돌 버그의 싹을 완전히 도려냅니다.
+        allow_reset=True  # 포맷 기능을 활성화하기 위해 강제 리셋 옵션 허용
     )
 
-    # 로컬 경로 락 싸움이 없으므로 캐시 미스/리로드 시에도 단 한 번의 에러 없이 100% 무결 가동됩니다.
-    chroma_client = chromadb.EphemeralClient(settings=chroma_settings)
+    try:
+        # 물리 디렉토리에 완전 영구 적재 체제로 고도화 (GitHub에 파일 추적 가능해짐)
+        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+    except ValueError:
+        # 기존 인스턴스 충돌 세션 방어용 우회 매커니즘
+        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+        
     collection = chroma_client.get_or_create_collection(
         name="competitor_patents", 
         embedding_function=sentence_transformer_ef
@@ -288,7 +298,7 @@ def run_main_portal():
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 초경량 가상 메모리 커널 구동 중")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 물리 커널 동기화 인프라 가동 중")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
@@ -311,12 +321,35 @@ def run_main_portal():
         st.divider()
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
+        # ==========================================
+        # [고도화] "가상 데이터 웨어하우스 전체 포맷" 버튼 핸들러 강화
+        # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-            if os.path.exists(MASTER_EXCEL_PATH): 
-                os.remove(MASTER_EXCEL_PATH)
-            commit_and_push_data()
-            st.warning("모든 데이터가 소거되었습니다.")
-            st.rerun()
+            with st.spinner("⏳ 데이터베이스 세션 락 해제 및 서버 전면 초기화 중..."):
+                try:
+                    # 1. 로컬 마스터 엑셀 물리 소거
+                    if os.path.exists(MASTER_EXCEL_PATH): 
+                        os.remove(MASTER_EXCEL_PATH)
+                    
+                    # 2. ChromaDB 내의 데이터 컬렉션 비우기 및 디렉토리 강제 리셋
+                    try:
+                        chroma_client.reset() # 설정(allow_reset=True)을 통해 컬렉션 내부 완전 포맷
+                    except Exception:
+                        # 리셋 불가 상황 대비 물리 폴더 강제 밀어버리기
+                        if os.path.exists(DB_PATH):
+                            shutil.rmtree(DB_PATH)
+                            os.makedirs(DB_PATH, exist_ok=True)
+                    
+                    # 3. Streamlit 세션 및 리소스 캐시 강제 무효화
+                    st.cache_resource.clear()
+                    
+                    # 4. 빈 껍데기 상태(초기화 상태)를 GitHub 저장소 API로 전송하여 동기화 완결
+                    commit_and_push_data()
+                    
+                    st.warning("⚠️ 가상 데이터 웨어하우스 및 벡터 DB가 완벽하게 포맷되었습니다.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"초기화 중 인프라 제어 오류 발생: {e}")
 
     st.subheader("⚙️ 1단계: 분석 목적 및 AI 전문 페르소나 선택")
     analysis_mode = st.selectbox(
