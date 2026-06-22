@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import chromadb
+from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
 import openpyxl 
@@ -34,8 +35,8 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    Streamlit Watcher 및 캐시 락 간섭을 우회하여
-    GitHub REST API를 통해 Private 저장소에 파일을 실시간 Direct 적재
+    Streamlit 내부 스레드 간섭을 원천 차단하고
+    GitHub REST API를 이용하여 Private 저장소에 파일을 Direct 적재하는 함수
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
         return False
@@ -48,12 +49,13 @@ def upload_file_to_github_api(local_file_path, github_target_path):
         return False
 
     try:
+        # 파일 바이너리 로드 후 인코딩
         with open(local_file_path, "rb") as f:
             content = base64.b64encode(f.read()).decode("utf-8")
             
         api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
         
-        # 원격지 기존 파일 SHA값 확보
+        # 원격지 기존 파일 SHA값 확보 (Overwrite 필수 과정)
         sha = None
         req_get = Request(api_url, headers={
             "Authorization": f"Bearer {token}", 
@@ -65,8 +67,9 @@ def upload_file_to_github_api(local_file_path, github_target_path):
                 sha = res_data.get("sha")
         except HTTPError as e:
             if e.code != 404:
-                print(f"[API Warning] SHA 조회 패스")
+                print(f"[API Warning] SHA 획득 생략")
 
+        # REST API 트랜잭션 페이로드 구성
         payload = {
             "message": f"🔄 [Automated API Warehouse Sync] {github_target_path}",
             "content": content,
@@ -90,7 +93,7 @@ def upload_file_to_github_api(local_file_path, github_target_path):
             if response.status in [200, 201]:
                 return True
     except Exception as e:
-        print(f"GitHub API 통신 예외 수용: {e}")
+        print(f"GitHub API 통신 중 무시된 세션 예외: {e}")
     return False
 
 def commit_and_push_data():
@@ -140,37 +143,40 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [치명적 버그 해결] 대형 임베딩 모델 격리 캐싱 함수 (1초 미만 로딩 유지)
+# 2. 대형 임베딩 모델 격리 캐싱 및 자가 복구 인프라
 # ==========================================
 @st.cache_resource(show_spinner=False)
 def get_cached_embedding_function():
-    """
-    무거운 임베딩 모델 가중치만 메모리에 안전하게 격리 캐싱하여 
-    초기 로딩 1초 미만을 완벽 유지하고, DB 커넥션 객체 오염은 완벽 차단
-    """
+    """임베딩 모델 가중치만 메모리에 안전하게 격리 캐싱하여 1초 미만 로딩 보장"""
     return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
 
 def get_clean_infra_connection():
     """
-    StopIteration 메타데이터 깨짐을 방지하기 위해 
-    매 런타임 새로고침마다 순정 커넥션을 안전하게 재생성하는 팩토리 함수
+    [교착 상태 파쇄] anonymized_telemetry=False 설정을 이식하여
+    에러를 뿜어내던 텔레메트리 스레드를 영구 차단한 순정 커넥션 반환 함수
     """
     sentence_transformer_ef = get_cached_embedding_function()
 
+    # 텔레메트리 오작동을 영구 진압하는 크로마 세팅 객체 정의
+    chroma_settings = Settings(
+        anonymized_telemetry=False,
+        is_persistent=True
+    )
+
     try:
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
         collection = chroma_client.get_or_create_collection(
             name="competitor_patents", 
             embedding_function=sentence_transformer_ef
         )
-        collection.count() # 무결성 검증용 사전 호출
+        collection.count() # 무결성 사전 검증
     except (StopIteration, Exception):
-        # 꼬인 데이터 세그먼트 발견 즉시 자동 클렌징 후 재접속
+        # 파편화 찌꺼기 디렉토리 발견 시 즉시 초기화 복구
         if os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+        chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
         collection = chroma_client.get_or_create_collection(
             name="competitor_patents", 
             embedding_function=sentence_transformer_ef
@@ -291,7 +297,7 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    # 새로고침될 때마다 안전한 순정 DB 커넥션을 동적으로 획득
+    # 새로고침마다 안전하게 분리 조치된 순정 인프라 획득
     chroma_client, collection, llm = get_clean_infra_connection()
 
     col_title, col_logout = st.columns([8, 2])
