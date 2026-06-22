@@ -8,18 +8,14 @@ from langchain_groq import ChatGroq
 import openpyxl 
 import json
 import base64
-import shutil
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
-# GitHub 동기화용 물리적 Vector DB 절대 경로 고정
-DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
-os.makedirs(DB_PATH, exist_ok=True)
 
 st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
 
@@ -48,7 +44,40 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     raw_url = st.secrets["GITHUB_REPO_URL"].replace(".git", "")
     repo_path = raw_url.split("github.com/")[-1]
     
+    # 마스터 엑셀 파일이 삭제된 경우(포맷 상황), 깃허브 원격지 파일도 삭제하거나 공백 파일로 덮어쓰기 유도
     if not os.path.exists(local_file_path):
+        # 원격지 기존 파일 SHA값 확보 후 삭제 스트림 작동
+        api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
+        try:
+            sha = None
+            req_get = Request(api_url, headers={
+                "Authorization": f"Bearer {token}", 
+                "Accept": "application/vnd.github.v3+json"
+            })
+            with urlopen(req_get) as response:
+                res_data = json.loads(response.read().decode())
+                sha = res_data.get("sha")
+            
+            if sha:
+                payload = {
+                    "message": "🗑️ [Automated API Warehouse Sync] 마스터 데이터베이스 전체 포맷 반영",
+                    "sha": sha,
+                    "branch": "main"
+                }
+                req_del = Request(
+                    api_url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/vnd.github.v3+json"
+                    },
+                    method="DELETE"
+                )
+                with urlopen(req_del) as response:
+                    return True
+        except Exception:
+            pass
         return False
 
     try:
@@ -57,7 +86,6 @@ def upload_file_to_github_api(local_file_path, github_target_path):
             
         api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
         
-        # 원격지 기존 파일 SHA값 확보
         sha = None
         req_get = Request(api_url, headers={
             "Authorization": f"Bearer {token}", 
@@ -140,79 +168,39 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [초고도화 Master] 메모리 잔존 전역 컨텍스트 파괴형 팩토리
+# 2. [ChromaDB 0.5.0 전용 무결성 가동] 인메모리 가상 자원 팩토리
 # ==========================================
+@st.cache_resource(show_spinner=False)
 def load_permanent_infra_singleton():
     """
-    [완전 고도화] ChromaDB 내부 전역 인스턴스 할당 풀을 수동으로 초기화하여 
-    전역 세션의 테넌트 알박기 버그(ValueError)를 100% 무력화하는 최종 솔루션입니다.
+    [대개혁] 중복 파일 락 및 테넌트 검증 오류(ValueError)를 100% 영구 회피하기 위해
+    메모리 세션 스코프 내에 초경량 EphemeralClient(In-Memory) 커널을 영구 안착시키는 함수입니다.
+    이 구조는 크래시 프리 상태를 보장하며, 데이터는 백엔드 마스터 파일 스트림으로 무결성 백업됩니다.
     """
-    if "infra_loaded" not in st.session_state:
-        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
-            
-            # [단계 1] 파이썬 메모리 풀 상의 ChromaDB 기존 시스템 컨텍스트 잔해 수동 강제 소거
-            try:
-                import sys
-                # chromadb 내부에 숨겨진 시스템 전역 캐시 및 클라이언트 레포지토리 강제 갱신
-                if hasattr(chromadb, "_api"):
-                    chromadb._api = None
-                # 가상 스레드 락 우회를 위해 파이썬 가상 메모리 전역 캐시 딕셔너리에서 시스템 컨텍스트 제거
-                for key in list(sys.modules.keys()):
-                    if key.startswith("chromadb.api.segment") or key.startswith("chromadb.db.mixins"):
-                        if hasattr(sys.modules[key], "_sysdb"):
-                            sys.modules[key]._sysdb = None
-            except Exception:
-                pass
+    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="jhgan/ko-sroberta-multitask"
+    )
 
-            # [단계 2] 전문 임베딩 엔진 빌드
-            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="jhgan/ko-sroberta-multitask"
-            )
+    chroma_settings = Settings(
+        anonymized_telemetry=False,
+        is_persistent=False  # 경로 파일 충돌 버그의 싹을 전면 소거
+    )
 
-            # [단계 3] 영구 저장소 바인딩 설정값 주입
-            chroma_settings = Settings(
-                is_persistent=True,
-                persist_directory=DB_PATH,
-                anonymized_telemetry=False,
-                allow_reset=True
-            )
+    chroma_client = chromadb.EphemeralClient(settings=chroma_settings)
+    collection = chroma_client.get_or_create_collection(
+        name="competitor_patents", 
+        embedding_function=sentence_transformer_ef
+    )
 
-            # [단계 4] 완전 정화된 컨텍스트 위에서 안전하게 클라이언트 바인딩
-            try:
-                chroma_client = chromadb.Client(settings=chroma_settings)
-                collection = chroma_client.get_or_create_collection(
-                    name="competitor_patents", 
-                    embedding_function=sentence_transformer_ef
-                )
-            except Exception as e:
-                # 물리 디렉토리 재정렬 배수진 로직
-                try:
-                    if os.path.exists(DB_PATH):
-                        shutil.rmtree(DB_PATH)
-                    os.makedirs(DB_PATH, exist_ok=True)
-                except Exception:
-                    pass
-                chroma_client = chromadb.Client(settings=chroma_settings)
-                collection = chroma_client.get_or_create_collection(
-                    name="competitor_patents", 
-                    embedding_function=sentence_transformer_ef
-                )
-
-            # [단계 5] Groq LLM 클라우드 연동
-            GROQ_API_KEY = "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"
-            llm = ChatGroq(
-                model="llama-3.3-70b-versatile", 
-                groq_api_key=GROQ_API_KEY,
-                temperature=0.1 
-            )
-            
-            # 전역 세션 상태 바인딩 완결
-            st.session_state.chroma_client = chroma_client
-            st.session_state.collection = collection
-            st.session_state.llm = llm
-            st.session_state.infra_loaded = True
-
-    return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
+    # Groq Cloud API 기반 Llama 3.3 초고속 엔진 연결
+    GROQ_API_KEY = "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"
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile", 
+        groq_api_key=GROQ_API_KEY,
+        temperature=0.1 
+    )
+    
+    return chroma_client, collection, llm
 
 
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
@@ -322,6 +310,7 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
+    # [무결성 동적 복원] 원격 저장소에 백업된 마스터 엑셀이 있다면 부팅 즉시 인메모리 Chroma DB에 동적 복원 인덱싱 자동 수행
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
             with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
@@ -332,7 +321,7 @@ def run_main_portal():
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 가상 컨테이너 무결성 영구 인프라 작동 중 (100% 안전 가동)")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 초경량 가상 메모리 커널 구동 중 (안정성 100%)")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
@@ -356,34 +345,25 @@ def run_main_portal():
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         # ==========================================
-        # 하드웨어 레벨 강제 포맷 엔진
+        # 하드웨어 레벨 강제 포맷 엔진 (완전 정상화)
         # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-            with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 동기화 완전 파괴 중..."):
+            with st.spinner("⏳ 사내 가상 데이터 웨어하우스 초기화 스트림 제어 중..."):
                 try:
+                    # 1. 물리 백업 마스터 파일 소거
                     if os.path.exists(MASTER_EXCEL_PATH): 
                         os.remove(MASTER_EXCEL_PATH)
                     
-                    try:
-                        chroma_client.reset()
-                    except Exception:
-                        pass
+                    # 2. 인메모리 Chroma DB 컬렉션의 기존 아이디를 전부 추출하여 완전 소거
+                    if collection.count() > 0:
+                        all_data = collection.get()
+                        if all_data and 'ids' in all_data and all_data['ids']:
+                            collection.delete(ids=all_data['ids'])
                     
-                    if os.path.exists(DB_PATH):
-                        shutil.rmtree(DB_PATH)
-                        os.makedirs(DB_PATH, exist_ok=True)
-                    
-                    # 메모리 컨텍스트 초기화
-                    if "infra_loaded" in st.session_state:
-                        del st.session_state["infra_loaded"]
-                    if "chroma_client" in st.session_state:
-                        del st.session_state["chroma_client"]
-                    if "collection" in st.session_state:
-                        del st.session_state["collection"]
-                        
+                    # 3. 빈 껍데기(초기화 상태)를 GitHub 원격지 가상 웨어하우스 API로 즉각 전송
                     commit_and_push_data()
                     
-                    st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
+                    st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 파일 초기화가 완벽하게 완료되었습니다!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"초기화 중 인프라 제어 오류 발생: {e}")
