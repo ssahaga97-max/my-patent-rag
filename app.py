@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import os
 import chromadb
-from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
 import openpyxl 
@@ -15,8 +14,8 @@ from urllib.error import HTTPError
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
-# [본래 목적] 물리 Vector DB 영구 저장소 경로 고정
-DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
+# /tmp 경로 사용: Streamlit Cloud에서 항상 쓰기 가능하며 git에 커밋된 구버전 SQLite 파일 충돌 원천 차단
+DB_PATH = "/tmp/my_patent_vector_db"
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 os.makedirs(DB_PATH, exist_ok=True)
@@ -150,24 +149,15 @@ def load_permanent_infra_singleton():
                 model_name="jhgan/ko-sroberta-multitask"
             )
 
-            # [수정 사항 적용] 충돌을 유발하는이전 파라미터(is_persistent, persist_directory) 완전 삭제
-            chroma_settings = Settings(
-                anonymized_telemetry=False,
-                allow_reset=True
-            )
-
-            # [단계 2] PersistentClient 고유의 경로 관리 기능에 온전히 위임
+            # [단계 2] Settings 없이 PersistentClient 직접 호출 (버전 충돌 원천 차단)
             try:
-                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                chroma_client = chromadb.PersistentClient(path=DB_PATH)
             except Exception:
-                # 불완전하게 깨진 기존 디렉토리가 있을 경우 정화 후 재호출 트랙 안전 가동
-                try:
-                    if os.path.exists(DB_PATH):
-                        shutil.rmtree(DB_PATH)
-                    os.makedirs(DB_PATH, exist_ok=True)
-                except Exception:
-                    pass
-                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                # SQLite 스키마 손상 시 디렉토리 완전 정화 후 재생성
+                if os.path.exists(DB_PATH):
+                    shutil.rmtree(DB_PATH)
+                os.makedirs(DB_PATH, exist_ok=True)
+                chroma_client = chromadb.PersistentClient(path=DB_PATH)
             
             # [단계 3] 깨끗하게 초기화된 스키마 위에 시맨틱 RAG 특허 컬렉션 안전 결합
             collection = chroma_client.get_or_create_collection(
