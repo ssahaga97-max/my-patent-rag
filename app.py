@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
-# [고도화] GitHub 동기화용 물리적 Vector DB 절대 경로 고정
+# GitHub 동기화용 물리적 Vector DB 절대 경로 고정
 DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
@@ -119,7 +119,7 @@ def check_authentication():
         }
 
     if not st.session_state.logged_in:
-        st.title("🏛  맞춤형 인텔리전스 특허 가상 서버 인트라넷")
+        st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷")
         st.subheader("🔑 사내 연구원 로그인 인증")
         
         with st.form("login_form"):
@@ -140,47 +140,60 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [고도화] 글로벌 세션 스코프 싱글톤 인프라 팩토리
+# 2. [초고도화] 자가 치유형 전역 세션 인프라 팩토리
 # ==========================================
 def load_permanent_infra_singleton():
     """
-    @st.cache_resource의 메모리 락 결함을 우회하기 위해 st.session_state 커널에 
-    클라이언트 인프라를 영구 안착시킵니다. 이 구조는 '전체 포맷' 제어가 100% 무결하게 작동하도록 보장합니다.
+    부팅 시 구버전 SQLite 파일 락 및 손상(sqlite3.OperationalError)을 감지하면
+    스스로 폴더를 청소하고 인프라를 정상 구동하는 자가 치유형 엔진입니다.
     """
     if "infra_loaded" not in st.session_state:
-        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
-            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="jhgan/ko-sroberta-multitask"
-            )
+        # 무거운 모델 로드를 외부 루프 블록으로 안전화
+        sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="jhgan/ko-sroberta-multitask"
+        )
 
-            chroma_settings = Settings(
-                anonymized_telemetry=False,
-                allow_reset=True  # 포맷 명령어 커널 활성화
-            )
+        chroma_settings = Settings(
+            anonymized_telemetry=False,
+            allow_reset=True
+        )
 
-            try:
-                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
-            except ValueError:
-                # 클라우드 컨테이너 포트 충돌 및 세션 교착 우회
-                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
-                
+        # 자가 치유(Self-Healing) 내부 함수 정의
+        def init_chroma_core():
+            return chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+
+        try:
+            chroma_client = init_chroma_core()
+            collection = chroma_client.get_or_create_collection(
+                name="competitor_patents", 
+                embedding_function=sentence_transformer_ef
+            )
+        except Exception as infra_error:
+            # sqlite3.OperationalError 또는 다른 세션 충돌 시 물리 디렉토리 강제 정화
+            st.sidebar.warning("⚠️ 백엔드 데이터베이스 파일 충돌 감지: 자가 정화 커널 작동")
+            if os.path.exists(DB_PATH):
+                shutil.rmtree(DB_PATH)
+                os.makedirs(DB_PATH, exist_ok=True)
+            
+            # 클린 스토리지 환경에서 인프라 핵심 재부팅
+            chroma_client = init_chroma_core()
             collection = chroma_client.get_or_create_collection(
                 name="competitor_patents", 
                 embedding_function=sentence_transformer_ef
             )
 
-            GROQ_API_KEY = "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"
-            llm = ChatGroq(
-                model="llama-3.3-70b-versatile", 
-                groq_api_key=GROQ_API_KEY,
-                temperature=0.1 
-            )
-            
-            # 세션에 영구 제어권 바인딩
-            st.session_state.chroma_client = chroma_client
-            st.session_state.collection = collection
-            st.session_state.llm = llm
-            st.session_state.infra_loaded = True
+        GROQ_API_KEY = "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"
+        llm = ChatGroq(
+            model="llama-3.3-70b-versatile", 
+            groq_api_key=GROQ_API_KEY,
+            temperature=0.1 
+        )
+        
+        # 세션에 인프라 싱글톤 바인딩 완결
+        st.session_state.chroma_client = chroma_client
+        st.session_state.collection = collection
+        st.session_state.llm = llm
+        st.session_state.infra_loaded = True
 
     return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
 
@@ -347,7 +360,7 @@ def run_main_portal():
                         shutil.rmtree(DB_PATH)
                         os.makedirs(DB_PATH, exist_ok=True)
                     
-                    # 4. [가장 중요] 전역 메모리에 잡혀있던 싱글톤 인프라 인스턴스 완전 소거
+                    # 4. 전역 메모리에 잡혀있던 싱글톤 인프라 인스턴스 완전 소거
                     if "infra_loaded" in st.session_state:
                         del st.session_state["infra_loaded"]
                     if "chroma_client" in st.session_state:
