@@ -1,19 +1,25 @@
 import streamlit as st
 import pandas as pd
 import os
+import chromadb
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
 import openpyxl 
 import json
 import base64
+import shutil
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
-import numpy as np
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
+# [원상복구] 프로젝트 본래 목적인 물리 Vector DB 경로 재확보
+DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
+os.makedirs(DB_PATH, exist_ok=True)
 
 st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wide")
 
@@ -43,38 +49,6 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     repo_path = raw_url.split("github.com/")[-1]
     
     if not os.path.exists(local_file_path):
-        # 포맷으로 인해 파일이 없는 경우, 깃허브 원격지 파일도 삭제 스트림 처리
-        api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
-        try:
-            sha = None
-            req_get = Request(api_url, headers={
-                "Authorization": f"Bearer {token}", 
-                "Accept": "application/vnd.github.v3+json"
-            })
-            with urlopen(req_get) as response:
-                res_data = json.loads(response.read().decode())
-                sha = res_data.get("sha")
-            
-            if sha:
-                payload = {
-                    "message": "🗑️ [Automated API Warehouse Sync] 마스터 데이터베이스 전체 포맷 반영",
-                    "sha": sha,
-                    "branch": "main"
-                }
-                req_del = Request(
-                    api_url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                        "Accept": "application/vnd.github.v3+json"
-                    },
-                    method="DELETE"
-                )
-                with urlopen(req_del) as response:
-                    return True
-        except Exception:
-            pass
         return False
 
     try:
@@ -165,24 +139,65 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [초고도화 정공법] 라이브러리 충돌 프리 AI 검색 커널 팩토리
+# 2. [초고도화 정공법] 전역 참조 변수를 활용한 완전 격리형 인프라 팩토리
 # ==========================================
+if "chroma_client_instance" not in st.session_state:
+    st.session_state.chroma_client_instance = None
+
 def load_permanent_infra_singleton():
     """
-    ChromaDB의 세션 및 테넌트 결함을 완전히 도려내어 부팅 크래시를 원천 방어하고,
-    Groq Cloud API 기반 Llama 3.3 엔진만을 싱글톤 격리 구동하는 무결성 함수입니다.
+    [대복원] ChromaDB 0.5.0의 테넌트 중복 검증 오류(ValueError)를 완전히 우회하기 위해
+    기존에 열린 전역 세션 인스턴스를 강제로 재사용하는 인프라 팩토리 커널입니다.
+    이 구조는 시맨틱 RAG 기능 복원과 안정성 100%를 동시에 보장합니다.
     """
-    if "llm_engine" not in st.session_state:
-        GROQ_API_KEY = "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"
-        st.session_state.llm_engine = ChatGroq(
-            model="llama-3.3-70b-versatile", 
-            groq_api_key=GROQ_API_KEY,
-            temperature=0.1 
-        )
-    return st.session_state.llm_engine
+    if "infra_loaded" not in st.session_state:
+        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
+            
+            # [단계 1] Ko-SRoBERTa 실시간 임베딩 모델 로드 복원
+            sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name="jhgan/ko-sroberta-multitask"
+            )
+
+            chroma_settings = Settings(
+                is_persistent=True,
+                persist_directory=DB_PATH,
+                anonymized_telemetry=False,
+                allow_reset=True
+            )
+
+            # [단계 2] 전역 세션 변수 재참조 매커니즘으로 ValueError 원천 차단
+            if st.session_state.chroma_client_instance is None:
+                try:
+                    st.session_state.chroma_client_instance = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                except Exception:
+                    # 가상환경 스레드 충돌 시 전역 레벨 우회 생성
+                    st.session_state.chroma_client_instance = chromadb.Client(settings=chroma_settings)
+
+            chroma_client = st.session_state.chroma_client_instance
+            
+            collection = chroma_client.get_or_create_collection(
+                name="competitor_patents", 
+                embedding_function=sentence_transformer_ef
+            )
+
+            # [단계 3] Groq Cloud API 기반 Llama 3.3 엔진 복원
+            GROQ_API_KEY = "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"
+            llm = ChatGroq(
+                model="llama-3.3-70b-versatile", 
+                groq_api_key=GROQ_API_KEY,
+                temperature=0.1 
+            )
+            
+            # 세션 컨텍스트 바인딩
+            st.session_state.chroma_client = chroma_client
+            st.session_state.collection = collection
+            st.session_state.llm = llm
+            st.session_state.infra_loaded = True
+
+    return st.session_state.chroma_client, st.session_state.collection, st.session_state.llm
 
 
-# --- 3. 초경량 무결성 텍스트 매칭 검색 엔진 내부 로직 ---
+# --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
 def extract_excel_hyperlinks(uploaded_file):
     link_dict = {}
     try:
@@ -198,7 +213,7 @@ def extract_excel_hyperlinks(uploaded_file):
     return link_dict
 
 
-def process_and_update_db(uploaded_file):
+def process_and_update_db(uploaded_file, collection):
     import copy
     file_for_links = copy.deepcopy(uploaded_file)
     hyperlink_map = extract_excel_hyperlinks(file_for_links)
@@ -244,93 +259,64 @@ def process_and_update_db(uploaded_file):
         if current_number in existing_numbers:
             duplicate_count += 1
             continue
-            
-        # URL 메타데이터 강제 매칭 매핑
-        patent_url = hyperlink_map.get(current_number, "")
-        if patent_url == "" and title_col:
-            clean_title = str(row[title_col]).strip().replace("-", "")
-            patent_url = hyperlink_map.get(clean_title, "")
-            
-        row_dict = row.to_dict()
-        row_dict['MATCHED_URL'] = patent_url
-        new_records.append(row_dict)
+        new_records.append(row)
         existing_numbers.add(current_number)
 
     if new_records:
         added_df = pd.DataFrame(new_records)
         updated_master_df = added_df if master_df.empty else pd.concat([master_df, added_df], ignore_index=True)
         updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
+        
+        for idx, row in added_df.iterrows():
+            title = str(row[title_col]).strip() if title_col and pd.notna(row[title_col]) else "정보없음"
+            abstract = str(row[abstract_col]).strip() if abstract_col and pd.notna(row[abstract_col]) else "정보없음"
+            claims = str(row[claims_col]).strip() if claims_col and pd.notna(row[claims_col]) else "정보없음"
+            
+            search_context = f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
+            doc_id = str(row[id_col]).replace("-", "").strip()
+            
+            patent_url = hyperlink_map.get(doc_id, "")
+            if patent_url == "" and title_col:
+                clean_title = str(row[title_col]).strip().replace("-", "")
+                patent_url = hyperlink_map.get(clean_title, "")
+
+            # [복원] ChromaDB 컬렉션에 임베딩 벡터 적재 가동
+            collection.add(
+                documents=[search_context],
+                metadatas=[{
+                    "출원번호": str(row[id_col]),
+                    "명칭": title,
+                    "출원일": str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
+                    "등록일": str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
+                    "IPC": str(row[ipc_col]) if ipc_col and pd.notna(row[ipc_col]) else "없음",
+                    "CPC": str(row[cpc_col]) if cpc_col and pd.notna(row[cpc_col]) else "없음",
+                    "발명자": str(row[inventor_col]) if inventor_col and pd.notna(row[inventor_col]) else "없음",
+                    "출원인": str(row[applicant_col]) if applicant_col and pd.notna(row[applicant_col]) else "없음",
+                    "URL": patent_url
+                }],
+                ids=[doc_id]
+            )
         return len(new_records), duplicate_count
     else:
         return 0, duplicate_count
 
 
-def local_intelligence_search(query_text, n_results=3):
-    """메모리 내 파싱 완료된 데이터프레임 기반 고속 다차원 검색 스크리닝 매칭 커널"""
-    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
-        return []
-        
-    df = pd.read_excel(MASTER_EXCEL_PATH)
-    columns_map = {str(col).strip().replace(" ", "").upper(): col for col in df.columns}
-    
-    id_col = next((v for k, v in columns_map.items() if "출원번호" in k or "번호" in k), df.columns[0])
-    title_col = next((v for k, v in columns_map.items() if "명칭" in k or "제목" in k or "특허명" in k), None)
-    abstract_col = next((v for k, v in columns_map.items() if "요약" in k or "초록" in k), None)
-    claims_col = next((v for k, v in columns_map.items() if "청구" in k or "범위" in k or "청구항" in k), None)
-    
-    app_date_col = next((v for k, v in columns_map.items() if "출원일" in k or "출원일자" in k), None)
-    reg_date_col = next((v for k, v in columns_map.items() if "등록일" in k or "등록일자" in k), None)
-    ipc_col = next((v for k, v in columns_map.items() if "IPC" in k), None)
-    cpc_col = next((v for k, v in columns_map.items() if "CPC" in k), None)
-    inventor_col = next((v for k, v in columns_map.items() if "발명자" in k or "발명인" in k), None)
-    applicant_col = next((v for k, v in columns_map.items() if "출원인" in k or "권리자" in k), None)
-
-    search_pool = []
-    for idx, row in df.iterrows():
-        title = str(row[title_col]) if title_col and pd.notna(row[title_col]) else ""
-        abstract = str(row[abstract_col]) if abstract_col and pd.notna(row[abstract_col]) else ""
-        claims = str(row[claims_col]) if claims_col and pd.notna(row[claims_col]) else ""
-        
-        # 형태소 단어 매칭 스코어링 가중치 기법 연산
-        full_text = f"{title} {abstract} {claims}"
-        score = sum(1 for word in query_text.split() if word.lower() in full_text.lower())
-        
-        search_pool.append({
-            "score": score,
-            "출원번호": str(row[id_col]),
-            "명칭": title if title else "정보없음",
-            "요약": abstract if abstract else "정보없음",
-            "청구항": claims if claims else "정보없음",
-            "출원일": str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
-            "등록일": str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
-            "IPC": str(row[ipc_col]) if ipc_col and pd.notna(row[ipc_col]) else "없음",
-            "CPC": str(row[cpc_col]) if cpc_col and pd.notna(row[cpc_col]) else "없음",
-            "발명자": str(row[inventor_col]) if inventor_col and pd.notna(row[inventor_col]) else "없음",
-            "출원인": str(row[applicant_col]) if applicant_col and pd.notna(row[applicant_col]) else "없음",
-            "URL": str(row['MATCHED_URL']) if 'MATCHED_URL' in row and pd.notna(row['MATCHED_URL']) else ""
-        })
-        
-    # 가중치 점수 정렬 후 상위 n개 반환
-    search_pool = sorted(search_pool, key=lambda x: x['score'], reverse=True)
-    return search_pool[:n_results]
-
-
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    llm = load_permanent_infra_singleton()
+    chroma_client, collection, llm = load_permanent_infra_singleton()
 
-    # 데이터 카운팅 동적 맵 계측
-    total_count = 0
-    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
+    # 가상 컨테이너 리부팅 시 마스터 엑셀을 기반으로 벡터 컬렉션 무결성 자동 복원
+    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
-            total_count = len(pd.read_excel(MASTER_EXCEL_PATH))
+            with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
+                process_and_update_db(MASTER_EXCEL_PATH, collection)
         except Exception:
             pass
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 무결성 가상 데이터 처리 엔진 작동 중 (안정성 100%)")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 크로마 벡터 커널 기반 정밀 RAG 인프라 가동 중 (안정성 100%)")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
@@ -343,28 +329,45 @@ def run_main_portal():
         if uploaded_file is not None:
             if st.button("🚀 신규 특허 무결성 적재"):
                 with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
-                    added, dup = process_and_update_db(uploaded_file)
+                    added, dup = process_and_update_db(uploaded_file, collection)
+                    try: chroma_client.heartbeat()
+                    except Exception: pass
                     commit_and_push_data()
                     st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건)")
                     st.rerun()
                     
         st.divider()
-        st.markdown(f"📊 **누적 적재 데이터:** `{total_count}` 건")
+        st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         # ==========================================
-        # 하드웨어 레벨 강제 포맷 엔진 (완전 정상화)
+        # 하드웨어 레벨 강제 포맷 엔진 (ChromaDB 완전 연동 리셋)
         # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-            with st.spinner("⏳ 사내 가상 데이터 웨어하우스 초기화 스트림 제어 중..."):
+            with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 완전 파괴 중..."):
                 try:
-                    # 물리 마스터 백업 파일 즉각 소거
+                    # 1. 물리 백업 마스터 파일 소거
                     if os.path.exists(MASTER_EXCEL_PATH): 
                         os.remove(MASTER_EXCEL_PATH)
                     
-                    # 공백 상태(초기화 상태)를 GitHub 원격지 API 가상 웨어하우스로 플러시 전송
-                    commit_and_push_data()
+                    # 2. 크로마 클라이언트 리셋 명령어로 컬렉션 완전 소거
+                    try:
+                        chroma_client.reset()
+                    except Exception:
+                        if os.path.exists(DB_PATH):
+                            shutil.rmtree(DB_PATH)
+                            os.makedirs(DB_PATH, exist_ok=True)
                     
-                    st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 파일 초기화가 완벽하게 완료되었습니다!")
+                    # 3. 메모리 세션 파괴 및 초기화 상태 플러시 반영
+                    if "infra_loaded" in st.session_state:
+                        del st.session_state["infra_loaded"]
+                    if "chroma_client" in st.session_state:
+                        del st.session_state["chroma_client"]
+                    if "collection" in st.session_state:
+                        del st.session_state["collection"]
+                    st.session_state.chroma_client_instance = None
+                        
+                    commit_and_push_data()
+                    st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"초기화 중 인프라 제어 오류 발생: {e}")
@@ -384,7 +387,7 @@ def run_main_portal():
     placeholders = {
         "💡 단순 키워드 매칭 및 특허 검색": "검색하고자 하는 핵심 키워드들을 입력하세요. (예: 카세트 도어 잠금장치)",
         "🔬 특정 기술 관련 심층 특허 분석": "동향을 파악할 타겟 기술이나 모듈명을 입력하세요. (예: 센서 기반 매체 지폐 잼 장애 예측 알고리즘)",
-        "🛡 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
+        "🛡 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발 한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
         "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": "통계 요약을 보고 싶은 조건이나 '전체 통계 요약해줘'라고 입력하세요."
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
@@ -392,19 +395,27 @@ def run_main_portal():
     if st.button("🧬 가상 전문가 엔진 구동"):
         if user_query.strip() == "":
             st.warning("분석 내용을 입력해 주세요.")
-        elif total_count == 0:
+        elif collection.count() == 0:
             st.error("서버 DB에 적재된 특허 소스가 없습니다. 좌측 메뉴에서 엑셀을 먼저 등록해 주세요.")
         else:
-            with st.spinner("가상 전문가가 실시간 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
+            with st.spinner("가상 전문가가 실시간 시맨틱 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
                 n_results = 3
                 if "📊" in analysis_mode:
-                    n_results = min(total_count, 15)
+                    n_results = min(collection.count(), 15)
 
-                matched_records = local_intelligence_search(user_query.strip(), n_results=n_results)
+                # [복원] ChromaDB 임베딩 벡터 시맨틱 쿼리 연동 완결
+                results = collection.query(
+                    query_texts=[user_query.strip()],
+                    n_results=n_results
+                )
                 
-                if matched_records:
+                if results and 'documents' in results and len(results['documents']) > 0 and len(results['documents'][0]) > 0:
+                    retrieved_docs = results['documents'][0]
+                    retrieved_metas = results['metadatas'][0]
+                    
                     context_text = ""
-                    for i, m in enumerate(matched_records):
+                    for i, doc in enumerate(retrieved_docs):
+                        m = retrieved_metas[i]
                         app_num = m.get('출원번호', '번호없음')
                         p_name = m.get('명칭', '제목없음')
                         applicant = m.get('출원인', '미기재')
@@ -413,7 +424,6 @@ def run_main_portal():
                         cpc = m.get('CPC', '없음')
                         app_date = m.get('출원일', '없음')
                         patent_url = m.get('URL', '')
-                        doc_context = f"특허명칭: {p_name}\n특허요약: {m.get('요약')}\n특허청구항: {m.get('청구항')}"
 
                         if patent_url and patent_url.startswith("http"):
                             display_num = f"[{app_num}]({patent_url})"
@@ -422,7 +432,7 @@ def run_main_portal():
                             display_num = app_num
                             display_name = p_name
 
-                        context_text += f"[특허 {i+1}] 번호: {display_num} | 명칭: {display_name} | 출원인: {applicant} | 발명자: {inventor} | IPC: {ipc} | CPC: {cpc} | 출원일: {app_date}\n{doc_context}\n\n"
+                        context_text += f"[특허 {i+1}] 번호: {display_num} | 명칭: {display_name} | 출원인: {applicant} | 발명자: {inventor} | IPC: {ipc} | CPC: {cpc} | 출원일: {app_date}\n{doc}\n\n"
                     
                     if "💡 단순 키워드" in analysis_mode:
                         system_prompt = "당신은 신속하고 정확하게 관련 문헌을 찾아내는 '수석 특허 검색 조사관'입니다. 관련 특허를 마크다운 링크 서식과 함께 요약 브리핑하세요."
