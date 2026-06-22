@@ -15,7 +15,7 @@ from urllib.error import HTTPError
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
-# 프로젝트 본래 목적인 물리 Vector DB 영구 저장소 경로 고정
+# [본래 목적] 물리 Vector DB 영구 저장소 경로 고정
 DB_PATH = os.path.join(BASE_DIR, "my_patent_vector_db")
 
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
@@ -37,10 +37,6 @@ if "user_id" not in st.session_state:
 # [인프라 무결성 안착] GitHub API 강제 업로드 엔진
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
-    """
-    Streamlit 내부 파일 감시자 간섭 및 I/O 교착을 완벽히 우회하여
-    GitHub REST API를 통해 Private 저장소에 데이터를 Direct 적재하는 함수
-    """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
         return False
         
@@ -97,7 +93,6 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     return False
 
 def commit_and_push_data():
-    """가상 컨테이너 리부팅 대응용 마스터 엑셀 백업 스트림 엔진"""
     excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
     if excel_status:
         st.toast("💾 사내 가상 데이터 웨어하우스(GitHub) 마스터 엑셀 영구 동기화 완료!")
@@ -139,17 +134,13 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [완전 영구 결착] 파썬 전역 네임스페이스 격리형 인프라 팩토리
+# 2. [충돌 해제] 무결성 싱글톤 인프라 팩토리
 # ==========================================
-# Streamlit의 멀티스레드가 접근할 수 없는 파이썬 전역 실행 스코프 수준에 참조 앵커 배치
-if "_GLOBAL_CHROMA_KERNEL" not in globals():
-    globals()["_GLOBAL_CHROMA_KERNEL"] = None
-
 def load_permanent_infra_singleton():
     """
-    [대종결] 저수준 임포트(ModuleNotFoundError)와 테넌트 검증 오류(ValueError)를 동시에 종결하기 위해
-    파이썬 전역 메모리 네임스페이스의 인스턴스를 강제로 바인딩하여 재활용하는 마스터 엔진입니다.
-    이 구조는 무조건 성공하는 빌드 상태와 시맨틱 특허 RAG 목적을 완벽하게 동시 달성합니다.
+    [커서 진단 반영 완결]
+    Settings에서 중복되는 영속성 파라미터를 완전히 거세하여 SQLite 스키마 충돌을 원천 차단하고,
+    수천 건의 시맨틱 특허 RAG 시스템의 본질인 임베딩 및 클라이언트 자원을 정상 확보합니다.
     """
     if "infra_loaded" not in st.session_state:
         with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
@@ -159,31 +150,26 @@ def load_permanent_infra_singleton():
                 model_name="jhgan/ko-sroberta-multitask"
             )
 
+            # [수정 사항 적용] 충돌을 유발하는이전 파라미터(is_persistent, persist_directory) 완전 삭제
             chroma_settings = Settings(
-                is_persistent=True,
-                persist_directory=DB_PATH,
                 anonymized_telemetry=False,
                 allow_reset=True
             )
 
-            # [단계 2] C-레벨 전역 변수 가로채기 매커니즘 작동 (ValueError 필터 완전 패스)
-            if globals()["_GLOBAL_CHROMA_KERNEL"] is None:
+            # [단계 2] PersistentClient 고유의 경로 관리 기능에 온전히 위임
+            try:
+                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+            except Exception:
+                # 불완전하게 깨진 기존 디렉토리가 있을 경우 정화 후 재호출 트랙 안전 가동
                 try:
-                    globals()["_GLOBAL_CHROMA_KERNEL"] = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                    if os.path.exists(DB_PATH):
+                        shutil.rmtree(DB_PATH)
+                    os.makedirs(DB_PATH, exist_ok=True)
                 except Exception:
-                    # 가상환경 파일 시스템 교착 발생 시 물리 초기화 후 강제 리빌드 우회
-                    try:
-                        if os.path.exists(DB_PATH):
-                            shutil.rmtree(DB_PATH)
-                        os.makedirs(DB_PATH, exist_ok=True)
-                    except Exception:
-                        pass
-                    globals()["_GLOBAL_CHROMA_KERNEL"] = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
+                    pass
+                chroma_client = chromadb.PersistentClient(path=DB_PATH, settings=chroma_settings)
             
-            # 전역 공간에 안착된 커널 소스 로드
-            chroma_client = globals()["_GLOBAL_CHROMA_KERNEL"]
-            
-            # [단계 3] 안정적으로 시맨틱 RAG 특허 컬렉션 생성 및 주입
+            # [단계 3] 깨끗하게 초기화된 스키마 위에 시맨틱 RAG 특허 컬렉션 안전 결합
             collection = chroma_client.get_or_create_collection(
                 name="competitor_patents", 
                 embedding_function=sentence_transformer_ef
@@ -197,7 +183,6 @@ def load_permanent_infra_singleton():
                 temperature=0.1 
             )
             
-            # 세션 컨텍스트 싱글톤 바인딩 완결
             st.session_state.chroma_client = chroma_client
             st.session_state.collection = collection
             st.session_state.llm = llm
@@ -289,7 +274,7 @@ def process_and_update_db(uploaded_file, collection):
                 clean_title = str(row[title_col]).strip().replace("-", "")
                 patent_url = hyperlink_map.get(clean_title, "")
 
-            # [본질 사수] 의미론적 유사도 분석 RAG를 위한 ChromaDB 벡터 공간 적재
+            # 경쟁사 특허 RAG 목적에 부합하는 시맨틱 인덱싱 벡터화 실행
             collection.add(
                 documents=[search_context],
                 metadatas=[{
@@ -314,7 +299,6 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
-    # 가상 컨테이너 리부팅 시 마스터 엑셀을 기반으로 벡터 컬렉션 무결성 자동 동적 인덱싱 복원 보장
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
             with st.spinner("📦 가상 웨어하우스로부터 영구 자원 인덱싱 동적 복원 중..."):
@@ -348,17 +332,12 @@ def run_main_portal():
         st.divider()
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
-        # ==========================================
-        # 하드웨어 레벨 강제 포맷 엔진 (ChromaDB 물리 연동 완전 리셋)
-        # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
             with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 완전 초기화 중..."):
                 try:
-                    # 1. 물리 백업 마스터 파일 즉각 삭제
                     if os.path.exists(MASTER_EXCEL_PATH): 
                         os.remove(MASTER_EXCEL_PATH)
                     
-                    # 2. 크로마 클라이언트 리셋 명령어로 컬렉션 내부 물리 파일 완전 소거
                     try:
                         chroma_client.reset()
                     except Exception:
@@ -366,14 +345,12 @@ def run_main_portal():
                             shutil.rmtree(DB_PATH)
                             os.makedirs(DB_PATH, exist_ok=True)
                     
-                    # 3. 전역 네임스페이스 및 메모리 세션 파괴 완결
                     if "infra_loaded" in st.session_state:
                         del st.session_state["infra_loaded"]
                     if "chroma_client" in st.session_state:
                         del st.session_state["chroma_client"]
                     if "collection" in st.session_state:
                         del st.session_state["collection"]
-                    globals()["_GLOBAL_CHROMA_KERNEL"] = None
                         
                     commit_and_push_data()
                     st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
@@ -412,7 +389,6 @@ def run_main_portal():
                 if "📊" in analysis_mode:
                     n_results = min(collection.count(), 15)
 
-                # [본래 목적의 완벽한 실현] ChromaDB 임베딩 벡터 시맨틱 다차원 쿼리 스트림 정상 가동
                 results = collection.query(
                     query_texts=[user_query.strip()],
                     n_results=n_results
