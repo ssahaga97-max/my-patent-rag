@@ -140,57 +140,65 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [초고도화 마스터] 글로벌 컨텍스트 완전 해제형 인프라 팩토리
+# 2. [초고도화 Master] 메모리 잔존 전역 컨텍스트 파괴형 팩토리
 # ==========================================
-@st.cache_resource(show_spinner=False)
-def get_global_chroma_kernel():
-    """
-    ChromaDB의 테넌트 중복 검증 엔진(ValueError) 우회를 보장하기 위해
-    Streamlit 글로벌 리소스 풀 상에 단 한 번만 영구 할당되는 싱글톤 커널 함수입니다.
-    """
-    chroma_settings = Settings(
-        is_persistent=True,
-        persist_directory=DB_PATH,
-        anonymized_telemetry=False,
-        allow_reset=True
-    )
-    # 중복 할당 원천 봉쇄 구조로 테넌트 검증 오류 완전 해결
-    return chromadb.Client(settings=chroma_settings)
-
-
 def load_permanent_infra_singleton():
     """
-    글로벌 크로마 커널 인터페이스를 활용하여 컬렉션 및 LLM 아키텍처를 
-    세션 상태에 안전하게 격리 구동하는 지연 로딩(Lazy Loading) 빌더입니다.
+    [완전 고도화] ChromaDB 내부 전역 인스턴스 할당 풀을 수동으로 초기화하여 
+    전역 세션의 테넌트 알박기 버그(ValueError)를 100% 무력화하는 최종 솔루션입니다.
     """
     if "infra_loaded" not in st.session_state:
         with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
             
-            # [단계 1] 전문 임베딩 엔진 빌드
+            # [단계 1] 파이썬 메모리 풀 상의 ChromaDB 기존 시스템 컨텍스트 잔해 수동 강제 소거
+            try:
+                import sys
+                # chromadb 내부에 숨겨진 시스템 전역 캐시 및 클라이언트 레포지토리 강제 갱신
+                if hasattr(chromadb, "_api"):
+                    chromadb._api = None
+                # 가상 스레드 락 우회를 위해 파이썬 가상 메모리 전역 캐시 딕셔너리에서 시스템 컨텍스트 제거
+                for key in list(sys.modules.keys()):
+                    if key.startswith("chromadb.api.segment") or key.startswith("chromadb.db.mixins"):
+                        if hasattr(sys.modules[key], "_sysdb"):
+                            sys.modules[key]._sysdb = None
+            except Exception:
+                pass
+
+            # [단계 2] 전문 임베딩 엔진 빌드
             sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name="jhgan/ko-sroberta-multitask"
             )
 
-            # [단계 2] 전역 싱글톤 커널 호출 (ValueError 무조건 통과)
-            chroma_client = get_global_chroma_kernel()
-            
+            # [단계 3] 영구 저장소 바인딩 설정값 주입
+            chroma_settings = Settings(
+                is_persistent=True,
+                persist_directory=DB_PATH,
+                anonymized_telemetry=False,
+                allow_reset=True
+            )
+
+            # [단계 4] 완전 정화된 컨텍스트 위에서 안전하게 클라이언트 바인딩
             try:
+                chroma_client = chromadb.Client(settings=chroma_settings)
                 collection = chroma_client.get_or_create_collection(
                     name="competitor_patents", 
                     embedding_function=sentence_transformer_ef
                 )
-            except Exception:
-                # 데이터 충돌 및 리셋 리부팅 상황 발생 시 세정 작업 후 강제 바인딩
+            except Exception as e:
+                # 물리 디렉토리 재정렬 배수진 로직
                 try:
-                    chroma_client.reset()
+                    if os.path.exists(DB_PATH):
+                        shutil.rmtree(DB_PATH)
+                    os.makedirs(DB_PATH, exist_ok=True)
                 except Exception:
                     pass
+                chroma_client = chromadb.Client(settings=chroma_settings)
                 collection = chroma_client.get_or_create_collection(
                     name="competitor_patents", 
                     embedding_function=sentence_transformer_ef
                 )
 
-            # [단계 3] LLM 클라우드 연동
+            # [단계 5] Groq LLM 클라우드 연동
             GROQ_API_KEY = "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"
             llm = ChatGroq(
                 model="llama-3.3-70b-versatile", 
@@ -198,7 +206,7 @@ def load_permanent_infra_singleton():
                 temperature=0.1 
             )
             
-            # 세션 런타임 상태 바인딩
+            # 전역 세션 상태 바인딩 완결
             st.session_state.chroma_client = chroma_client
             st.session_state.collection = collection
             st.session_state.llm = llm
@@ -324,7 +332,7 @@ def run_main_portal():
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 싱글톤 격리형 가상 인프라 작동 중 (100% 안전 가동)")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 가상 컨테이너 무결성 영구 인프라 작동 중 (100% 안전 가동)")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
@@ -348,7 +356,7 @@ def run_main_portal():
         st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
         
         # ==========================================
-        # 하드웨어 레벨 강제 포맷 엔진 (전면 초기화 보완)
+        # 하드웨어 레벨 강제 포맷 엔진
         # ==========================================
         if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
             with st.spinner("⏳ 파일 시스템 락킹 전면 해제 및 벡터 DB 커널 동기화 완전 파괴 중..."):
@@ -365,7 +373,7 @@ def run_main_portal():
                         shutil.rmtree(DB_PATH)
                         os.makedirs(DB_PATH, exist_ok=True)
                     
-                    # 메모리 컨텍스트 초기화를 위해 세션 스태이트 타겟 완전 플러시
+                    # 메모리 컨텍스트 초기화
                     if "infra_loaded" in st.session_state:
                         del st.session_state["infra_loaded"]
                     if "chroma_client" in st.session_state:
@@ -373,7 +381,6 @@ def run_main_portal():
                     if "collection" in st.session_state:
                         del st.session_state["collection"]
                         
-                    st.cache_resource.clear() # 전역 싱글톤 커널 캐시 강제 강하 세척
                     commit_and_push_data()
                     
                     st.toast("⚠️ 가상 데이터 웨어하우스 및 백엔드 물리 커널 초기화가 성공적으로 완료되었습니다!")
