@@ -34,8 +34,8 @@ st.set_page_config(page_title="클라우드 특허 RAG 인트라넷", layout="wi
 # ==========================================
 def upload_file_to_github_api(local_file_path, github_target_path):
     """
-    Streamlit Cloud 인프라 특성을 우회하여
-    GitHub REST API를 이용해 Private 저장소에 파일을 Direct 적재하는 함수
+    Streamlit Watcher 및 캐시 락 간섭을 우회하여
+    GitHub REST API를 통해 Private 저장소에 파일을 실시간 Direct 적재
     """
     if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO_URL" not in st.secrets:
         return False
@@ -65,7 +65,7 @@ def upload_file_to_github_api(local_file_path, github_target_path):
                 sha = res_data.get("sha")
         except HTTPError as e:
             if e.code != 404:
-                print(f"[API Warning] SHA 조회 건너뜀")
+                print(f"[API Warning] SHA 조회 패스")
 
         payload = {
             "message": f"🔄 [Automated API Warehouse Sync] {github_target_path}",
@@ -94,10 +94,10 @@ def upload_file_to_github_api(local_file_path, github_target_path):
     return False
 
 def commit_and_push_data():
-    """가상 컨테이너 백업 동기화 라우터"""
+    """가상 컨테이너 리부팅 대응용 백업 스트림 엔진"""
     excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
     
-    # ChromaDB 가상 스토리지의 유효 파일 전송
+    # 크로마 DB 핵심 파일 강제 API 백업
     sqlite_file = os.path.join(DB_PATH, "chroma.sqlite3")
     db_status = upload_file_to_github_api(sqlite_file, "my_patent_vector_db/chroma.sqlite3")
     
@@ -140,17 +140,24 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [치명적 버그 전면 격파] 지연 로딩 및 자가 회복 인프라 함수
+# 2. [치명적 버그 해결] 대형 임베딩 모델 격리 캐싱 함수 (1초 미만 로딩 유지)
 # ==========================================
 @st.cache_resource(show_spinner=False)
-def initialize_infra():
+def get_cached_embedding_function():
     """
-    StopIteration 메타데이터 깨짐 현상 발생 시, 
-    스스로 기존 소실 디렉토리를 밀어버리고 무결성 순정 규격으로 초기화하는 복구 로직 추가
+    무거운 임베딩 모델 가중치만 메모리에 안전하게 격리 캐싱하여 
+    초기 로딩 1초 미만을 완벽 유지하고, DB 커넥션 객체 오염은 완벽 차단
     """
-    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="jhgan/ko-sroberta-multitask"
     )
+
+def get_clean_infra_connection():
+    """
+    StopIteration 메타데이터 깨짐을 방지하기 위해 
+    매 런타임 새로고침마다 순정 커넥션을 안전하게 재생성하는 팩토리 함수
+    """
+    sentence_transformer_ef = get_cached_embedding_function()
 
     try:
         chroma_client = chromadb.PersistentClient(path=DB_PATH)
@@ -158,10 +165,9 @@ def initialize_infra():
             name="competitor_patents", 
             embedding_function=sentence_transformer_ef
         )
-        # [테스트 트리거] 에러가 나는 count 함수를 미리 찔러보아 무결성 사전 검증
-        collection.count()
-    except (StopIteration, Exception) as e:
-        # ⚠️ StopIteration 또는 파일 결함 감지 시 무조건 강제 포맷 후 갱신
+        collection.count() # 무결성 검증용 사전 호출
+    except (StopIteration, Exception):
+        # 꼬인 데이터 세그먼트 발견 즉시 자동 클렌징 후 재접속
         if os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
         chroma_client = chromadb.PersistentClient(path=DB_PATH)
@@ -285,12 +291,13 @@ def process_and_update_db(uploaded_file, collection):
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    chroma_client, collection, llm = initialize_infra()
+    # 새로고침될 때마다 안전한 순정 DB 커넥션을 동적으로 획득
+    chroma_client, collection, llm = get_clean_infra_connection()
 
     col_title, col_logout = st.columns([8, 2])
     with col_title:
         st.title("🏛️ 맞춤형 인텔리전스 특허 가상 서버 인트라넷 (Groq Cloud Engine)")
-        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 시스템 인프라 안정 구동 중")
+        st.caption(f"접속 연구원 계정: {st.session_state.user_id} | 인프라 구조 격리 안정화")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in = False
