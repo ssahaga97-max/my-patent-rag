@@ -37,6 +37,9 @@ if "user_id" not in st.session_state:
     st.session_state.user_id = None
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
+# 프로세스 재시작 감지용 플래그 — @st.cache_resource가 초기화되면 항상 True
+if "github_synced" not in st.session_state:
+    st.session_state.github_synced = False
 
 
 # ==========================================
@@ -183,6 +186,17 @@ def upload_user_registry_to_github() -> bool:
     return upload_file_to_github_api(USER_REGISTRY_PATH, "my_patent_folder/user_registry.json")
 
 
+def sync_all_from_github():
+    """
+    세션 최초 진입 시(프로세스 재시작 감지) GitHub에서 모든 영구 데이터를 무조건 동기화.
+    조건부 다운로드(파일 없을 때만) 방식의 누락을 원천 차단.
+    반환값: (excel_ok, registry_ok)
+    """
+    excel_ok    = download_master_excel_from_github()
+    registry_ok = download_user_registry_from_github()
+    return excel_ok, registry_ok
+
+
 # ==========================================
 # [관리자 알림] 가입 이메일 발송 엔진
 # ==========================================
@@ -323,6 +337,11 @@ def check_authentication():
     if os.path.exists(logo_path):
         st.image(logo_path, width=160)
     st.title("AI 경쟁사 특허 조사 분석")
+
+    # 로그인 화면 진입 시에도 레지스트리가 없으면 GitHub에서 복원
+    if not os.path.exists(USER_REGISTRY_PATH):
+        download_user_registry_from_github()
+
     tab_login, tab_register = st.tabs(["🔑 로그인", "📝 신규 회원 가입"])
 
     # ── 로그인 탭 ──
@@ -576,24 +595,30 @@ def process_and_update_db(uploaded_file, collection):
 def run_main_portal():
     chroma_client, collection, llm = load_permanent_infra_singleton()
 
-    # 컨테이너 재시작 시 로고 파일 자동 복원
-    download_logo_from_github()
+    # ── 세션 최초 진입 시: GitHub → 로컬 전체 동기화 ──
+    # github_synced는 세션 단위 플래그. 프로세스 재시작(컨테이너 재생성) 시 항상 False로 초기화됨.
+    if not st.session_state.github_synced:
+        download_logo_from_github()
+        with st.spinner("🔄 GitHub 데이터 웨어하우스 동기화 중..."):
+            excel_ok, registry_ok = sync_all_from_github()
 
-    # [데이터 휘발 방지] 컨테이너 재시작 후 로컬 엑셀이 없으면 GitHub에서 즉시 복원
-    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
-        with st.spinner("🔄 GitHub 데이터 웨어하우스에서 마스터 엑셀 복원 중..."):
-            restored = download_master_excel_from_github()
-            if restored:
-                st.toast("✅ GitHub로부터 마스터 데이터 복원 완료!")
+        if excel_ok:
+            st.toast("✅ 마스터 특허 데이터 복원 완료")
+        if registry_ok:
+            st.toast("✅ 회원 정보 복원 완료")
+        if not excel_ok and not registry_ok:
+            st.toast("ℹ️ GitHub 동기화 건너뜀 (신규 배포 또는 시크릿 미설정)")
 
-    # 엑셀은 있지만 /tmp ChromaDB가 비어 있으면(재시작) 자동 재인덱싱
+        st.session_state.github_synced = True
+
+    # ChromaDB가 비어 있으면(재시작) 엑셀 기반 자동 재인덱싱
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
-            with st.spinner("📦 마스터 데이터 기반 벡터 DB 자동 재인덱싱 중... (첫 접속 시 1~2분 소요)"):
+            with st.spinner("📦 벡터 DB 자동 재인덱싱 중... (특허 수에 따라 1~3분 소요)"):
                 process_and_update_db(MASTER_EXCEL_PATH, collection)
-            st.toast(f"✅ 벡터 DB 복원 완료! ({collection.count()}건 인덱싱됨)")
+            st.toast(f"✅ 벡터 DB 복원 완료 ({collection.count()}건)")
         except Exception as e:
-            st.warning(f"자동 재인덱싱 중 오류 발생: {e}")
+            st.warning(f"자동 재인덱싱 오류: {e}")
 
     is_admin = st.session_state.get("is_admin", False)
 
@@ -617,6 +642,17 @@ def run_main_portal():
     with st.sidebar:
         if is_admin:
             st.header("📂 데이터 관리 센터")
+
+            # GitHub 수동 재동기화 버튼
+            if st.button("🔄 GitHub 데이터 강제 재동기화", use_container_width=True):
+                with st.spinner("GitHub → 로컬 전체 동기화 중..."):
+                    excel_ok, reg_ok = sync_all_from_github()
+                if excel_ok or reg_ok:
+                    st.session_state.github_synced = False  # 재인덱싱 재실행 유도
+                    st.toast("✅ 동기화 완료 — 앱을 새로고침하면 최신 데이터가 반영됩니다.")
+                else:
+                    st.toast("⚠️ GitHub 동기화 실패 — GITHUB_TOKEN 시크릿을 확인하세요.")
+            st.divider()
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
             if uploaded_file is not None:
                 if st.button("🚀 신규 특허 무결성 적재"):
