@@ -891,11 +891,28 @@ def run_main_portal():
             if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
                 with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
                     try:
+                        # 마스터 엑셀 삭제
                         if os.path.exists(MASTER_EXCEL_PATH):
                             os.remove(MASTER_EXCEL_PATH)
+                        # EphemeralClient는 _build_infra.clear() 없이
+                        # 컬렉션을 직접 초기화 — 캐시 파괴 시 스탈 참조로 인한
+                        # 'no such table' 오류를 방지한다.
+                        try:
+                            chroma_client.delete_collection("competitor_patents")
+                        except Exception:
+                            pass
+                        sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                            model_name="jhgan/ko-sroberta-multitask"
+                        )
+                        new_col = chroma_client.get_or_create_collection(
+                            name="competitor_patents",
+                            embedding_function=sentence_transformer_ef
+                        )
+                        # 캐시된 인프라의 collection을 교체할 수 없으므로
+                        # 캐시를 초기화하고 새 세션에서 다시 빌드하도록 유도
                         _build_infra.clear()
-                        if "infra_initialized" in st.session_state:
-                            del st.session_state["infra_initialized"]
+                        st.session_state.pop("infra_initialized", None)
+                        st.session_state.github_synced = False
                         st.toast("✅ 데이터 웨어하우스 전체 초기화 완료. 새 엑셀을 업로드해 주세요.")
                         st.rerun()
                     except Exception as e:
