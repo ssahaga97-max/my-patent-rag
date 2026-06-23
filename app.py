@@ -153,15 +153,15 @@ def upload_file_to_github_api(local_file_path, github_target_path):
             "Accept": "application/vnd.github.v3+json"
         })
         try:
-            with urlopen(req_get) as response:
+            with urlopen(req_get, timeout=15) as response:
                 res_data = json.loads(response.read().decode())
                 sha = res_data.get("sha")
         except HTTPError as e:
             if e.code != 404:
-                print(f"[API Warning] SHA 획득 생략")
+                print(f"[API Warning] SHA 획득 실패: HTTP {e.code}")
 
         payload = {
-            "message": f"🔄 [Automated API Warehouse Sync] {github_target_path}",
+            "message": f"[Automated Sync] {github_target_path}",
             "content": content,
             "branch": "main"
         }
@@ -179,20 +179,35 @@ def upload_file_to_github_api(local_file_path, github_target_path):
             method="PUT"
         )
         
-        with urlopen(req_put) as response:
-            if response.status in [200, 201]:
-                return True
+        try:
+            with urlopen(req_put, timeout=120) as response:
+                if response.status in [200, 201]:
+                    return True
+                print(f"GitHub PUT 예상 외 응답: HTTP {response.status}")
+                return False
+        except HTTPError as e:
+            print(f"GitHub PUT 실패: HTTP {e.code} {e.reason} — {e.read().decode(errors='ignore')[:200]}")
+            return False
     except Exception as e:
         print(f"GitHub API 통신 중 예외 제어: {e}")
     return False
 
-def commit_and_push_data():
-    """마스터 엑셀을 GitHub에 업로드하여 컨테이너 재시작 후에도 데이터가 복원될 수 있도록 보존."""
+def commit_and_push_data() -> bool:
+    """마스터 엑셀을 GitHub에 업로드하여 컨테이너 재시작 후에도 데이터가 복원될 수 있도록 보존.
+    반환값: True=GitHub 업로드 성공, False=실패.
+    """
     excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
     if excel_status:
-        st.toast("💾 GitHub 데이터 웨어하우스 동기화 완료 — 재시작 후 자동 복원 보장!")
+        st.toast("💾 GitHub 백업 완료 — 재시작 후에도 데이터가 자동 복원됩니다!")
     else:
-        st.toast("⚠️ GitHub 동기화 실패 — Secrets에서 GITHUB_TOKEN을 TOML 최상위(섹션 헤더 위)에 배치했는지 확인하세요.")
+        st.error(
+            "❌ **GitHub 백업 실패!**  \n"
+            "특허 데이터가 현재 세션 ChromaDB에는 적재되었지만 GitHub에 저장되지 않았습니다.  \n"
+            "**컨테이너 재시작 시 데이터가 소실됩니다.**  \n\n"
+            "👉 좌측 사이드바 **'🔍 GitHub 연결 진단'** 버튼으로 원인 파악 후,  \n"
+            "**'💾 GitHub 마스터 백업 재시도'** 버튼으로 재업로드하세요."
+        )
+    return excel_status
 
 
 # ==========================================
@@ -879,9 +894,12 @@ def run_main_portal():
                     st.info(f"📊 처리 결과: 신규 **{added}건** 추가 / 중복 제외 **{dup}건** / DB 총 **{safe_count(collection)}건**")
 
                     if added > 0:
-                        with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중..."):
-                            commit_and_push_data()
-                        st.success(f"✅ 완료! 신규 {added}건 인덱싱 및 GitHub 백업 완료")
+                        with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중... (대용량 파일은 최대 2분 소요)"):
+                            github_ok = commit_and_push_data()
+                        if github_ok:
+                            st.success(f"✅ 완료! 신규 {added}건 인덱싱 및 GitHub 백업 성공 — 재시작 후에도 데이터가 보존됩니다.")
+                        else:
+                            st.warning(f"⚠️ 신규 {added}건이 ChromaDB에 인덱싱되었으나 GitHub 백업 실패. 위 오류 메시지를 확인하세요.")
                     elif dup > 0:
                         st.warning(f"⚠️ 업로드한 파일의 특허 {dup}건이 이미 DB에 존재합니다. 새로운 데이터가 없습니다.")
                     else:
@@ -890,6 +908,24 @@ def run_main_portal():
 
             st.divider()
             st.markdown(f"📊 **누적 적재 데이터:** `{safe_count(collection)}` 건")
+
+            if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
+                file_kb = os.path.getsize(MASTER_EXCEL_PATH) // 1024
+                st.caption(f"로컬 마스터: {file_kb} KB")
+                if st.button("💾 GitHub 마스터 백업 재시도", use_container_width=True):
+                    with st.spinner("GitHub에 마스터 엑셀 업로드 중... (최대 2분)"):
+                        ok = upload_file_to_github_api(
+                            MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx"
+                        )
+                    if ok:
+                        st.success(f"✅ GitHub 백업 성공! ({safe_count(collection)}건 → GitHub 저장 완료)")
+                    else:
+                        st.error(
+                            "❌ 백업 실패. 아래 '🔍 GitHub 연결 진단' 버튼으로 원인 확인 후 재시도하세요.  \n"
+                            "토큰 권한이 `repo` (쓰기) 권한인지, 만료되지 않았는지 확인하세요."
+                        )
+            else:
+                st.caption("로컬 마스터 파일 없음 (업로드 후 활성화)")
 
             if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
                 with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
