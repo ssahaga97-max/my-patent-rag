@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import threading
 import chromadb
 from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
@@ -550,10 +551,38 @@ def check_authentication():
 # 2. [프로세스 레벨 싱글톤] @st.cache_resource 기반 인프라 팩토리
 # ==========================================
 
-# 모듈 레벨 ChromaDB 클라이언트 싱글톤.
-# _build_infra.clear() 호출 후에도 이 참조는 살아 있어 동일 인스턴스를 재사용.
-# → ChromaDB 내부 _identifiers_to_system 레지스트리 충돌(ValueError) 원천 차단.
-_CHROMA_CLIENT = None  # chromadb EphemeralClient 인스턴스 (모듈 레벨 싱글톤)
+# 모듈 레벨 ChromaDB 클라이언트 싱글톤 + 생성 락.
+# _build_infra.clear() 후에도 _CHROMA_CLIENT 참조는 살아 있어 재생성 없이 재사용.
+# 락은 멀티스레드 환경에서 동시 생성 시도로 인한 ValueError를 방지한다.
+_CHROMA_CLIENT = None
+_CHROMA_LOCK   = threading.Lock()
+
+
+def _get_or_create_chroma_client():
+    """
+    EphemeralClient를 안전하게 반환한다.
+    내부 _identifiers_to_system 레지스트리에 충돌 인스턴스가 남아 있을 경우
+    해당 레지스트리를 직접 비운 뒤 재시도한다.
+    """
+    global _CHROMA_CLIENT
+    with _CHROMA_LOCK:
+        if _CHROMA_CLIENT is not None:
+            return _CHROMA_CLIENT
+        for attempt in range(2):
+            try:
+                _CHROMA_CLIENT = chromadb.EphemeralClient()
+                return _CHROMA_CLIENT
+            except ValueError:
+                if attempt == 0:
+                    # 레지스트리에 잔존 인스턴스가 있으면 강제 초기화 후 재시도
+                    try:
+                        from chromadb.api.client import SharedSystemClient
+                        SharedSystemClient._identifiers_to_system.clear()
+                    except Exception:
+                        pass
+                else:
+                    raise
+    return _CHROMA_CLIENT
 
 
 @st.cache_resource
@@ -572,10 +601,7 @@ def _build_infra():
     내부 _identifiers_to_system 레지스트리에 이전 인스턴스가 남아 ValueError 충돌 발생.
     → 모듈 레벨 변수에 클라이언트를 보관해 재생성 없이 재사용.
     """
-    global _CHROMA_CLIENT
-    if _CHROMA_CLIENT is None:
-        _CHROMA_CLIENT = chromadb.EphemeralClient()
-    chroma_client = _CHROMA_CLIENT
+    chroma_client = _get_or_create_chroma_client()
 
     # 다국어 임베딩 함수 및 컬렉션
     # paraphrase-multilingual-mpnet-base-v2: 50개 언어 지원, 한국어↔영어 교차 언어 검색 가능
