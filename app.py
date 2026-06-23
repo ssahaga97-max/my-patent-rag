@@ -585,7 +585,8 @@ def _get_llm():
     return ChatGroq(
         model="llama-3.3-70b-versatile",
         groq_api_key=groq_api_key,
-        temperature=0.1
+        temperature=0.1,
+        max_tokens=2048,
     )
 
 
@@ -634,6 +635,187 @@ def safe_count(collection) -> int:
     except Exception as e:
         print(f"[ChromaDB safe_count 오류] {e}")
         return 0
+
+
+# Groq on_demand llama-3.3-70b-versatile TPM 한도(12,000) 대비 입력 예산
+GROQ_INPUT_TOKEN_BUDGET = 9000
+
+
+def _estimate_tokens(text: str) -> int:
+    """한국어 혼합 텍스트 보수적 토큰 추정 (약 2자 = 1토큰)."""
+    return max(1, len(text) // 2)
+
+
+def _truncate_text(text: str, max_chars: int, suffix: str = "\n…(분량 제한으로 일부 생략)") -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + suffix
+
+
+def _format_patent_meta_line(i: int, m: dict) -> tuple[str, str, str]:
+    app_num    = m.get("출원번호", "번호없음")
+    p_name     = m.get("명칭", "제목없음")
+    applicant  = m.get("출원인", "미기재")
+    inventor   = m.get("발명자", "미기재")
+    ipc        = m.get("IPC", "없음")
+    cpc        = m.get("CPC", "없음")
+    app_date   = m.get("출원일", "없음")
+    patent_url = m.get("URL", "")
+
+    if patent_url and patent_url.startswith("http"):
+        display_num  = f"[{app_num}]({patent_url})"
+        display_name = f"[{p_name}]({patent_url})"
+    else:
+        display_num  = app_num
+        display_name = p_name
+
+    header = (
+        f"[특허 {i+1}] 번호: {display_num} | 명칭: {display_name} | "
+        f"출원인: {applicant} | 발명자: {inventor} | "
+        f"IPC: {ipc} | CPC: {cpc} | 출원일: {app_date}\n"
+    )
+    return header, display_num, display_name
+
+
+def _parse_patent_doc(doc: str) -> dict:
+    """ChromaDB 문서 문자열을 명칭·요약·청구항으로 분리."""
+    doc = doc.strip()
+    title, abstract, claims = "", "", ""
+
+    if "특허요약:" in doc:
+        before, rest = doc.split("특허요약:", 1)
+        title = before.strip()
+        if "특허청구항:" in rest:
+            abstract, claims = rest.split("특허청구항:", 1)
+            abstract, claims = abstract.strip(), claims.strip()
+        else:
+            abstract = rest.strip()
+    else:
+        abstract = doc
+
+    return {"title": title, "abstract": abstract, "claims": claims}
+
+
+def _compress_patent_doc_for_llm(doc: str, max_chars: int, *, claims_first: bool = False) -> tuple[str, bool]:
+    """
+    토큰 예산 내로 특허 본문 축약.
+    claims_first=False: 요약 우선 — 청구항을 먼저 생략·축소, 요약을 최대한 유지.
+    claims_first=True : 침해 분석용 — 청구항 우선, 요약을 먼저 축소.
+    """
+    parsed = _parse_patent_doc(doc)
+    title = parsed["title"] or "특허명칭: (미기재)"
+    abstract = parsed["abstract"]
+    claims = parsed["claims"]
+
+    def _join(title_line: str, abs_text: str, claims_text: str | None) -> str:
+        parts = [title_line, f"특허요약: {abs_text}"]
+        if claims_text is not None:
+            parts.append(f"특허청구항: {claims_text}")
+        return "\n".join(parts)
+
+    omitted_claims = "(토큰 예산 초과로 생략)"
+    omitted_abstract = "(토큰 예산 초과로 생략)"
+
+    full = _join(title, abstract, claims if claims else None)
+    if len(full) <= max_chars:
+        return full, False
+
+    truncated = True
+
+    if not claims_first:
+        # 1) 요약 전체 + 청구항 생략
+        abstract_only = _join(title, abstract, omitted_claims if claims else None)
+        if len(abstract_only) <= max_chars:
+            return abstract_only, truncated
+
+        # 2) 요약 일부 + 청구항 생략
+        prefix = f"{title}\n특허요약: "
+        suffix = f"\n특허청구항: {omitted_claims}" if claims else ""
+        abs_budget = max_chars - len(prefix) - len(suffix)
+        if abs_budget >= 80:
+            compressed = prefix + _truncate_text(abstract, abs_budget, suffix="…") + suffix
+            if len(compressed) <= max_chars:
+                return compressed, truncated
+    else:
+        # 1) 청구항 전체 + 요약 생략
+        if claims:
+            claims_only = _join(title, omitted_abstract, claims)
+            if len(claims_only) <= max_chars:
+                return claims_only, truncated
+
+            # 2) 청구항 일부 + 요약 생략
+            prefix = f"{title}\n특허요약: {omitted_abstract}\n특허청구항: "
+            claims_budget = max_chars - len(prefix)
+            if claims_budget >= 80:
+                compressed = prefix + _truncate_text(claims, claims_budget, suffix="…")
+                if len(compressed) <= max_chars:
+                    return compressed, truncated
+
+        # 청구항 없으면 요약 우선으로 폴백
+        abstract_only = _join(title, abstract, None)
+        if len(abstract_only) <= max_chars:
+            return abstract_only, truncated
+
+    return _truncate_text(full, max_chars), truncated
+
+
+def _build_rag_context_for_llm(
+    docs: list, metas: list, token_budget: int, *, claims_first: bool = False
+) -> tuple[str, bool]:
+    """
+    검색된 특허 문서를 Groq 입력 토큰 예산 내로 축소.
+    건별로 요약/청구항 우선순위에 따라 축약한 뒤, 여전히 초과하면 건당 한도를 낮춘다.
+    """
+    n = len(docs)
+    if n == 0:
+        return "", False
+
+    per_doc_chars = max(400, min(1800, (token_budget * 2) // n))
+    truncated = False
+
+    while True:
+        parts = []
+        for i, (doc, m) in enumerate(zip(docs, metas)):
+            header, _, _ = _format_patent_meta_line(i, m)
+            body, doc_truncated = _compress_patent_doc_for_llm(
+                doc, per_doc_chars, claims_first=claims_first
+            )
+            if doc_truncated:
+                truncated = True
+            parts.append(f"{header}{body}\n\n")
+
+        combined = "".join(parts)
+        if _estimate_tokens(combined) <= token_budget or per_doc_chars <= 300:
+            if _estimate_tokens(combined) > token_budget:
+                combined = _truncate_text(combined, token_budget * 2)
+                truncated = True
+            return combined, truncated
+
+        per_doc_chars = int(per_doc_chars * 0.75)
+
+
+def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str) -> tuple[str, bool]:
+    instruction = "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요."
+    overhead = _estimate_tokens(
+        f"[SYSTEM] {system_prompt}\n{instruction}\n[사용자 요청]\n{user_query}\n"
+        "보고서는 마크다운 양식으로 한국어로 작성하세요."
+    ) + 30
+    context_budget = max(1500, GROQ_INPUT_TOKEN_BUDGET - overhead)
+    truncated = False
+
+    if _estimate_tokens(context_text) > context_budget:
+        context_text = _truncate_text(context_text, context_budget * 2)
+        truncated = True
+
+    prompt = (
+        f"[SYSTEM] {system_prompt}\n"
+        f"{instruction}\n\n"
+        f"[참고 데이터]\n{context_text}\n\n"
+        f"[사용자 요청]\n{user_query}\n\n"
+        "보고서는 마크다운 양식으로 한국어로 작성하세요."
+    )
+    return prompt, truncated
 
 
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
@@ -1103,7 +1285,7 @@ def run_main_portal():
         n_results_user = st.slider(
             "🔢 3단계: 참조할 관련 특허 수",
             min_value=3, max_value=20, value=default_n, step=1,
-            help="AI가 분석에 참조할 최대 특허 건수입니다. 숫자가 클수록 넓은 범위를 검토하지만 응답이 느려질 수 있습니다."
+            help="AI가 분석에 참조할 최대 특허 건수입니다. Groq API 입력 한도(12,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다."
         )
     else:
         n_results_user = 10  # 통계 모드는 슬라이더 불필요 (전체 데이터 집계)
@@ -1115,6 +1297,7 @@ def run_main_portal():
             st.error("서버 DB에 적재된 특허 소스가 없습니다. 좌측 메뉴에서 엑셀을 먼저 등록해 주세요.")
         else:
             with st.spinner("가상 전문가가 실시간 시맨틱 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
+                context_truncated = False
 
                 # ── 통계 모드: 전체 메타데이터 pandas 집계 후 요약 컨텍스트 구성 ──
                 if "📊" in analysis_mode:
@@ -1184,30 +1367,11 @@ def run_main_portal():
                     retrieved_docs  = results["documents"][0]
                     retrieved_metas = results["metadatas"][0]
 
-                    context_text = ""
-                    for i, (doc, m) in enumerate(zip(retrieved_docs, retrieved_metas)):
-                        app_num    = m.get("출원번호", "번호없음")
-                        p_name     = m.get("명칭", "제목없음")
-                        applicant  = m.get("출원인", "미기재")
-                        inventor   = m.get("발명자", "미기재")
-                        ipc        = m.get("IPC", "없음")
-                        cpc        = m.get("CPC", "없음")
-                        app_date   = m.get("출원일", "없음")
-                        patent_url = m.get("URL", "")
-
-                        if patent_url and patent_url.startswith("http"):
-                            display_num  = f"[{app_num}]({patent_url})"
-                            display_name = f"[{p_name}]({patent_url})"
-                        else:
-                            display_num  = app_num
-                            display_name = p_name
-
-                        context_text += (
-                            f"[특허 {i+1}] 번호: {display_num} | 명칭: {display_name} | "
-                            f"출원인: {applicant} | 발명자: {inventor} | "
-                            f"IPC: {ipc} | CPC: {cpc} | 출원일: {app_date}\n{doc}\n\n"
-                        )
-
+                    suffix_preview = (
+                        "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요.\n\n"
+                        f"[사용자 요청]\n{user_query}\n\n"
+                        "보고서는 마크다운 양식으로 한국어로 작성하세요."
+                    )
                     if "💡 단순 키워드" in analysis_mode:
                         system_prompt = (
                             "당신은 신속하고 정확하게 관련 문헌을 찾아내는 '수석 특허 검색 조사관'입니다. "
@@ -1225,15 +1389,31 @@ def run_main_portal():
                             "회피설계 가이드를 구성요소 완비 법칙에 근거하여 작성하세요."
                         )
 
-                prompt = (
-                    f"[SYSTEM] {system_prompt}\n"
-                    "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요.\n\n"
-                    f"[참고 데이터]\n{context_text}\n\n"
-                    f"[사용자 요청]\n{user_query}\n\n"
-                    "보고서는 마크다운 양식으로 한국어로 작성하세요."
-                )
+                    overhead = _estimate_tokens(f"[SYSTEM] {system_prompt}\n{suffix_preview}") + 20
+                    context_budget = max(1500, GROQ_INPUT_TOKEN_BUDGET - overhead)
+                    claims_first = "🛡" in analysis_mode
+                    context_text, context_truncated = _build_rag_context_for_llm(
+                        retrieved_docs, retrieved_metas, context_budget, claims_first=claims_first
+                    )
+
+                prompt, prompt_truncated = _assemble_llm_prompt(system_prompt, context_text, user_query)
+                truncated = context_truncated or prompt_truncated
 
                 try:
+                    if truncated:
+                        if "🛡" in analysis_mode:
+                            trunc_msg = (
+                                "Groq API 입력 한도(12,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
+                                "침해 분석 모드는 **청구항을 우선** 유지하고 요약을 먼저 줄입니다. "
+                                "더 상세한 분석이 필요하면 '참조할 관련 특허 수'를 줄여 보세요."
+                            )
+                        else:
+                            trunc_msg = (
+                                "Groq API 입력 한도(12,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
+                                "키워드·심층 분석 모드는 **요약을 우선** 유지하고 청구항을 먼저 생략·축소합니다. "
+                                "더 상세한 분석이 필요하면 '참조할 관련 특허 수'를 줄여 보세요."
+                            )
+                        st.info(trunc_msg)
                     response = llm.invoke(prompt)
                     st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
                     st.write(response.content)
