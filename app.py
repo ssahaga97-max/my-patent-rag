@@ -555,11 +555,15 @@ def _build_infra():
     ChromaDB 데이터 영속성은 GitHub 백업/복원으로 이미 보장되므로,
     SQLite 파일 불필요 → EphemeralClient(순수 인메모리)로 교체하여 모든 SQLite 오류 원천 제거.
     """
-    chroma_client = chromadb.EphemeralClient()
+    chroma_client = chromadb.EphemeralClient(
+        settings=chromadb.Settings(anonymized_telemetry=False)
+    )
 
-    # Ko-SRoBERTa 임베딩 함수 및 컬렉션
+    # 다국어 임베딩 함수 및 컬렉션
+    # paraphrase-multilingual-mpnet-base-v2: 50개 언어 지원, 한국어↔영어 교차 언어 검색 가능
+    # (ko-sroberta-multitask에서 교체 — 한국/일본 특허(한국어) + 해외 특허(영어) 혼합 DB 대응)
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="jhgan/ko-sroberta-multitask"
+        model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
     )
     collection = chroma_client.get_or_create_collection(
         name="competitor_patents",
@@ -998,7 +1002,7 @@ def run_main_portal():
                         except Exception:
                             pass
                         sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-                            model_name="jhgan/ko-sroberta-multitask"
+                            model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
                         )
                         chroma_client.get_or_create_collection(
                             name="competitor_patents",
@@ -1082,6 +1086,16 @@ def run_main_portal():
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
 
+    if "📊" not in analysis_mode:
+        default_n = 7 if "🛡" in analysis_mode else 5
+        n_results_user = st.slider(
+            "🔢 3단계: 참조할 관련 특허 수",
+            min_value=3, max_value=20, value=default_n, step=1,
+            help="AI가 분석에 참조할 최대 특허 건수입니다. 숫자가 클수록 넓은 범위를 검토하지만 응답이 느려질 수 있습니다."
+        )
+    else:
+        n_results_user = 10  # 통계 모드는 슬라이더 불필요 (전체 데이터 집계)
+
     if st.button("🧬 가상 전문가 엔진 구동"):
         if user_query.strip() == "":
             st.warning("분석 내용을 입력해 주세요.")
@@ -1144,9 +1158,7 @@ def run_main_portal():
 
                 # ── 일반 모드: 시맨틱 RAG 검색 ──
                 else:
-                    # 침해 분석은 7건, 나머지는 5건으로 품질 향상
-                    n_results = 7 if "🛡" in analysis_mode else 5
-                    n_results = min(n_results, safe_count(collection))
+                    n_results = min(n_results_user, safe_count(collection))
 
                     results = collection.query(
                         query_texts=[user_query.strip()],
