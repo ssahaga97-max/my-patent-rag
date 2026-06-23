@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import os
-import threading
 import chromadb
+from chromadb.api.client import SharedSystemClient
 from chromadb.utils import embedding_functions
 from langchain_groq import ChatGroq
 import openpyxl
@@ -546,121 +546,88 @@ def check_authentication():
 # 2. [프로세스 레벨 싱글톤] @st.cache_resource 기반 인프라 팩토리
 # ==========================================
 
-# ── 모듈 레벨 ChromaDB 싱글톤 ──────────────────────────────────────────────────
-# _CHROMA_CLIENT : EphemeralClient 인스턴스. 프로세스 수명 동안 단 한 번만 생성.
-# _CURRENT_COLLECTION : 현재 유효한 컬렉션 참조.
-#   · 포맷 버튼이 _build_infra.clear() 대신 이 변수를 직접 교체한다.
-#   · run_main_portal()은 _build_infra()가 반환한 컬렉션 대신 이 변수를 사용.
-#   이렇게 하면 _build_infra.clear() 호출을 완전히 제거할 수 있고
-#   EphemeralClient 재생성에 따른 ValueError를 원천 차단한다.
-_CHROMA_CLIENT     = None
-_CURRENT_COLLECTION = None
-_CHROMA_LOCK       = threading.Lock()
-_EMBED_MODEL       = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+# ── ChromaDB / LLM 인프라 (@st.cache_resource) ───────────────────────────────
+# Streamlit은 스크립트를 매 리런마다 처음부터 재실행하므로 모듈 전역 변수는 매번 None으로
+# 초기화된다. chromadb SharedSystemClient 레지스트리는 프로세스 수준에서 유지되므로,
+# 모듈 전역 싱글톤 + EphemeralClient() 재호출 조합은 "An instance already exists"를 유발한다.
+_EMBED_MODEL      = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+_COLLECTION_NAME  = "competitor_patents"
 
 
-def _get_or_create_chroma_client():
+@st.cache_resource
+def _get_chroma_client():
     """
-    EphemeralClient를 스레드 안전하게 단 한 번만 생성·반환.
-    레지스트리에 잔존 인스턴스가 있어 ValueError가 발생하면
-    chromadb 공식 API인 clear_system_cache()로 초기화 후 재시도한다.
+    EphemeralClient를 Streamlit cache_resource로 프로세스당 1회만 생성.
+    chromadb 레지스트리 잔존 시 SharedSystemClient.clear_system_cache() 후 재시도.
     """
-    global _CHROMA_CLIENT
-    with _CHROMA_LOCK:
-        if _CHROMA_CLIENT is not None:
-            return _CHROMA_CLIENT
-        for attempt in range(2):
-            try:
-                _CHROMA_CLIENT = chromadb.EphemeralClient()
-                return _CHROMA_CLIENT
-            except ValueError:
-                if attempt == 0:
-                    try:
-                        chromadb.Client.clear_system_cache()
-                    except Exception:
-                        pass
-                else:
-                    raise
-        return _CHROMA_CLIENT
+    for attempt in range(2):
+        try:
+            return chromadb.EphemeralClient()
+        except ValueError:
+            SharedSystemClient.clear_system_cache()
+            if attempt == 1:
+                raise
 
 
-def _make_embedding_fn():
+@st.cache_resource
+def _get_embedding_fn():
     return embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=_EMBED_MODEL
     )
 
 
-def reset_collection():
-    """
-    포맷 버튼 전용: 기존 컬렉션을 삭제하고 빈 컬렉션을 재생성한 뒤
-    _CURRENT_COLLECTION 전역 참조를 교체한다.
-    _build_infra.clear()를 호출하지 않으므로 EphemeralClient 재생성 ValueError 없음.
-    """
-    global _CURRENT_COLLECTION
-    client = _get_or_create_chroma_client()
-    try:
-        client.delete_collection("competitor_patents")
-    except Exception:
-        pass
-    _CURRENT_COLLECTION = client.get_or_create_collection(
-        name="competitor_patents",
-        embedding_function=_make_embedding_fn()
-    )
-    return _CURRENT_COLLECTION
-
-
 @st.cache_resource
-def _build_infra():
-    """
-    @st.cache_resource: 프로세스당 단 한 번만 실행.
-    EphemeralClient와 LLM을 초기화한다.
-    컬렉션은 _CURRENT_COLLECTION 전역 변수로 관리하므로 여기서는 반환하지 않는다.
-    (포맷 후 _build_infra.clear() 없이 reset_collection()으로 컬렉션만 교체 가능)
-    """
-    global _CURRENT_COLLECTION
-    chroma_client = _get_or_create_chroma_client()
-
-    # 최초 실행 시에만 컬렉션 생성 (이미 reset_collection()이 교체한 경우 덮어쓰지 않음)
-    if _CURRENT_COLLECTION is None:
-        _CURRENT_COLLECTION = chroma_client.get_or_create_collection(
-            name="competitor_patents",
-            embedding_function=_make_embedding_fn()
-        )
-
+def _get_llm():
     groq_api_key = st.secrets.get("GROQ_API_KEY", "")
     groq_api_key = groq_api_key.encode("ascii", errors="ignore").decode("ascii").strip()
     if not groq_api_key:
         raise ValueError("Streamlit Secrets에 GROQ_API_KEY가 설정되어 있지 않습니다.")
-    llm = ChatGroq(
+    return ChatGroq(
         model="llama-3.3-70b-versatile",
         groq_api_key=groq_api_key,
         temperature=0.1
     )
 
-    return chroma_client, llm
+
+def _get_collection():
+    """캐시된 EphemeralClient에서 컬렉션 참조. 포맷 후 reset_collection()이 재생성."""
+    client = _get_chroma_client()
+    return client.get_or_create_collection(
+        name=_COLLECTION_NAME,
+        embedding_function=_get_embedding_fn()
+    )
+
+
+def reset_collection():
+    """
+    포맷 버튼 전용: 기존 컬렉션을 삭제하고 빈 컬렉션을 재생성.
+    EphemeralClient는 @st.cache_resource로 유지 — 재생성하지 않음.
+    """
+    client = _get_chroma_client()
+    try:
+        client.delete_collection(_COLLECTION_NAME)
+    except Exception:
+        pass
+    return client.get_or_create_collection(
+        name=_COLLECTION_NAME,
+        embedding_function=_get_embedding_fn()
+    )
 
 
 def load_permanent_infra_singleton():
-    """
-    _build_infra()를 통해 chroma_client와 llm을 얻고,
-    _CURRENT_COLLECTION 전역 변수에서 최신 컬렉션 참조를 가져와 반환한다.
-    포맷 버튼은 _build_infra.clear() 없이 reset_collection()으로 _CURRENT_COLLECTION만 교체.
-    """
+    """캐시된 chroma_client, collection, llm을 반환."""
     if "infra_initialized" not in st.session_state:
         with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
-            chroma_client, llm = _build_infra()
+            _get_chroma_client()
+            _get_llm()
         st.session_state.infra_initialized = True
-    else:
-        chroma_client, llm = _build_infra()
-    return chroma_client, _CURRENT_COLLECTION, llm
+    return _get_chroma_client(), _get_collection(), _get_llm()
 
 
 def safe_count(collection) -> int:
     """
     collection.count()를 안전하게 호출.
     SQLite 오류 발생 시 0을 반환하여 앱 크래시 방지.
-    캐시 초기화는 하지 않음 — 기존 ChromaDB 인스턴스가 메모리에 살아있는 채로
-    _build_infra.clear() 후 PersistentClient 재생성 시 충돌(ValueError)이 발생하기 때문.
     """
     try:
         return collection.count()
@@ -1055,7 +1022,7 @@ def run_main_portal():
                                 except Exception as e:
                                     st.warning(f"GitHub 삭제 중 오류: {e}")
 
-                        # 3. ChromaDB 컬렉션 재생성 (_build_infra.clear() 없이 전역 참조만 교체)
+                        # 3. ChromaDB 컬렉션 재생성 (EphemeralClient는 cache_resource로 유지)
                         reset_collection()
 
                         # github_synced = True: 포맷 직후 리런에서 GitHub 재다운로드 방지
