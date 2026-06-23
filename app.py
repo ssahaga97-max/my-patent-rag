@@ -46,22 +46,71 @@ if "github_synced" not in st.session_state:
 # [인프라 무결성 안착] GitHub API 강제 업로드 엔진
 # ==========================================
 def _get_github_secrets():
-    """
-    TOML 최상위 키로 설정된 GITHUB_TOKEN / GITHUB_REPO_URL을 안전하게 반환.
-    섹션 헤더([USER_CREDENTIALS]) 뒤에 배치하면 해당 섹션 하위에 귀속되어
-    st.secrets["GITHUB_TOKEN"]으로 접근이 불가능해지므로, 반드시 TOML 최상위에 위치해야 함.
-    """
+    """GITHUB_TOKEN / GITHUB_REPO_URL을 Streamlit Secrets에서 로드."""
     try:
         token = st.secrets["GITHUB_TOKEN"]
         repo_url = st.secrets["GITHUB_REPO_URL"]
         if not token or token.startswith("ghp_본인의"):
             return None, None
-        # https:// 누락 방어
         if not repo_url.startswith("https://"):
             repo_url = "https://" + repo_url.lstrip("http://")
         return token, repo_url
     except Exception:
         return None, None
+
+
+def diagnose_github() -> dict:
+    """
+    GitHub 연결 상태를 단계별로 진단하여 dict로 반환.
+    keys: secret_ok, token_prefix, repo_url, api_reachable, repo_accessible, error
+    """
+    result = {
+        "secret_ok": False, "token_prefix": "", "repo_url": "",
+        "api_reachable": False, "repo_accessible": False, "error": ""
+    }
+    # 1단계: 시크릿 존재 여부
+    token, repo_url = _get_github_secrets()
+    if not token:
+        result["error"] = (
+            "GITHUB_TOKEN 또는 GITHUB_REPO_URL을 Streamlit Secrets에서 찾을 수 없습니다.\n"
+            "TOML 구조에서 두 키가 [USER_CREDENTIALS] 섹션 헤더보다 위에 있는지 확인하세요."
+        )
+        return result
+    result["secret_ok"]    = True
+    result["token_prefix"] = token[:12] + "..."
+    result["repo_url"]     = repo_url
+
+    # 2단계: GitHub API 서버 도달 여부
+    try:
+        ping = Request("https://api.github.com", headers={"Accept": "application/vnd.github.v3+json"})
+        with urlopen(ping, timeout=5):
+            result["api_reachable"] = True
+    except Exception as e:
+        result["error"] = f"GitHub API 서버에 접근할 수 없습니다: {e}"
+        return result
+
+    # 3단계: 레포지토리 접근 권한 (토큰 유효성)
+    try:
+        repo_path = repo_url.replace(".git", "").split("github.com/")[-1]
+        req = Request(
+            f"https://api.github.com/repos/{repo_path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+        )
+        with urlopen(req, timeout=8) as resp:
+            repo_info = json.loads(resp.read().decode())
+            result["repo_accessible"] = True
+            result["repo_name"]       = repo_info.get("full_name", "")
+    except HTTPError as e:
+        if e.code == 401:
+            result["error"] = "토큰 인증 실패(401) — 토큰이 만료되었거나 잘못되었습니다. 새 토큰을 발급하세요."
+        elif e.code == 404:
+            result["error"] = f"레포지토리를 찾을 수 없습니다(404) — GITHUB_REPO_URL을 확인하세요: {repo_url}"
+        else:
+            result["error"] = f"GitHub API 오류 ({e.code}): {e.reason}"
+    except Exception as e:
+        result["error"] = f"레포지토리 접근 중 오류: {e}"
+
+    return result
 
 
 def upload_file_to_github_api(local_file_path, github_target_path):
@@ -648,10 +697,36 @@ def run_main_portal():
                 with st.spinner("GitHub → 로컬 전체 동기화 중..."):
                     excel_ok, reg_ok = sync_all_from_github()
                 if excel_ok or reg_ok:
-                    st.session_state.github_synced = False  # 재인덱싱 재실행 유도
+                    st.session_state.github_synced = False
                     st.toast("✅ 동기화 완료 — 앱을 새로고침하면 최신 데이터가 반영됩니다.")
+                    st.rerun()
                 else:
-                    st.toast("⚠️ GitHub 동기화 실패 — GITHUB_TOKEN 시크릿을 확인하세요.")
+                    st.warning("⚠️ GitHub 동기화 실패 — 아래 진단 버튼으로 원인을 확인하세요.")
+
+            # GitHub 연결 진단 버튼
+            if st.button("🔍 GitHub 연결 진단", use_container_width=True):
+                with st.spinner("진단 중..."):
+                    diag = diagnose_github()
+
+                if diag["repo_accessible"]:
+                    st.success(f"✅ GitHub 연결 정상\n\n"
+                               f"- 레포: `{diag.get('repo_name','')}`\n"
+                               f"- 토큰: `{diag['token_prefix']}`")
+                else:
+                    st.error(f"❌ 연결 실패\n\n**원인:**\n{diag['error']}")
+                    if diag["secret_ok"] and not diag["api_reachable"]:
+                        st.info("💡 Streamlit Cloud 네트워크 문제일 수 있습니다. 잠시 후 재시도해 주세요.")
+                    elif diag["secret_ok"]:
+                        st.info("💡 Streamlit Cloud → **Manage app → Secrets**에서 토큰을 새로 발급한 값으로 교체해 주세요.")
+                    else:
+                        st.code(
+                            "# Secrets 올바른 구조 (섹션 헤더 위에 위치)\n"
+                            'GITHUB_TOKEN = "ghp_새토큰값"\n'
+                            'GITHUB_REPO_URL = "https://github.com/ssahaga97-max/my-patent-rag.git"\n\n'
+                            "[USER_CREDENTIALS]\n"
+                            'admin = "1234!"',
+                            language="toml"
+                        )
             st.divider()
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
             if uploaded_file is not None:
