@@ -22,6 +22,11 @@ MASTER_EXCEL_PATH    = os.path.join(BASE_DIR, "my_patent_folder", "master_patent
 USER_REGISTRY_PATH   = os.path.join(BASE_DIR, "my_patent_folder", "user_registry.json")
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 
+# ChromaDB 텔레메트리 비활성화 — EphemeralClient(settings=...) 방식은
+# _create_system_if_not_exists에서 "An instance already exists" ValueError를 유발하므로
+# 환경변수 방식으로 대체
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
 st.set_page_config(page_title="AI 경쟁사 특허 조사 분석", layout="wide", page_icon="🔬")
 
 
@@ -555,9 +560,7 @@ def _build_infra():
     ChromaDB 데이터 영속성은 GitHub 백업/복원으로 이미 보장되므로,
     SQLite 파일 불필요 → EphemeralClient(순수 인메모리)로 교체하여 모든 SQLite 오류 원천 제거.
     """
-    chroma_client = chromadb.EphemeralClient(
-        settings=chromadb.Settings(anonymized_telemetry=False)
-    )
+    chroma_client = chromadb.EphemeralClient()
 
     # 다국어 임베딩 함수 및 컬렉션
     # paraphrase-multilingual-mpnet-base-v2: 50개 언어 지원, 한국어↔영어 교차 언어 검색 가능
