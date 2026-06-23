@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import io
 import chromadb
 from chromadb.api.client import SharedSystemClient
 from chromadb.utils import embedding_functions
@@ -8,7 +9,6 @@ from langchain_groq import ChatGroq
 import openpyxl
 import json
 import base64
-import shutil
 import hashlib
 import smtplib
 from email.mime.text import MIMEText
@@ -41,7 +41,19 @@ if "github_synced" not in st.session_state:
 
 
 # ==========================================
-# [인프라 무결성 안착] GitHub API 강제 업로드 엔진
+# 공통 유틸리티
+# ==========================================
+def _clean_ascii(value: str) -> str:
+    """비가시적 유니코드 문자(BOM, Zero-Width Space 등) 제거."""
+    return value.encode("ascii", errors="ignore").decode("ascii").strip()
+
+
+def _hash_pw(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+# ==========================================
+# GitHub API
 # ==========================================
 def _get_github_secrets():
     """
@@ -55,9 +67,8 @@ def _get_github_secrets():
         if not token or token.startswith("ghp_본인의"):
             return None, None
 
-        # 비가시적 유니코드 문자 제거 (latin-1 인코딩 오류 원천 차단)
-        token    = token.encode("ascii", errors="ignore").decode("ascii").strip()
-        repo_url = repo_url.encode("ascii", errors="ignore").decode("ascii").strip()
+        token    = _clean_ascii(token)
+        repo_url = _clean_ascii(repo_url)
 
         if not token:
             return None, None
@@ -66,6 +77,15 @@ def _get_github_secrets():
         return token, repo_url
     except Exception:
         return None, None
+
+
+def _get_github_repo_path() -> tuple[str | None, str | None, str | None]:
+    """(token, repo_url, repo_path) 반환. 실패 시 (None, None, None)."""
+    token, repo_url = _get_github_secrets()
+    if not token:
+        return None, None, None
+    repo_path = repo_url.replace(".git", "").split("github.com/")[-1]
+    return token, repo_url, repo_path
 
 
 def diagnose_github() -> dict:
@@ -77,8 +97,7 @@ def diagnose_github() -> dict:
         "secret_ok": False, "token_prefix": "", "repo_url": "",
         "api_reachable": False, "repo_accessible": False, "error": ""
     }
-    # 1단계: 시크릿 존재 여부
-    token, repo_url = _get_github_secrets()
+    token, repo_url, repo_path = _get_github_repo_path()
     if not token:
         result["error"] = (
             "GITHUB_TOKEN 또는 GITHUB_REPO_URL을 Streamlit Secrets에서 찾을 수 없습니다.\n"
@@ -91,7 +110,7 @@ def diagnose_github() -> dict:
 
     # 토큰 원본에 비가시적 유니코드 문자가 있었는지 체크 (진단 정보용)
     raw_token = str(st.secrets.get("GITHUB_TOKEN", ""))
-    if raw_token != raw_token.encode("ascii", errors="ignore").decode("ascii").strip():
+    if raw_token != _clean_ascii(raw_token):
         result["error"] = (
             "⚠️ GITHUB_TOKEN에 비가시적 유니코드 문자(복사·붙여넣기 오염)가 감지되었습니다. "
             "Streamlit Secrets 편집기에서 토큰 값을 지우고 직접 다시 입력하세요."
@@ -109,7 +128,6 @@ def diagnose_github() -> dict:
 
     # 3단계: 레포지토리 접근 권한 (토큰 유효성)
     try:
-        repo_path = repo_url.replace(".git", "").split("github.com/")[-1]
         req = Request(
             f"https://api.github.com/repos/{repo_path}",
             headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
@@ -132,14 +150,8 @@ def diagnose_github() -> dict:
 
 
 def upload_file_to_github_api(local_file_path, github_target_path):
-    token, repo_url = _get_github_secrets()
-    if not token:
-        return False
-        
-    raw_url = repo_url.replace(".git", "")
-    repo_path = raw_url.split("github.com/")[-1]
-
-    if not os.path.exists(local_file_path):
+    token, _, repo_path = _get_github_repo_path()
+    if not token or not os.path.exists(local_file_path):
         return False
 
     try:
@@ -211,12 +223,91 @@ def commit_and_push_data() -> bool:
     return excel_status
 
 
-# ==========================================
-# [회원 관리] 사용자 레지스트리 엔진
-# ==========================================
-def _hash_pw(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+def delete_file_from_github_api(github_target_path: str) -> bool:
+    """GitHub Contents API로 파일 삭제. 성공 또는 404(이미 없음) 시 True."""
+    token, _, repo_path = _get_github_repo_path()
+    if not token:
+        return False
 
+    api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
+    try:
+        req_get = Request(api_url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+        with urlopen(req_get, timeout=15) as r:
+            sha = json.loads(r.read().decode()).get("sha", "")
+
+        if not sha:
+            return False
+
+        del_payload = json.dumps({
+            "message": f"[Format] Delete {github_target_path}",
+            "sha": sha,
+            "branch": "main"
+        }).encode("utf-8")
+        req_del = Request(api_url, data=del_payload, headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github.v3+json"
+        }, method="DELETE")
+        with urlopen(req_del, timeout=30):
+            return True
+    except HTTPError as e:
+        if e.code == 404:
+            return True
+        print(f"GitHub 삭제 실패: HTTP {e.code} {e.reason}")
+        return False
+    except Exception as e:
+        print(f"GitHub 삭제 중 오류: {e}")
+        return False
+
+
+def _download_file_from_github(github_path: str, local_path: str):
+    """
+    GitHub에서 단일 파일을 내려받아 local_path에 저장.
+    반환값: True=성공, None=404(파일 없음), False=오류
+    """
+    token, _, repo_path = _get_github_repo_path()
+    if not token:
+        return False
+    try:
+        api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_path}"
+        req = Request(api_url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json"
+        })
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+
+        if data.get("content"):
+            raw = base64.b64decode(data["content"])
+        elif data.get("download_url"):
+            with urlopen(Request(
+                data["download_url"],
+                headers={"Authorization": f"Bearer {token}"}
+            )) as r:
+                raw = r.read()
+        else:
+            return False
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(raw)
+        return True
+    except HTTPError as e:
+        if e.code == 404:
+            return None
+        print(f"GitHub 파일 다운로드 실패 ({github_path}): HTTP {e.code} {e.reason}")
+        return False
+    except Exception as e:
+        print(f"GitHub 파일 다운로드 실패 ({github_path}): {e}")
+        return False
+
+
+# ==========================================
+# [회원 관리] 사용자 레지스트리
+# ==========================================
 
 def load_user_registry() -> dict:
     if os.path.exists(USER_REGISTRY_PATH):
@@ -235,44 +326,9 @@ def save_user_registry(registry: dict):
 
 
 def download_user_registry_from_github():
-    """
-    반환값:
-      True  = 다운로드 성공
-      None  = GitHub에 파일 없음 (404) — 정상 상태 (포맷 후 / 최초 배포)
-      False = 실제 오류 (토큰 없음, 인증 실패, 네트워크 오류 등)
-    """
-    token, repo_url = _get_github_secrets()
-    if not token:
-        return False
-    try:
-        raw_url   = repo_url.replace(".git", "")
-        repo_path = raw_url.split("github.com/")[-1]
-        api_url   = f"https://api.github.com/repos/{repo_path}/contents/my_patent_folder/user_registry.json"
-        req = Request(api_url, headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
-        })
-        with urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-        if data.get("content"):
-            raw = base64.b64decode(data["content"])
-        elif data.get("download_url"):
-            with urlopen(Request(data["download_url"], headers={"Authorization": f"Bearer {token}"})) as r:
-                raw = r.read()
-        else:
-            return False
-        os.makedirs(os.path.dirname(USER_REGISTRY_PATH), exist_ok=True)
-        with open(USER_REGISTRY_PATH, "wb") as f:
-            f.write(raw)
-        return True
-    except HTTPError as e:
-        if e.code == 404:
-            return None  # 파일 없음 = 정상 상태 (오류 아님)
-        print(f"사용자 레지스트리 복원 실패: HTTP {e.code} {e.reason}")
-        return False
-    except Exception as e:
-        print(f"사용자 레지스트리 복원 실패: {e}")
-        return False
+    return _download_file_from_github(
+        "my_patent_folder/user_registry.json", USER_REGISTRY_PATH
+    )
 
 
 def upload_user_registry_to_github() -> bool:
@@ -339,86 +395,13 @@ def download_logo_from_github():
     logo_path = os.path.join(BASE_DIR, "atec_logo.png")
     if os.path.exists(logo_path):
         return True
-    token, repo_url = _get_github_secrets()
-    if not token:
-        return False
-    try:
-        raw_url   = repo_url.replace(".git", "")
-        repo_path = raw_url.split("github.com/")[-1]
-        api_url   = f"https://api.github.com/repos/{repo_path}/contents/atec_logo.png"
-        req = Request(api_url, headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
-        })
-        with urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-        if data.get("content"):
-            raw = base64.b64decode(data["content"])
-        elif data.get("download_url"):
-            with urlopen(Request(data["download_url"], headers={"Authorization": f"Bearer {token}"})) as r:
-                raw = r.read()
-        else:
-            return False
-        with open(logo_path, "wb") as f:
-            f.write(raw)
-        return True
-    except HTTPError as e:
-        if e.code == 404:
-            return False  # 로고 미업로드 상태 — 정상
-        print(f"로고 복원 실패: HTTP {e.code} {e.reason}")
-        return False
-    except Exception as e:
-        print(f"로고 복원 실패: {e}")
-        return False
+    return _download_file_from_github("atec_logo.png", logo_path) is True
 
 
 def download_master_excel_from_github():
-    """
-    컨테이너 재시작으로 로컬 파일이 소실된 경우 GitHub에서 마스터 엑셀을 내려받아 복원.
-    반환값:
-      True  = 다운로드 성공
-      None  = GitHub에 파일 없음 (404) — 정상 상태 (포맷 후 / 최초 배포)
-      False = 실제 오류 (토큰 없음, 인증 실패, 네트워크 오류 등)
-    """
-    token, repo_url = _get_github_secrets()
-    if not token:
-        return False
-    try:
-        raw_url = repo_url.replace(".git", "")
-        repo_path = raw_url.split("github.com/")[-1]
-        api_url = f"https://api.github.com/repos/{repo_path}/contents/my_patent_folder/master_patents.xlsx"
-        req = Request(api_url, headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
-        })
-        with urlopen(req) as response:
-            data = json.loads(response.read().decode())
-
-        # GitHub Contents API는 1MB 초과 파일의 content 필드를 비워 반환
-        # → download_url로 폴백하여 대용량 엑셀도 안전하게 처리
-        if data.get("content"):
-            raw_content = base64.b64decode(data["content"])
-        elif data.get("download_url"):
-            dl_req = Request(data["download_url"], headers={
-                "Authorization": f"Bearer {token}"
-            })
-            with urlopen(dl_req) as dl_resp:
-                raw_content = dl_resp.read()
-        else:
-            return False
-
-        os.makedirs(os.path.dirname(MASTER_EXCEL_PATH), exist_ok=True)
-        with open(MASTER_EXCEL_PATH, "wb") as f:
-            f.write(raw_content)
-        return True
-    except HTTPError as e:
-        if e.code == 404:
-            return None  # 파일 없음 = 정상 상태 (오류 아님)
-        print(f"GitHub 마스터 엑셀 복원 실패: HTTP {e.code} {e.reason}")
-        return False
-    except Exception as e:
-        print(f"GitHub 마스터 엑셀 복원 실패: {e}")
-        return False
+    return _download_file_from_github(
+        "my_patent_folder/master_patents.xlsx", MASTER_EXCEL_PATH
+    )
 
 
 # ==========================================
@@ -462,12 +445,18 @@ def check_authentication():
             admin_creds = _get_admin_credentials()
             registry    = load_user_registry()
 
-            # 관리자 계정 확인 (Secrets 기반 평문 비교)
-            if username in admin_creds and admin_creds[username] == password:
-                st.session_state.logged_in = True
-                st.session_state.user_id   = username
-                st.session_state.is_admin  = True
-                st.rerun()
+            # 관리자 계정 확인 (Secrets 평문 또는 SHA-256 해시)
+            if username in admin_creds:
+                stored = admin_creds[username]
+                is_hex_hash = len(stored) == 64 and all(c in "0123456789abcdef" for c in stored.lower())
+                stored_hash = stored if is_hex_hash else _hash_pw(stored)
+                if stored_hash == _hash_pw(password):
+                    st.session_state.logged_in = True
+                    st.session_state.user_id   = username
+                    st.session_state.is_admin  = True
+                    st.rerun()
+                else:
+                    st.error("❌ 비밀번호가 올바르지 않습니다.")
             # 일반 사용자 확인 (레지스트리 해시 비교)
             elif username in registry:
                 user_rec = registry[username]
@@ -553,6 +542,11 @@ def check_authentication():
 _EMBED_MODEL      = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 _COLLECTION_NAME  = "competitor_patents"
 
+# Groq on_demand: 단일 요청 = 입력 토큰 + max_tokens(출력 예약) ≤ 12,000 TPM
+GROQ_TPM_LIMIT = 12000
+GROQ_MAX_OUTPUT_TOKENS = 1024
+GROQ_REQUEST_MARGIN = 700  # 추정 오차·API 오버헤드 여유
+
 
 @st.cache_resource
 def _get_chroma_client():
@@ -578,15 +572,14 @@ def _get_embedding_fn():
 
 @st.cache_resource
 def _get_llm():
-    groq_api_key = st.secrets.get("GROQ_API_KEY", "")
-    groq_api_key = groq_api_key.encode("ascii", errors="ignore").decode("ascii").strip()
+    groq_api_key = _clean_ascii(st.secrets.get("GROQ_API_KEY", ""))
     if not groq_api_key:
         raise ValueError("Streamlit Secrets에 GROQ_API_KEY가 설정되어 있지 않습니다.")
     return ChatGroq(
         model="llama-3.3-70b-versatile",
         groq_api_key=groq_api_key,
         temperature=0.1,
-        max_tokens=2048,
+        max_tokens=GROQ_MAX_OUTPUT_TOKENS,
     )
 
 
@@ -637,13 +630,32 @@ def safe_count(collection) -> int:
         return 0
 
 
-# Groq on_demand llama-3.3-70b-versatile TPM 한도(12,000) 대비 입력 예산
-GROQ_INPUT_TOKEN_BUDGET = 9000
-
-
 def _estimate_tokens(text: str) -> int:
-    """한국어 혼합 텍스트 보수적 토큰 추정 (약 2자 = 1토큰)."""
-    return max(1, len(text) // 2)
+    """한국어 특허 텍스트 보수적 토큰 추정 (과소 추정 방지)."""
+    if not text:
+        return 0
+    # 한국어 혼합: 약 1.2~1.7자/토큰 → 1.25자/토큰 가정
+    return max(1, int(len(text) / 1.25) + 5)
+
+
+def _chars_for_token_budget(tokens: int) -> int:
+    """토큰 예산에 대응하는 최대 문자 수."""
+    return max(100, int(tokens * 1.25))
+
+
+def _max_prompt_input_tokens(system_prompt: str, user_query: str) -> int:
+    """입력+출력 합계가 Groq TPM 한도 내가 되도록 참고 데이터에 쓸 수 있는 토큰."""
+    instruction = "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요."
+    fixed = (
+        f"[SYSTEM] {system_prompt}\n{instruction}\n"
+        f"[참고 데이터]\n\n[사용자 요청]\n{user_query}\n\n"
+        "보고서는 마크다운 양식으로 한국어로 작성하세요."
+    )
+    overhead = _estimate_tokens(fixed) + 30
+    return max(
+        1200,
+        GROQ_TPM_LIMIT - GROQ_MAX_OUTPUT_TOKENS - GROQ_REQUEST_MARGIN - overhead,
+    )
 
 
 def _truncate_text(text: str, max_chars: int, suffix: str = "\n…(분량 제한으로 일부 생략)") -> str:
@@ -771,7 +783,7 @@ def _build_rag_context_for_llm(
     if n == 0:
         return "", False
 
-    per_doc_chars = max(400, min(1800, (token_budget * 2) // n))
+    per_doc_chars = max(300, min(1200, _chars_for_token_budget(token_budget) // n))
     truncated = False
 
     while True:
@@ -786,27 +798,39 @@ def _build_rag_context_for_llm(
             parts.append(f"{header}{body}\n\n")
 
         combined = "".join(parts)
-        if _estimate_tokens(combined) <= token_budget or per_doc_chars <= 300:
+        if _estimate_tokens(combined) <= token_budget or per_doc_chars <= 250:
             if _estimate_tokens(combined) > token_budget:
-                combined = _truncate_text(combined, token_budget * 2)
+                combined = _truncate_text(combined, _chars_for_token_budget(token_budget))
                 truncated = True
             return combined, truncated
 
         per_doc_chars = int(per_doc_chars * 0.75)
 
 
-def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str) -> tuple[str, bool]:
+def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str) -> tuple[str, bool, str]:
     instruction = "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요."
-    overhead = _estimate_tokens(
-        f"[SYSTEM] {system_prompt}\n{instruction}\n[사용자 요청]\n{user_query}\n"
-        "보고서는 마크다운 양식으로 한국어로 작성하세요."
-    ) + 30
-    context_budget = max(1500, GROQ_INPUT_TOKEN_BUDGET - overhead)
+    context_budget = _max_prompt_input_tokens(system_prompt, user_query)
     truncated = False
 
     if _estimate_tokens(context_text) > context_budget:
-        context_text = _truncate_text(context_text, context_budget * 2)
+        context_text = _truncate_text(context_text, _chars_for_token_budget(context_budget))
         truncated = True
+
+    max_input = GROQ_TPM_LIMIT - GROQ_MAX_OUTPUT_TOKENS - GROQ_REQUEST_MARGIN
+
+    for _ in range(8):
+        prompt = (
+            f"[SYSTEM] {system_prompt}\n"
+            f"{instruction}\n\n"
+            f"[참고 데이터]\n{context_text}\n\n"
+            f"[사용자 요청]\n{user_query}\n\n"
+            "보고서는 마크다운 양식으로 한국어로 작성하세요."
+        )
+        if _estimate_tokens(prompt) <= max_input:
+            return prompt, truncated, context_text
+
+        truncated = True
+        context_text = _truncate_text(context_text, max(200, int(len(context_text) * 0.82)))
 
     prompt = (
         f"[SYSTEM] {system_prompt}\n"
@@ -815,10 +839,64 @@ def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str)
         f"[사용자 요청]\n{user_query}\n\n"
         "보고서는 마크다운 양식으로 한국어로 작성하세요."
     )
-    return prompt, truncated
+    return prompt, truncated, context_text
 
 
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
+def _detect_columns(df: pd.DataFrame) -> dict:
+    """DataFrame 컬럼명을 분석해 각 필드에 해당하는 실제 컬럼명 반환."""
+    col_map = {str(c).strip().replace(" ", "").upper(): c for c in df.columns}
+    return {
+        "id":        next((v for k, v in col_map.items() if "출원번호" in k or "번호" in k), df.columns[0]),
+        "title":     next((v for k, v in col_map.items() if "명칭" in k or "제목" in k or "특허명" in k), None),
+        "abstract":  next((v for k, v in col_map.items() if "요약" in k or "초록" in k), None),
+        "claims":    next((v for k, v in col_map.items() if "청구" in k or "범위" in k or "청구항" in k), None),
+        "app_date":  next((v for k, v in col_map.items() if "출원일" in k or "출원일자" in k), None),
+        "reg_date":  next((v for k, v in col_map.items() if "등록일" in k or "등록일자" in k), None),
+        "ipc":       next((v for k, v in col_map.items() if "IPC" in k), None),
+        "cpc":       next((v for k, v in col_map.items() if "CPC" in k), None),
+        "inventor":  next((v for k, v in col_map.items() if "발명자" in k or "발명인" in k), None),
+        "applicant": next((v for k, v in col_map.items() if "출원인" in k or "권리자" in k), None),
+    }
+
+
+def _get_cell(row, col, default: str = "없음") -> str:
+    """컬럼이 존재하고 값이 있으면 str 반환."""
+    if col and pd.notna(row.get(col)):
+        val = str(row[col]).strip()
+        return val if val else default
+    return default
+
+
+def _get_info_cell(row, col) -> str:
+    """임베딩용 — 빈 값은 '정보없음'."""
+    return _get_cell(row, col, default="정보없음")
+
+
+def _build_metadata(row, cols: dict, patent_url: str = "") -> dict:
+    """ChromaDB 메타데이터 딕셔너리 생성."""
+    title = _get_info_cell(row, cols["title"]) if cols["title"] else "정보없음"
+    return {
+        "출원번호": str(row[cols["id"]]),
+        "명칭":     title,
+        "출원일":   _get_cell(row, cols["app_date"]),
+        "등록일":   _get_cell(row, cols["reg_date"]),
+        "IPC":      _get_cell(row, cols["ipc"]),
+        "CPC":      _get_cell(row, cols["cpc"]),
+        "발명자":   _get_cell(row, cols["inventor"]),
+        "출원인":   _get_cell(row, cols["applicant"]),
+        "URL":      patent_url,
+    }
+
+
+def _build_document(row, cols: dict) -> str:
+    """ChromaDB 임베딩용 문서 텍스트 생성."""
+    title    = _get_info_cell(row, cols["title"])
+    abstract = _get_info_cell(row, cols["abstract"])
+    claims   = _get_info_cell(row, cols["claims"])
+    return f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
+
+
 def extract_excel_hyperlinks(uploaded_file):
     link_dict = {}
     try:
@@ -839,51 +917,21 @@ def reindex_from_master_excel(collection) -> int:
     재시작 후 ChromaDB 재구성 전용 함수.
     process_and_update_db는 uploaded_file을 MASTER_EXCEL_PATH와 비교해
     전부 중복으로 처리하는 문제가 있어, 재인덱싱은 이 함수를 사용한다.
-    메타데이터 키는 process_and_update_db와 동일한 한국어 구조를 사용한다.
     """
     if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
         return 0
     try:
-        df = pd.read_excel(MASTER_EXCEL_PATH)
-        col_map = {str(c).strip().replace(" ", "").upper(): c for c in df.columns}
-
-        id_col       = next((v for k, v in col_map.items() if "출원번호" in k or "번호" in k), df.columns[0])
-        title_col    = next((v for k, v in col_map.items() if "명칭" in k or "제목" in k or "특허명" in k), None)
-        abstract_col = next((v for k, v in col_map.items() if "요약" in k or "초록" in k), None)
-        claims_col   = next((v for k, v in col_map.items() if "청구" in k or "범위" in k or "청구항" in k), None)
-        app_date_col = next((v for k, v in col_map.items() if "출원일" in k), None)
-        reg_date_col = next((v for k, v in col_map.items() if "등록일" in k), None)
-        ipc_col      = next((v for k, v in col_map.items() if "IPC" in k), None)
-        cpc_col      = next((v for k, v in col_map.items() if "CPC" in k), None)
-        inventor_col = next((v for k, v in col_map.items() if "발명자" in k or "발명인" in k), None)
-        applicant_col= next((v for k, v in col_map.items() if "출원인" in k or "권리자" in k), None)
+        df   = pd.read_excel(MASTER_EXCEL_PATH)
+        cols = _detect_columns(df)
 
         ids, docs, metas = [], [], []
         for _, row in df.iterrows():
-            pat_id = str(row[id_col]).replace("-", "").strip()
+            pat_id = str(row[cols["id"]]).replace("-", "").strip()
             if not pat_id or pat_id == "nan":
                 continue
-
-            title    = str(row[title_col]).strip()    if title_col    and pd.notna(row[title_col])    else "정보없음"
-            abstract = str(row[abstract_col]).strip() if abstract_col and pd.notna(row[abstract_col]) else "정보없음"
-            claims   = str(row[claims_col]).strip()   if claims_col   and pd.notna(row[claims_col])   else "정보없음"
-            doc = f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
-
-            # process_and_update_db와 동일한 한국어 메타데이터 키 구조
-            meta = {
-                "출원번호": str(row[id_col]),
-                "명칭":     title,
-                "출원일":   str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
-                "등록일":   str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
-                "IPC":      str(row[ipc_col])      if ipc_col      and pd.notna(row[ipc_col])      else "없음",
-                "CPC":      str(row[cpc_col])      if cpc_col      and pd.notna(row[cpc_col])      else "없음",
-                "발명자":   str(row[inventor_col]) if inventor_col  and pd.notna(row[inventor_col]) else "없음",
-                "출원인":   str(row[applicant_col])if applicant_col and pd.notna(row[applicant_col])else "없음",
-                "URL":      ""
-            }
             ids.append(pat_id)
-            docs.append(doc)
-            metas.append(meta)
+            docs.append(_build_document(row, cols))
+            metas.append(_build_metadata(row, cols, patent_url=""))
 
         BATCH = 100
         for i in range(0, len(ids), BATCH):
@@ -899,47 +947,36 @@ def reindex_from_master_excel(collection) -> int:
 
 
 def process_and_update_db(uploaded_file, collection):
-    import copy
-    file_for_links = copy.deepcopy(uploaded_file)
-    hyperlink_map = extract_excel_hyperlinks(file_for_links)
-    
+    file_bytes    = uploaded_file.read()
+    hyperlink_map = extract_excel_hyperlinks(io.BytesIO(file_bytes))
+
     try:
-        new_df = pd.read_excel(uploaded_file)
+        new_df = pd.read_excel(io.BytesIO(file_bytes))
     except Exception as e:
         st.error(f"엑셀 파일 로드 실패: {e}")
         return 0, 0
-    
-    columns_map = {str(col).strip().replace(" ", "").upper(): col for col in new_df.columns}
-    
-    id_col = next((v for k, v in columns_map.items() if "출원번호" in k or "번호" in k), new_df.columns[0])
-    title_col = next((v for k, v in columns_map.items() if "명칭" in k or "제목" in k or "특허명" in k), None)
-    abstract_col = next((v for k, v in columns_map.items() if "요약" in k or "초록" in k), None)
-    claims_col = next((v for k, v in columns_map.items() if "청구" in k or "범위" in k or "청구항" in k), None)
-    
-    app_date_col = next((v for k, v in columns_map.items() if "출원일" in k or "출원일자" in k), None)
-    reg_date_col = next((v for k, v in columns_map.items() if "등록일" in k or "등록일자" in k), None)
-    ipc_col = next((v for k, v in columns_map.items() if "IPC" in k), None)
-    cpc_col = next((v for k, v in columns_map.items() if "CPC" in k), None)
-    inventor_col = next((v for k, v in columns_map.items() if "발명자" in k or "발명인" in k), None)
-    applicant_col = next((v for k, v in columns_map.items() if "출원인" in k or "권리자" in k), None)
+
+    cols = _detect_columns(new_df)
 
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
         try:
-            master_df = pd.read_excel(MASTER_EXCEL_PATH)
-            existing_numbers = set(master_df[id_col].astype(str).str.replace("-", "").str.strip().tolist())
+            master_df        = pd.read_excel(MASTER_EXCEL_PATH)
+            existing_numbers = set(
+                master_df[cols["id"]].astype(str).str.replace("-", "").str.strip().tolist()
+            )
         except Exception:
-            master_df = pd.DataFrame(columns=new_df.columns)
+            master_df        = pd.DataFrame(columns=new_df.columns)
             existing_numbers = set()
     else:
-        master_df = pd.DataFrame(columns=new_df.columns)
+        master_df        = pd.DataFrame(columns=new_df.columns)
         existing_numbers = set()
 
-    new_records = []
+    new_records     = []
     duplicate_count = 0
 
-    for idx, row in new_df.iterrows():
-        current_number = str(row[id_col]).replace("-", "").strip()
-        if current_number == "" or current_number == "nan":
+    for _, row in new_df.iterrows():
+        current_number = str(row[cols["id"]]).replace("-", "").strip()
+        if not current_number or current_number == "nan":
             continue
         if current_number in existing_numbers:
             duplicate_count += 1
@@ -947,50 +984,34 @@ def process_and_update_db(uploaded_file, collection):
         new_records.append(row)
         existing_numbers.add(current_number)
 
-    if new_records:
-        added_df = pd.DataFrame(new_records)
-        updated_master_df = added_df if master_df.empty else pd.concat([master_df, added_df], ignore_index=True)
-        updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
-
-        # 배치 처리로 ChromaDB 적재 (1건씩 루프 대비 대용량 처리 안정성 향상)
-        batch_ids, batch_docs, batch_metas = [], [], []
-        for _, row in added_df.iterrows():
-            title    = str(row[title_col]).strip()    if title_col    and pd.notna(row[title_col])    else "정보없음"
-            abstract = str(row[abstract_col]).strip() if abstract_col and pd.notna(row[abstract_col]) else "정보없음"
-            claims   = str(row[claims_col]).strip()   if claims_col   and pd.notna(row[claims_col])   else "정보없음"
-
-            search_context = f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
-            doc_id = str(row[id_col]).replace("-", "").strip()
-
-            patent_url = hyperlink_map.get(doc_id, "")
-            if patent_url == "" and title_col:
-                clean_title = str(row[title_col]).strip().replace("-", "")
-                patent_url = hyperlink_map.get(clean_title, "")
-
-            batch_ids.append(doc_id)
-            batch_docs.append(search_context)
-            batch_metas.append({
-                "출원번호": str(row[id_col]),
-                "명칭":     title,
-                "출원일":   str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
-                "등록일":   str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
-                "IPC":      str(row[ipc_col])      if ipc_col      and pd.notna(row[ipc_col])      else "없음",
-                "CPC":      str(row[cpc_col])      if cpc_col      and pd.notna(row[cpc_col])      else "없음",
-                "발명자":   str(row[inventor_col]) if inventor_col  and pd.notna(row[inventor_col]) else "없음",
-                "출원인":   str(row[applicant_col])if applicant_col and pd.notna(row[applicant_col])else "없음",
-                "URL":      patent_url
-            })
-
-        BATCH = 100
-        for i in range(0, len(batch_ids), BATCH):
-            collection.upsert(
-                ids=batch_ids[i:i+BATCH],
-                documents=batch_docs[i:i+BATCH],
-                metadatas=batch_metas[i:i+BATCH]
-            )
-        return len(new_records), duplicate_count
-    else:
+    if not new_records:
         return 0, duplicate_count
+
+    added_df = pd.DataFrame(new_records)
+    updated_master_df = added_df if master_df.empty else pd.concat([master_df, added_df], ignore_index=True)
+    updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
+
+    batch_ids, batch_docs, batch_metas = [], [], []
+    for _, row in added_df.iterrows():
+        doc_id = str(row[cols["id"]]).replace("-", "").strip()
+
+        patent_url = hyperlink_map.get(doc_id, "")
+        if not patent_url and cols["title"]:
+            clean_title = str(row[cols["title"]]).strip().replace("-", "")
+            patent_url  = hyperlink_map.get(clean_title, "")
+
+        batch_ids.append(doc_id)
+        batch_docs.append(_build_document(row, cols))
+        batch_metas.append(_build_metadata(row, cols, patent_url=patent_url))
+
+    BATCH = 100
+    for i in range(0, len(batch_ids), BATCH):
+        collection.upsert(
+            ids=batch_ids[i:i+BATCH],
+            documents=batch_docs[i:i+BATCH],
+            metadatas=batch_metas[i:i+BATCH]
+        )
+    return len(new_records), duplicate_count
 
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
@@ -1094,28 +1115,22 @@ def run_main_portal():
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
             if uploaded_file is not None:
                 if st.button("🚀 신규 특허 무결성 적재"):
-                    import copy, io
-                    # ── 1단계: 열 구조 사전 진단 ──
                     try:
                         preview_bytes = uploaded_file.read()
                         uploaded_file.seek(0)
-                        preview_df = pd.read_excel(io.BytesIO(preview_bytes), nrows=3)
-                        col_map_preview = {str(c).strip().replace(" ", "").upper(): c for c in preview_df.columns}
-
-                        id_detected    = next((v for k, v in col_map_preview.items() if "출원번호" in k or "번호" in k), preview_df.columns[0])
-                        title_detected = next((v for k, v in col_map_preview.items() if "명칭" in k or "제목" in k or "특허명" in k), "미감지")
-                        total_rows     = pd.read_excel(io.BytesIO(preview_bytes)).shape[0]
+                        preview_df    = pd.read_excel(io.BytesIO(preview_bytes), nrows=3)
+                        detected_cols = _detect_columns(preview_df)
+                        total_rows    = pd.read_excel(io.BytesIO(preview_bytes)).shape[0]
                         uploaded_file.seek(0)
 
                         with st.expander("📋 업로드 파일 열 감지 결과 (클릭 확인)", expanded=True):
                             st.write(f"- **전체 행 수:** {total_rows}행")
-                            st.write(f"- **감지된 출원번호 열:** `{id_detected}`")
-                            st.write(f"- **감지된 명칭 열:** `{title_detected}`")
+                            st.write(f"- **감지된 출원번호 열:** `{detected_cols['id']}`")
+                            st.write(f"- **감지된 명칭 열:** `{detected_cols['title']}`")
                             st.write(f"- **전체 열 목록:** {list(preview_df.columns)}")
                     except Exception as diag_e:
                         st.warning(f"파일 사전 진단 실패: {diag_e}")
 
-                    # ── 2단계: 실제 적재 ──
                     with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                         added, dup = process_and_update_db(uploaded_file, collection)
 
@@ -1171,40 +1186,12 @@ def run_main_portal():
                         # 2. (옵션) GitHub 백업도 삭제
                         github_cleared = False
                         if also_clear_github:
-                            token, repo_url = _get_github_secrets()
-                            if token:
-                                try:
-                                    raw_url   = repo_url.replace(".git", "")
-                                    repo_path = raw_url.split("github.com/")[-1]
-                                    api_url   = f"https://api.github.com/repos/{repo_path}/contents/my_patent_folder/master_patents.xlsx"
-                                    req_get   = Request(api_url, headers={
-                                        "Authorization": f"Bearer {token}",
-                                        "Accept": "application/vnd.github.v3+json"
-                                    })
-                                    with urlopen(req_get, timeout=15) as r:
-                                        sha = json.loads(r.read().decode()).get("sha", "")
-                                    if sha:
-                                        del_payload = json.dumps({
-                                            "message": "[Format] Delete master_patents.xlsx",
-                                            "sha": sha,
-                                            "branch": "main"
-                                        }).encode("utf-8")
-                                        req_del = Request(api_url, data=del_payload, headers={
-                                            "Authorization": f"Bearer {token}",
-                                            "Content-Type": "application/json",
-                                            "Accept": "application/vnd.github.v3+json"
-                                        }, method="DELETE")
-                                        with urlopen(req_del, timeout=30):
-                                            github_cleared = True
-                                except HTTPError as e:
-                                    if e.code == 404:
-                                        github_cleared = True  # 이미 없음
-                                    else:
-                                        st.warning(f"GitHub 삭제 실패: HTTP {e.code} {e.reason}")
-                                except Exception as e:
-                                    st.warning(f"GitHub 삭제 중 오류: {e}")
+                            github_cleared = delete_file_from_github_api(
+                                "my_patent_folder/master_patents.xlsx"
+                            )
+                            if not github_cleared:
+                                st.warning("GitHub 삭제 실패 — GitHub 연결 진단 후 재시도하세요.")
 
-                        # 3. ChromaDB 컬렉션 재생성 (EphemeralClient는 cache_resource로 유지)
                         reset_collection()
 
                         # github_synced = True: 포맷 직후 리런에서 GitHub 재다운로드 방지
@@ -1367,11 +1354,6 @@ def run_main_portal():
                     retrieved_docs  = results["documents"][0]
                     retrieved_metas = results["metadatas"][0]
 
-                    suffix_preview = (
-                        "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요.\n\n"
-                        f"[사용자 요청]\n{user_query}\n\n"
-                        "보고서는 마크다운 양식으로 한국어로 작성하세요."
-                    )
                     if "💡 단순 키워드" in analysis_mode:
                         system_prompt = (
                             "당신은 신속하고 정확하게 관련 문헌을 찾아내는 '수석 특허 검색 조사관'입니다. "
@@ -1389,14 +1371,15 @@ def run_main_portal():
                             "회피설계 가이드를 구성요소 완비 법칙에 근거하여 작성하세요."
                         )
 
-                    overhead = _estimate_tokens(f"[SYSTEM] {system_prompt}\n{suffix_preview}") + 20
-                    context_budget = max(1500, GROQ_INPUT_TOKEN_BUDGET - overhead)
+                    context_budget = _max_prompt_input_tokens(system_prompt, user_query)
                     claims_first = "🛡" in analysis_mode
                     context_text, context_truncated = _build_rag_context_for_llm(
                         retrieved_docs, retrieved_metas, context_budget, claims_first=claims_first
                     )
 
-                prompt, prompt_truncated = _assemble_llm_prompt(system_prompt, context_text, user_query)
+                prompt, prompt_truncated, context_text = _assemble_llm_prompt(
+                    system_prompt, context_text, user_query
+                )
                 truncated = context_truncated or prompt_truncated
 
                 try:
