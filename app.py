@@ -551,73 +551,72 @@ def check_authentication():
 # 2. [프로세스 레벨 싱글톤] @st.cache_resource 기반 인프라 팩토리
 # ==========================================
 
-# 모듈 레벨 ChromaDB 클라이언트 싱글톤 + 생성 락.
-# _build_infra.clear() 후에도 _CHROMA_CLIENT 참조는 살아 있어 재생성 없이 재사용.
-# 락은 멀티스레드 환경에서 동시 생성 시도로 인한 ValueError를 방지한다.
-_CHROMA_CLIENT = None
-_CHROMA_LOCK   = threading.Lock()
+# ── 모듈 레벨 ChromaDB 싱글톤 ──────────────────────────────────────────────────
+# _CHROMA_CLIENT : EphemeralClient 인스턴스. 프로세스 수명 동안 단 한 번만 생성.
+# _CURRENT_COLLECTION : 현재 유효한 컬렉션 참조.
+#   · 포맷 버튼이 _build_infra.clear() 대신 이 변수를 직접 교체한다.
+#   · run_main_portal()은 _build_infra()가 반환한 컬렉션 대신 이 변수를 사용.
+#   이렇게 하면 _build_infra.clear() 호출을 완전히 제거할 수 있고
+#   EphemeralClient 재생성에 따른 ValueError를 원천 차단한다.
+_CHROMA_CLIENT     = None
+_CURRENT_COLLECTION = None
+_CHROMA_LOCK       = threading.Lock()
+_EMBED_MODEL       = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 
 def _get_or_create_chroma_client():
-    """
-    EphemeralClient를 안전하게 반환한다.
-    내부 _identifiers_to_system 레지스트리에 충돌 인스턴스가 남아 있을 경우
-    해당 레지스트리를 직접 비운 뒤 재시도한다.
-    """
+    """EphemeralClient를 스레드 안전하게 단 한 번만 생성·반환."""
     global _CHROMA_CLIENT
     with _CHROMA_LOCK:
-        if _CHROMA_CLIENT is not None:
-            return _CHROMA_CLIENT
-        for attempt in range(2):
-            try:
-                _CHROMA_CLIENT = chromadb.EphemeralClient()
-                return _CHROMA_CLIENT
-            except ValueError:
-                if attempt == 0:
-                    # 레지스트리에 잔존 인스턴스가 있으면 강제 초기화 후 재시도
-                    try:
-                        from chromadb.api.client import SharedSystemClient
-                        SharedSystemClient._identifiers_to_system.clear()
-                    except Exception:
-                        pass
-                else:
-                    raise
-    return _CHROMA_CLIENT
+        if _CHROMA_CLIENT is None:
+            _CHROMA_CLIENT = chromadb.EphemeralClient()
+        return _CHROMA_CLIENT
+
+
+def _make_embedding_fn():
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=_EMBED_MODEL
+    )
+
+
+def reset_collection():
+    """
+    포맷 버튼 전용: 기존 컬렉션을 삭제하고 빈 컬렉션을 재생성한 뒤
+    _CURRENT_COLLECTION 전역 참조를 교체한다.
+    _build_infra.clear()를 호출하지 않으므로 EphemeralClient 재생성 ValueError 없음.
+    """
+    global _CURRENT_COLLECTION
+    client = _get_or_create_chroma_client()
+    try:
+        client.delete_collection("competitor_patents")
+    except Exception:
+        pass
+    _CURRENT_COLLECTION = client.get_or_create_collection(
+        name="competitor_patents",
+        embedding_function=_make_embedding_fn()
+    )
+    return _CURRENT_COLLECTION
 
 
 @st.cache_resource
 def _build_infra():
     """
-    @st.cache_resource: 프로세스당 단 한 번만 실행되어 동일 인스턴스를 모든 세션·리런에서 재사용.
-
-    [PersistentClient → EphemeralClient 전환 이유]
-    chromadb 0.5.0에서 Streamlit Cloud 복수 Worker Process가 동시에 같은 SQLite 파일에
-    접근할 때 'no such table: tenants/collections/embeddings' 레이스 컨디션이 발생한다.
-    ChromaDB 데이터 영속성은 GitHub 백업/복원으로 이미 보장되므로,
-    SQLite 파일 불필요 → EphemeralClient(순수 인메모리)로 교체하여 모든 SQLite 오류 원천 제거.
-
-    [_CHROMA_CLIENT 전역 싱글톤 이유]
-    _build_infra.clear() 후 재실행 시 chromadb.EphemeralClient()를 재생성하면
-    내부 _identifiers_to_system 레지스트리에 이전 인스턴스가 남아 ValueError 충돌 발생.
-    → 모듈 레벨 변수에 클라이언트를 보관해 재생성 없이 재사용.
+    @st.cache_resource: 프로세스당 단 한 번만 실행.
+    EphemeralClient와 LLM을 초기화한다.
+    컬렉션은 _CURRENT_COLLECTION 전역 변수로 관리하므로 여기서는 반환하지 않는다.
+    (포맷 후 _build_infra.clear() 없이 reset_collection()으로 컬렉션만 교체 가능)
     """
+    global _CURRENT_COLLECTION
     chroma_client = _get_or_create_chroma_client()
 
-    # 다국어 임베딩 함수 및 컬렉션
-    # paraphrase-multilingual-mpnet-base-v2: 50개 언어 지원, 한국어↔영어 교차 언어 검색 가능
-    # (ko-sroberta-multitask에서 교체 — 한국/일본 특허(한국어) + 해외 특허(영어) 혼합 DB 대응)
-    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-    )
-    collection = chroma_client.get_or_create_collection(
-        name="competitor_patents",
-        embedding_function=sentence_transformer_ef
-    )
+    # 최초 실행 시에만 컬렉션 생성 (이미 reset_collection()이 교체한 경우 덮어쓰지 않음)
+    if _CURRENT_COLLECTION is None:
+        _CURRENT_COLLECTION = chroma_client.get_or_create_collection(
+            name="competitor_patents",
+            embedding_function=_make_embedding_fn()
+        )
 
-    # Groq Cloud API 기반 Llama 3.3 엔진 (키는 반드시 Streamlit Secrets에서 로드)
     groq_api_key = st.secrets.get("GROQ_API_KEY", "")
-    # GitHub 토큰과 동일하게: 복사·붙여넣기 시 섞여 들어온
-    # 비가시적 유니코드 문자(BOM, Zero-Width Space 등)를 ASCII 필터로 제거
     groq_api_key = groq_api_key.encode("ascii", errors="ignore").decode("ascii").strip()
     if not groq_api_key:
         raise ValueError("Streamlit Secrets에 GROQ_API_KEY가 설정되어 있지 않습니다.")
@@ -627,17 +626,22 @@ def _build_infra():
         temperature=0.1
     )
 
-    return chroma_client, collection, llm
+    return chroma_client, llm
 
 
 def load_permanent_infra_singleton():
-    # 최초 1회만 스피너 표시 — 이후 캐시 히트 시 즉시 반환
+    """
+    _build_infra()를 통해 chroma_client와 llm을 얻고,
+    _CURRENT_COLLECTION 전역 변수에서 최신 컬렉션 참조를 가져와 반환한다.
+    포맷 버튼은 _build_infra.clear() 없이 reset_collection()으로 _CURRENT_COLLECTION만 교체.
+    """
     if "infra_initialized" not in st.session_state:
         with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
-            result = _build_infra()
+            chroma_client, llm = _build_infra()
         st.session_state.infra_initialized = True
-        return result
-    return _build_infra()
+    else:
+        chroma_client, llm = _build_infra()
+    return chroma_client, _CURRENT_COLLECTION, llm
 
 
 def safe_count(collection) -> int:
@@ -1040,22 +1044,8 @@ def run_main_portal():
                                 except Exception as e:
                                     st.warning(f"GitHub 삭제 중 오류: {e}")
 
-                        # 3. ChromaDB 컬렉션 재생성
-                        try:
-                            chroma_client.delete_collection("competitor_patents")
-                        except Exception:
-                            pass
-                        sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-                            model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-                        )
-                        chroma_client.get_or_create_collection(
-                            name="competitor_patents",
-                            embedding_function=sentence_transformer_ef
-                        )
-
-                        # 4. 캐시 초기화
-                        _build_infra.clear()
-                        st.session_state.pop("infra_initialized", None)
+                        # 3. ChromaDB 컬렉션 재생성 (_build_infra.clear() 없이 전역 참조만 교체)
+                        reset_collection()
 
                         # github_synced = True: 포맷 직후 리런에서 GitHub 재다운로드 방지
                         # (이전에 False로 설정 시 GitHub의 기존 데이터가 즉시 복원되는 문제 해결)
