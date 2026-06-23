@@ -68,7 +68,7 @@ def _normalize_patent_id(value) -> str:
     처리 순서:
       1) Excel float / 지수표기(1.02E+12) → 정수 문자열
       2) 구분자(하이픈·공백·슬래시·점) 제거
-      3) KR/kr 접두사 제거
+      3) KR/kr 접두사만 선두에서 제거(국제출원 고유 문자열 보존)
       4) 영숫자만 유지(대문자) — PCT/US 등 국제출원번호 대응
 
     동일 특허의 서로 다른 표기(10-2020-0012345 / 1020200012345)는 같은 ID가 됨.
@@ -97,9 +97,213 @@ def _normalize_patent_id(value) -> str:
         s = s[:-2]
 
     s = re.sub(r"[\s\-_./\\]+", "", s)
-    s = re.sub(r"^(KR|kr)", "", s)
+    if s.lower().startswith("kr"):
+        s = s[2:]
     s = re.sub(r"[^A-Za-z0-9]", "", s).upper()
     return s
+
+
+# ── 통계 집계: 복수값 분리 · 경쟁사 대표명화 ─────────────────────────────
+_MULTI_VALUE_SPLIT_RE = re.compile(r"\s*[|;/]\s*")
+
+# lookup key(대문자·기호 제거) → 화면용 대표명 (경쟁사 20사 내외 수동 매핑)
+_APPLICANT_CANONICAL_KEYS: dict[str, str] = {
+    "DIEBOLD":                         "DIEBOLD NIXDORF",
+    "DIEBOLDNIXDORF":                  "DIEBOLD NIXDORF",
+    "DIEBOLDNIXDORFINCORPORATED":      "DIEBOLD NIXDORF",
+    "DIEBOLDNIXDORFSYSTEMSGMBH":       "DIEBOLD NIXDORF",
+    "WINCORNIXDORF":                   "DIEBOLD NIXDORF",
+    "WINCORNIXDORFINTERNATIONALGMBH":"DIEBOLD NIXDORF",
+    "NCR":                             "NCR",
+    "NCRCORPORATION":                  "NCR",
+    "NAUTILUSHYOSUNG":                 "HYOSUNG NAUTILUS",
+    "HYOSUNG":                         "HYOSUNG NAUTILUS",
+    "HYOSUNGNAUTILUS":                 "HYOSUNG NAUTILUS",
+    "HOTS":                            "HOTS",
+    "GLORY":                           "GLORY",
+    "GLORYLTD":                        "GLORY",
+    "OKIELECTRIC":                     "OKI ELECTRIC",
+    "OKIELECTRICINDUSTRY":             "OKI ELECTRIC",
+    "OKIELECTRICINDUSTRYCOLTD":        "OKI ELECTRIC",
+    "FTEC":                            "FTEC",
+    "GRGBANKING":                      "GRG BANKING",
+    "GRGBANKINGEQUIPMENT":             "GRG BANKING",
+    "GRGBANKINGEQUIPMENTCOLTD":        "GRG BANKING",
+    "SHENZHENYIHUA":                   "SHENZHEN YIHUA",
+    "SHENZHENYIHUACOMPCOLTD":          "SHENZHEN YIHUA",
+    "SHENZHENYIHUATIMETECHNOLOGY":     "SHENZHEN YIHUA",
+    "SHENZHENYIHUAFINANCIALINTELLIGENTRESINST": "SHENZHEN YIHUA",
+    "CASHWAY":                         "CASHWAY",
+    "CASHWAYTECHNOLOGY":               "CASHWAY",
+    "GUARDIAN":                        "GUARDIAN",
+    "GUARDIANANALYTICS":               "GUARDIAN",
+    "FUJITSU":                         "FUJITSU",
+    "HITACHI":                         "HITACHI",
+    "TOSHIBA":                         "TOSHIBA",
+    "RICOH":                           "RICOH",
+    "CANON":                           "CANON",
+    "PANASONIC":                       "PANASONIC",
+    "CUMMINSALLISON":                  "CUMMINS ALLISON",
+    "DE LA RUE":                       "DE LA RUE",
+    "DELARUE":                         "DE LA RUE",
+    "GIESSECKE":                       "GIECKE+DEVRIENT",
+    "GIESECKE":                        "GIECKE+DEVRIENT",
+    "GIECKE":                          "GIECKE+DEVRIENT",
+}
+
+# lookup key 앞부분 일치 시 대표명 (매핑표에 없는 변형 포착)
+_APPLICANT_PREFIX_RULES: list[tuple[str, str]] = [
+    ("DIEBOLD",          "DIEBOLD NIXDORF"),
+    ("WINCOR",           "DIEBOLD NIXDORF"),
+    ("NCR",              "NCR"),
+    ("NAUTILUS",         "HYOSUNG NAUTILUS"),
+    ("HYOSUNG",          "HYOSUNG NAUTILUS"),
+    ("GLORY",            "GLORY"),
+    ("OKIELECTRIC",      "OKI ELECTRIC"),
+    ("GRGBANKING",       "GRG BANKING"),
+    ("SHENZHENYIHUA",    "SHENZHEN YIHUA"),
+    ("CASHWAY",          "CASHWAY"),
+    ("GUARDIAN",         "GUARDIAN"),
+    ("CUMMINSALLISON",   "CUMMINS ALLISON"),
+    ("GIESSECKE",        "GIECKE+DEVRIENT"),
+    ("GIESECKE",         "GIECKE+DEVRIENT"),
+    ("GIECKE",           "GIECKE+DEVRIENT"),
+    ("DELARUE",          "DE LA RUE"),
+]
+
+_CORP_SUFFIX_PATTERNS = (
+    r"incorporated", r"inc\.?", r"corp\.?", r"corporation", r"ltd\.?", r"limited",
+    r"gmbh", r"co\.?", r"company", r"llc", r"plc", r"pte\.?", r"ag", r"sa", r"bv",
+    r"주식회사", r"\(주\)", r"㈜", r"유한회사", r"\(유\)", r"coltd", r"col\.?",
+    r"holdings?", r"group", r"international", r"systems?", r"equipment",
+    r"technology", r"technologies", r"industry", r"industries", r"financial",
+    r"intelligent", r"research", r"inst(?:itute)?", r"res", r"inst",
+)
+
+
+def _applicant_lookup_key(name: str) -> str:
+    """출원인 문자열을 alias 조회용 키로 변환."""
+    s = str(name).strip()
+    for _ in range(3):
+        prev = s
+        s = s.replace(",", " ")
+        for pat in _CORP_SUFFIX_PATTERNS:
+            s = re.sub(rf"\b{pat}\b", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"[\s\-_./\\()（）\[\]]+", "", s)
+        if s == prev:
+            break
+    return s.upper()
+
+
+def _canonical_applicant_name(name: str) -> str:
+    """경쟁사 출원인 표기를 대표명으로 통합 (집계 전용, 메타데이터 원본은 유지)."""
+    raw = str(name).strip()
+    if not raw or raw.lower() in ("nan", "none", "없음", "정보없음", "미기재"):
+        return ""
+
+    key = _applicant_lookup_key(raw)
+    if not key:
+        return raw
+
+    if key in _APPLICANT_CANONICAL_KEYS:
+        return _APPLICANT_CANONICAL_KEYS[key]
+
+    for prefix, canonical in _APPLICANT_PREFIX_RULES:
+        if key.startswith(prefix):
+            return canonical
+
+    # 한글 포함 시 공백·접미사만 정리한 표시명 반환
+    if re.search(r"[가-힣]", raw):
+        cleaned = re.sub(r"\s*(\(주\)|주식회사|㈜|유한회사|\(유\))\s*", "", raw).strip()
+        return cleaned if cleaned else raw
+
+    return raw
+
+
+def _explode_multi_values(value, *, allow_comma: bool = False) -> list[str]:
+    """한 셀에 묶인 복수 값(출원인·발명자·IPC)을 개별 항목 리스트로 분리."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "없음", "정보없음", "미기재"):
+        return []
+
+    parts = [p.strip() for p in _MULTI_VALUE_SPLIT_RE.split(s) if p.strip()]
+    if allow_comma and len(parts) <= 1:
+        parts = [p.strip() for p in re.split(r"\s*,\s*", s) if p.strip()]
+
+    return [
+        p for p in parts
+        if p and p.lower() not in ("nan", "none", "없음", "정보없음", "미기재")
+    ]
+
+
+def _flatten_for_counts(
+    series: pd.Series,
+    *,
+    normalizer=None,
+    explode: bool = False,
+    allow_comma: bool = False,
+) -> pd.Series:
+    """Series를 value_counts 가능한 flat Series로 변환."""
+    items: list[str] = []
+    for val in series:
+        if explode:
+            parts = _explode_multi_values(val, allow_comma=allow_comma)
+        else:
+            parts = [str(val).strip()] if pd.notna(val) else []
+        for part in parts:
+            item = normalizer(part) if normalizer else part.strip()
+            if item and item.lower() not in ("nan", "none", "없음"):
+                items.append(item)
+    return pd.Series(items, dtype=str)
+
+
+def _top_counts_table(
+    series: pd.Series,
+    n: int = 10,
+    *,
+    label: str = "항목",
+    normalizer=None,
+    explode: bool = False,
+    allow_comma: bool = False,
+) -> tuple[pd.DataFrame, str]:
+    """상위 N건 집계표(DataFrame)와 LLM용 마크다운 표 문자열 반환."""
+    flat = _flatten_for_counts(
+        series, normalizer=normalizer, explode=explode, allow_comma=allow_comma
+    )
+    if flat.empty:
+        empty = pd.DataFrame(columns=[label, "건수"])
+        return empty, f"| {label} | 건수 |\n| --- | ---: |\n| (데이터 없음) | 0 |"
+
+    counts = flat.value_counts().head(n)
+    df = pd.DataFrame({label: counts.index, "건수": counts.values})
+
+    lines = [f"| {label} | 건수 |", "| --- | ---: |"]
+    for _, row in df.iterrows():
+        lines.append(f"| {row[label]} | {int(row['건수'])} |")
+    return df, "\n".join(lines)
+
+
+def _year_counts_table(series: pd.Series) -> tuple[pd.DataFrame, str]:
+    """출원 연도별 건수 집계표."""
+    years = (
+        series.astype(str).str[:4]
+        .replace("", pd.NA)
+        .replace("없음", pd.NA)
+        .dropna()
+    )
+    if years.empty:
+        empty = pd.DataFrame(columns=["연도", "건수"])
+        return empty, "| 연도 | 건수 |\n| --- | ---: |\n| (데이터 없음) | 0 |"
+
+    counts = years.value_counts().sort_index()
+    df = pd.DataFrame({"연도": counts.index, "건수": counts.values})
+
+    lines = ["| 연도 | 건수 |", "| --- | ---: |"]
+    for _, row in df.iterrows():
+        lines.append(f"| {row['연도']} | {int(row['건수'])} |")
+    return df, "\n".join(lines)
 
 
 # ==========================================
@@ -592,8 +796,8 @@ def check_authentication():
 _EMBED_MODEL      = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 _COLLECTION_NAME  = "competitor_patents"
 
-# Groq on_demand: 단일 요청 = 입력 토큰 + max_tokens(출력 예약) ≤ 12,000 TPM
-GROQ_TPM_LIMIT = 12000
+# Groq on_demand 무료 티어: 단일 요청 = 입력 토큰 + max_tokens(출력 예약) ≤ 6,000 TPM
+GROQ_TPM_LIMIT = 6000
 GROQ_MAX_OUTPUT_TOKENS = 1024
 GROQ_REQUEST_MARGIN = 700  # 추정 오차·API 오버헤드 여유
 
@@ -1086,6 +1290,142 @@ def sync_chroma_missing_from_master(collection, hyperlink_map: dict | None = Non
         return 0
 
 
+def _excel_display_value(value) -> str:
+    """Chroma/엑셀 공통 표시값 정리."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "없음"
+    v = str(value).strip()
+    if not v or v.lower() in ("nan", "none", "정보없음"):
+        return "없음"
+    return v
+
+
+def _master_row_to_standard_dict(row, cols: dict) -> dict:
+    """마스터 엑셀 행 → 표준 컬럼 dict."""
+    url = ""
+    if "URL" in row.index and pd.notna(row.get("URL")):
+        url = str(row["URL"]).strip()
+    return {
+        "출원번호": str(row[cols["id"]]),
+        "명칭":     _get_cell(row, cols["title"]) if cols["title"] else "없음",
+        "요약":     _get_cell(row, cols["abstract"]) if cols["abstract"] else "없음",
+        "청구항":   _get_cell(row, cols["claims"]) if cols["claims"] else "없음",
+        "출원일":   _get_cell(row, cols["app_date"]),
+        "등록일":   _get_cell(row, cols["reg_date"]),
+        "IPC":      _get_cell(row, cols["ipc"]),
+        "CPC":      _get_cell(row, cols["cpc"]),
+        "발명자":   _get_cell(row, cols["inventor"]),
+        "출원인":   _get_cell(row, cols["applicant"]),
+        "URL":      url,
+    }
+
+
+def _chroma_record_to_row(chroma_id: str, meta: dict, doc: str) -> dict:
+    """ChromaDB id·메타데이터·문서 → 마스터 엑셀 표준 행."""
+    parsed = _parse_patent_doc(doc or "")
+
+    title = _excel_display_value(meta.get("명칭", ""))
+    if title == "없음":
+        raw_title = parsed.get("title", "")
+        if raw_title.startswith("특허명칭:"):
+            raw_title = raw_title.split("특허명칭:", 1)[1].strip()
+        title = _excel_display_value(raw_title)
+
+    abstract = parsed.get("abstract", "").strip()
+    claims   = parsed.get("claims", "").strip()
+    if abstract in ("", "정보없음"):
+        abstract = "없음"
+    if claims in ("", "정보없음"):
+        claims = "없음"
+
+    app_num = meta.get("출원번호", chroma_id)
+    if not str(app_num).strip() or str(app_num).strip() in ("없음", "nan"):
+        app_num = chroma_id
+
+    return {
+        "출원번호": str(app_num),
+        "명칭":     title,
+        "요약":     abstract,
+        "청구항":   claims,
+        "출원일":   _excel_display_value(meta.get("출원일", "")),
+        "등록일":   _excel_display_value(meta.get("등록일", "")),
+        "IPC":      _excel_display_value(meta.get("IPC", "")),
+        "CPC":      _excel_display_value(meta.get("CPC", "")),
+        "발명자":   _excel_display_value(meta.get("발명자", "")),
+        "출원인":   _excel_display_value(meta.get("출원인", "")),
+        "URL":      str(meta.get("URL", "") or "").strip(),
+    }
+
+
+_MASTER_EXCEL_COLUMNS = (
+    "출원번호", "명칭", "요약", "청구항", "출원일", "등록일",
+    "IPC", "CPC", "발명자", "출원인", "URL",
+)
+
+
+def sync_master_from_chroma(collection, batch_size: int = 500) -> tuple[int, int, int]:
+    """
+    ChromaDB → 마스터 엑셀 역동기화 (재임베딩·재파싱 없음, 메타데이터+문서만 읽음).
+    동일 canonical 출원번호는 Chroma 데이터가 우선(last-wins).
+    마스터에만 있던 행은 유지(합집합).
+    반환: (chroma보낸 건수, 동기화 전 마스터 고유 건수, 동기화 후 마스터 고유 건수)
+    """
+    master_before = _count_master_excel_patents() or 0
+    chroma_total  = safe_count(collection)
+    if chroma_total == 0:
+        return 0, master_before, master_before
+
+    rows_by_id: dict[str, dict] = {}
+
+    # 기존 마스터 행 선적재 (Chroma에 없는 행 보존)
+    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
+        try:
+            master_df   = pd.read_excel(MASTER_EXCEL_PATH)
+            master_cols = _detect_columns(master_df)
+            for _, row in master_df.iterrows():
+                cid = _normalize_patent_id(row[master_cols["id"]])
+                if cid:
+                    rows_by_id[cid] = _master_row_to_standard_dict(row, master_cols)
+        except Exception as e:
+            print(f"[마스터 선적재 오류] {e}")
+
+    # ChromaDB 배치 읽기 → 덮어쓰기 (재임베딩 없음)
+    exported = 0
+    try:
+        all_ids = collection.get(include=[])["ids"]
+    except Exception as e:
+        print(f"[ChromaDB id 목록 조회 오류] {e}")
+        return 0, master_before, master_before
+
+    for i in range(0, len(all_ids), batch_size):
+        batch_ids = all_ids[i:i + batch_size]
+        try:
+            batch = collection.get(ids=batch_ids, include=["metadatas", "documents"])
+        except Exception as e:
+            print(f"[ChromaDB 배치 조회 오류] {e}")
+            continue
+        for chroma_id, meta, doc in zip(
+            batch.get("ids", []),
+            batch.get("metadatas", []),
+            batch.get("documents", []),
+        ):
+            cid = _normalize_patent_id(chroma_id) or _normalize_patent_id(meta.get("출원번호", ""))
+            if not cid:
+                continue
+            rows_by_id[cid] = _chroma_record_to_row(chroma_id, meta or {}, doc or "")
+            exported += 1
+
+    if not rows_by_id:
+        return 0, master_before, master_before
+
+    df_out = pd.DataFrame(list(rows_by_id.values()), columns=list(_MASTER_EXCEL_COLUMNS))
+    os.makedirs(os.path.dirname(MASTER_EXCEL_PATH), exist_ok=True)
+    df_out.to_excel(MASTER_EXCEL_PATH, index=False)
+
+    master_after = len(rows_by_id)
+    return exported, master_before, master_after
+
+
 def _dedupe_dataframe_by_patent_id(df: pd.DataFrame, cols: dict) -> pd.DataFrame:
     """마스터 엑셀 저장 전 canonical 출원번호 기준 중복 행 제거(마지막 행 유지)."""
     if df.empty:
@@ -1456,8 +1796,37 @@ def run_main_portal():
             if master_n is not None:
                 count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
                 if master_n != chroma_n:
-                    count_md += "  \n⚠️ ChromaDB와 마스터 엑셀 건수가 다릅니다. 아래 **ChromaDB 누락분 복구** 버튼을 실행하세요."
+                    if chroma_n > master_n:
+                        gap = chroma_n - master_n
+                        count_md += (
+                            f"  \n⚠️ ChromaDB가 마스터보다 **{gap}건** 많습니다. "
+                            f"재시작 시 Chroma 데이터가 소실될 수 있으니 "
+                            f"**ChromaDB → 마스터 엑셀 역동기화** 후 GitHub 백업하세요."
+                        )
+                    else:
+                        gap = master_n - chroma_n
+                        count_md += (
+                            f"  \n⚠️ 마스터가 ChromaDB보다 **{gap}건** 많습니다. "
+                            f"**ChromaDB 누락분 복구** 버튼을 실행하세요."
+                        )
             st.markdown(count_md)
+
+            if master_n is not None and chroma_n > master_n:
+                if st.button("📥 ChromaDB → 마스터 엑셀 역동기화", use_container_width=True):
+                    gap = chroma_n - master_n
+                    with st.spinner(
+                        f"ChromaDB {chroma_n}건을 마스터 엑셀로 보내는 중 "
+                        f"(재임베딩 없음, 약 1~3분)..."
+                    ):
+                        exported, before_n, after_n = sync_master_from_chroma(collection)
+                    if exported > 0:
+                        st.success(
+                            f"✅ 역동기화 완료: Chroma **{exported}건** 반영 → "
+                            f"마스터 **{before_n} → {after_n}건** (ChromaDB는 그대로 유지)"
+                        )
+                        st.toast("💾 GitHub 마스터 백업을 실행해 영속화하세요.")
+                    else:
+                        st.error("역동기화 실패 — ChromaDB 데이터를 읽지 못했습니다.")
 
             if master_n is not None and master_n > chroma_n:
                 if st.button("🔧 ChromaDB 누락분 복구 (마스터 엑셀 기준)", use_container_width=True):
@@ -1480,7 +1849,10 @@ def run_main_portal():
                             MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx"
                         )
                     if ok:
-                        st.success(f"✅ GitHub 백업 성공! ({safe_count(collection)}건 → GitHub 저장 완료)")
+                        master_now = _count_master_excel_patents()
+                        st.success(
+                            f"✅ GitHub 백업 성공! (마스터 엑셀 **{master_now}건** → GitHub 저장 완료)"
+                        )
                     else:
                         st.error(
                             "❌ 백업 실패. 아래 '🔍 GitHub 연결 진단' 버튼으로 원인 확인 후 재시도하세요.  \n"
@@ -1591,7 +1963,7 @@ def run_main_portal():
         n_results_user = st.slider(
             "🔢 3단계: 참조할 관련 특허 수",
             min_value=3, max_value=20, value=default_n, step=1,
-            help="AI가 분석에 참조할 최대 특허 건수입니다. Groq API 입력 한도(12,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다."
+            help="AI가 분석에 참조할 최대 특허 건수입니다. Groq API 입력 한도(6,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다."
         )
     else:
         n_results_user = 10  # 통계 모드는 슬라이더 불필요 (전체 데이터 집계)
@@ -1617,19 +1989,48 @@ def run_main_portal():
 
                     stats_df = pd.DataFrame(all_metas)
 
-                    def top_counts(series, n=10):
-                        return series.replace("없음", pd.NA).dropna().value_counts().head(n).to_string()
+                    applicant_df, applicant_stat = _top_counts_table(
+                        stats_df.get("출원인", pd.Series(dtype=str)),
+                        n=15,
+                        label="출원인(대표명)",
+                        normalizer=_canonical_applicant_name,
+                        explode=True,
+                    )
+                    ipc_df, ipc_stat = _top_counts_table(
+                        stats_df.get("IPC", pd.Series(dtype=str)),
+                        n=10,
+                        label="IPC",
+                        explode=True,
+                        allow_comma=True,
+                    )
+                    inventor_df, inventor_stat = _top_counts_table(
+                        stats_df.get("발명자", pd.Series(dtype=str)),
+                        n=10,
+                        label="발명자",
+                        explode=True,
+                        allow_comma=True,
+                    )
+                    year_df, year_stat = _year_counts_table(
+                        stats_df.get("출원일", pd.Series(dtype=str))
+                    )
 
-                    applicant_stat = top_counts(stats_df.get("출원인", pd.Series(dtype=str)))
-                    ipc_stat       = top_counts(stats_df.get("IPC", pd.Series(dtype=str)))
-                    inventor_stat  = top_counts(stats_df.get("발명자", pd.Series(dtype=str)))
-
-                    year_series = stats_df.get("출원일", pd.Series(dtype=str)).str[:4]
-                    year_stat   = year_series.replace("", pd.NA).dropna().value_counts().sort_index().to_string()
+                    st.markdown("### 📊 사전 집계 통계 (경쟁사 대표명·복수값 분리 반영)")
+                    stat_col1, stat_col2 = st.columns(2)
+                    with stat_col1:
+                        st.markdown("**출원인별 (대표명 통합)**")
+                        st.dataframe(applicant_df, use_container_width=True, hide_index=True)
+                        st.markdown("**IPC 분류별**")
+                        st.dataframe(ipc_df, use_container_width=True, hide_index=True)
+                    with stat_col2:
+                        st.markdown("**발명자별**")
+                        st.dataframe(inventor_df, use_container_width=True, hide_index=True)
+                        st.markdown("**출원 연도별**")
+                        st.dataframe(year_df, use_container_width=True, hide_index=True)
 
                     context_text = f"""[전체 DB 통계 요약] 총 {total_count}건
+※ 출원인은 경쟁사 대표명으로 통합·표기 차이 병합됨. 발명자·IPC는 복수값 분리 후 집계.
 
-■ 출원인별 상위 10 현황
+■ 출원인별 상위 현황 (대표명)
 {applicant_stat}
 
 ■ IPC 분류별 상위 10 현황
@@ -1653,8 +2054,12 @@ def run_main_portal():
 
                     system_prompt = (
                         "당신은 특허 데이터 통계 전문 분석가입니다. "
-                        "아래 집계 통계를 기반으로 출원 동향, 핵심 출원인, 기술 분야 분포를 "
-                        "마크다운 표와 함께 체계적인 다차원 통계 리포트로 작성하세요."
+                        "아래 집계 표의 숫자(건수)는 이미 확정된 값이므로 변경·재계산·추정하지 말고 그대로 인용하세요. "
+                        "출원인은 경쟁사 대표명으로 통합된 결과입니다. "
+                        "마크다운 표를 작성할 때 반드시 '항목/출원인/발명자/IPC/연도' 열과 '건수' 열을 구분하고, "
+                        "건수 열에는 숫자만 넣으세요. "
+                        "집계 통계를 기반으로 출원 동향, 핵심 출원인, 기술 분야 분포를 "
+                        "체계적인 다차원 통계 리포트로 작성하세요."
                     )
 
                 # ── 일반 모드: 시맨틱 RAG 검색 ──
@@ -1705,13 +2110,13 @@ def run_main_portal():
                     if truncated:
                         if "🛡" in analysis_mode:
                             trunc_msg = (
-                                "Groq API 입력 한도(12,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
+                                "Groq API 입력 한도(6,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
                                 "침해 분석 모드는 **청구항을 우선** 유지하고 요약을 먼저 줄입니다. "
                                 "더 상세한 분석이 필요하면 '참조할 관련 특허 수'를 줄여 보세요."
                             )
                         else:
                             trunc_msg = (
-                                "Groq API 입력 한도(12,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
+                                "Groq API 입력 한도(6,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
                                 "키워드·심층 분석 모드는 **요약을 우선** 유지하고 청구항을 먼저 생략·축소합니다. "
                                 "더 상세한 분석이 필요하면 '참조할 관련 특허 수'를 줄여 보세요."
                             )
