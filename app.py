@@ -46,11 +46,22 @@ if "github_synced" not in st.session_state:
 # [인프라 무결성 안착] GitHub API 강제 업로드 엔진
 # ==========================================
 def _get_github_secrets():
-    """GITHUB_TOKEN / GITHUB_REPO_URL을 Streamlit Secrets에서 로드."""
+    """
+    GITHUB_TOKEN / GITHUB_REPO_URL을 Streamlit Secrets에서 로드.
+    urllib은 HTTP 헤더를 latin-1로 인코딩하므로, Secrets에서 복사·붙여넣기 시
+    섞여 들어온 비가시적 유니코드 문자(BOM, Zero-Width Space 등)를 ASCII 필터로 제거.
+    """
     try:
-        token = st.secrets["GITHUB_TOKEN"]
+        token    = st.secrets["GITHUB_TOKEN"]
         repo_url = st.secrets["GITHUB_REPO_URL"]
         if not token or token.startswith("ghp_본인의"):
+            return None, None
+
+        # 비가시적 유니코드 문자 제거 (latin-1 인코딩 오류 원천 차단)
+        token    = token.encode("ascii", errors="ignore").decode("ascii").strip()
+        repo_url = repo_url.encode("ascii", errors="ignore").decode("ascii").strip()
+
+        if not token:
             return None, None
         if not repo_url.startswith("https://"):
             repo_url = "https://" + repo_url.lstrip("http://")
@@ -79,6 +90,15 @@ def diagnose_github() -> dict:
     result["secret_ok"]    = True
     result["token_prefix"] = token[:12] + "..."
     result["repo_url"]     = repo_url
+
+    # 토큰 원본에 비가시적 유니코드 문자가 있었는지 체크 (진단 정보용)
+    raw_token = str(st.secrets.get("GITHUB_TOKEN", ""))
+    if raw_token != raw_token.encode("ascii", errors="ignore").decode("ascii").strip():
+        result["error"] = (
+            "⚠️ GITHUB_TOKEN에 비가시적 유니코드 문자(복사·붙여넣기 오염)가 감지되었습니다. "
+            "Streamlit Secrets 편집기에서 토큰 값을 지우고 직접 다시 입력하세요."
+        )
+        return result
 
     # 2단계: GitHub API 서버 도달 여부
     try:
