@@ -652,13 +652,14 @@ def run_main_portal():
             excel_ok, registry_ok = sync_all_from_github()
 
         if excel_ok:
-            st.toast("✅ 마스터 특허 데이터 복원 완료")
+            st.toast("✅ GitHub에서 마스터 특허 데이터 복원 완료")
         if registry_ok:
-            st.toast("✅ 회원 정보 복원 완료")
+            st.toast("✅ GitHub에서 회원 정보 복원 완료")
         if not excel_ok and not registry_ok:
-            st.toast("ℹ️ GitHub 동기화 건너뜀 (신규 배포 또는 시크릿 미설정)")
+            st.toast("ℹ️ GitHub에 저장된 데이터 없음 (최초 배포 또는 시크릿 미설정)")
 
         st.session_state.github_synced = True
+        # 엑셀 복원 여부와 무관하게 재인덱싱은 아래 조건에서 처리
 
     # ChromaDB가 비어 있으면(재시작) 엑셀 기반 자동 재인덱싱
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
@@ -731,11 +732,41 @@ def run_main_portal():
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
             if uploaded_file is not None:
                 if st.button("🚀 신규 특허 무결성 적재"):
+                    import copy, io
+                    # ── 1단계: 열 구조 사전 진단 ──
+                    try:
+                        preview_bytes = uploaded_file.read()
+                        uploaded_file.seek(0)
+                        preview_df = pd.read_excel(io.BytesIO(preview_bytes), nrows=3)
+                        col_map_preview = {str(c).strip().replace(" ", "").upper(): c for c in preview_df.columns}
+
+                        id_detected    = next((v for k, v in col_map_preview.items() if "출원번호" in k or "번호" in k), preview_df.columns[0])
+                        title_detected = next((v for k, v in col_map_preview.items() if "명칭" in k or "제목" in k or "특허명" in k), "미감지")
+                        total_rows     = pd.read_excel(io.BytesIO(preview_bytes)).shape[0]
+                        uploaded_file.seek(0)
+
+                        with st.expander("📋 업로드 파일 열 감지 결과 (클릭 확인)", expanded=True):
+                            st.write(f"- **전체 행 수:** {total_rows}행")
+                            st.write(f"- **감지된 출원번호 열:** `{id_detected}`")
+                            st.write(f"- **감지된 명칭 열:** `{title_detected}`")
+                            st.write(f"- **전체 열 목록:** {list(preview_df.columns)}")
+                    except Exception as diag_e:
+                        st.warning(f"파일 사전 진단 실패: {diag_e}")
+
+                    # ── 2단계: 실제 적재 ──
                     with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                         added, dup = process_and_update_db(uploaded_file, collection)
-                    with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중..."):
-                        commit_and_push_data()
-                    st.success(f"처리 완료! (신규: {added}건 / 중복 제외: {dup}건) — GitHub 백업 완료")
+
+                    st.info(f"📊 처리 결과: 신규 **{added}건** 추가 / 중복 제외 **{dup}건** / DB 총 **{collection.count()}건**")
+
+                    if added > 0:
+                        with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중..."):
+                            commit_and_push_data()
+                        st.success(f"✅ 완료! 신규 {added}건 인덱싱 및 GitHub 백업 완료")
+                    elif dup > 0:
+                        st.warning(f"⚠️ 업로드한 파일의 특허 {dup}건이 이미 DB에 존재합니다. 새로운 데이터가 없습니다.")
+                    else:
+                        st.error("❌ 처리된 데이터가 없습니다. 위 열 감지 결과에서 '출원번호' 열이 올바르게 감지됐는지 확인하세요.")
                     st.rerun()
 
             st.divider()
