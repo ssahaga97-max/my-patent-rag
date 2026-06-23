@@ -594,6 +594,7 @@ def reindex_from_master_excel(collection) -> int:
     재시작 후 ChromaDB 재구성 전용 함수.
     process_and_update_db는 uploaded_file을 MASTER_EXCEL_PATH와 비교해
     전부 중복으로 처리하는 문제가 있어, 재인덱싱은 이 함수를 사용한다.
+    메타데이터 키는 process_and_update_db와 동일한 한국어 구조를 사용한다.
     """
     if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
         return 0
@@ -617,19 +618,24 @@ def reindex_from_master_excel(collection) -> int:
             pat_id = str(row[id_col]).replace("-", "").strip()
             if not pat_id or pat_id == "nan":
                 continue
-            parts = []
-            if title_col:    parts.append(str(row.get(title_col, "")))
-            if abstract_col: parts.append(str(row.get(abstract_col, "")))
-            if claims_col:   parts.append(str(row.get(claims_col, "")))
-            doc = " ".join(p for p in parts if p and p != "nan") or pat_id
 
-            meta = {"patent_id": pat_id}
-            for key, col in [("title", title_col), ("application_date", app_date_col),
-                              ("registration_date", reg_date_col), ("ipc", ipc_col),
-                              ("cpc", cpc_col), ("inventor", inventor_col), ("applicant", applicant_col)]:
-                if col:
-                    meta[key] = str(row.get(col, ""))
+            title    = str(row[title_col]).strip()    if title_col    and pd.notna(row[title_col])    else "정보없음"
+            abstract = str(row[abstract_col]).strip() if abstract_col and pd.notna(row[abstract_col]) else "정보없음"
+            claims   = str(row[claims_col]).strip()   if claims_col   and pd.notna(row[claims_col])   else "정보없음"
+            doc = f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
 
+            # process_and_update_db와 동일한 한국어 메타데이터 키 구조
+            meta = {
+                "출원번호": str(row[id_col]),
+                "명칭":     title,
+                "출원일":   str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
+                "등록일":   str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
+                "IPC":      str(row[ipc_col])      if ipc_col      and pd.notna(row[ipc_col])      else "없음",
+                "CPC":      str(row[cpc_col])      if cpc_col      and pd.notna(row[cpc_col])      else "없음",
+                "발명자":   str(row[inventor_col]) if inventor_col  and pd.notna(row[inventor_col]) else "없음",
+                "출원인":   str(row[applicant_col])if applicant_col and pd.notna(row[applicant_col])else "없음",
+                "URL":      ""
+            }
             ids.append(pat_id)
             docs.append(doc)
             metas.append(meta)
@@ -700,35 +706,42 @@ def process_and_update_db(uploaded_file, collection):
         added_df = pd.DataFrame(new_records)
         updated_master_df = added_df if master_df.empty else pd.concat([master_df, added_df], ignore_index=True)
         updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
-        
-        for idx, row in added_df.iterrows():
-            title = str(row[title_col]).strip() if title_col and pd.notna(row[title_col]) else "정보없음"
+
+        # 배치 처리로 ChromaDB 적재 (1건씩 루프 대비 대용량 처리 안정성 향상)
+        batch_ids, batch_docs, batch_metas = [], [], []
+        for _, row in added_df.iterrows():
+            title    = str(row[title_col]).strip()    if title_col    and pd.notna(row[title_col])    else "정보없음"
             abstract = str(row[abstract_col]).strip() if abstract_col and pd.notna(row[abstract_col]) else "정보없음"
-            claims = str(row[claims_col]).strip() if claims_col and pd.notna(row[claims_col]) else "정보없음"
-            
+            claims   = str(row[claims_col]).strip()   if claims_col   and pd.notna(row[claims_col])   else "정보없음"
+
             search_context = f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
             doc_id = str(row[id_col]).replace("-", "").strip()
-            
+
             patent_url = hyperlink_map.get(doc_id, "")
             if patent_url == "" and title_col:
                 clean_title = str(row[title_col]).strip().replace("-", "")
                 patent_url = hyperlink_map.get(clean_title, "")
 
-            # 경쟁사 특허 RAG 목적에 부합하는 시맨틱 인덱싱 벡터화 실행
-            collection.add(
-                documents=[search_context],
-                metadatas=[{
-                    "출원번호": str(row[id_col]),
-                    "명칭": title,
-                    "출원일": str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
-                    "등록일": str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
-                    "IPC": str(row[ipc_col]) if ipc_col and pd.notna(row[ipc_col]) else "없음",
-                    "CPC": str(row[cpc_col]) if cpc_col and pd.notna(row[cpc_col]) else "없음",
-                    "발명자": str(row[inventor_col]) if inventor_col and pd.notna(row[inventor_col]) else "없음",
-                    "출원인": str(row[applicant_col]) if applicant_col and pd.notna(row[applicant_col]) else "없음",
-                    "URL": patent_url
-                }],
-                ids=[doc_id]
+            batch_ids.append(doc_id)
+            batch_docs.append(search_context)
+            batch_metas.append({
+                "출원번호": str(row[id_col]),
+                "명칭":     title,
+                "출원일":   str(row[app_date_col]) if app_date_col and pd.notna(row[app_date_col]) else "없음",
+                "등록일":   str(row[reg_date_col]) if reg_date_col and pd.notna(row[reg_date_col]) else "없음",
+                "IPC":      str(row[ipc_col])      if ipc_col      and pd.notna(row[ipc_col])      else "없음",
+                "CPC":      str(row[cpc_col])      if cpc_col      and pd.notna(row[cpc_col])      else "없음",
+                "발명자":   str(row[inventor_col]) if inventor_col  and pd.notna(row[inventor_col]) else "없음",
+                "출원인":   str(row[applicant_col])if applicant_col and pd.notna(row[applicant_col])else "없음",
+                "URL":      patent_url
+            })
+
+        BATCH = 100
+        for i in range(0, len(batch_ids), BATCH):
+            collection.upsert(
+                ids=batch_ids[i:i+BATCH],
+                documents=batch_docs[i:i+BATCH],
+                metadatas=batch_metas[i:i+BATCH]
             )
         return len(new_records), duplicate_count
     else:
