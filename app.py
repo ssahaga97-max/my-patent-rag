@@ -589,6 +589,64 @@ def extract_excel_hyperlinks(uploaded_file):
     return link_dict
 
 
+def reindex_from_master_excel(collection) -> int:
+    """
+    재시작 후 ChromaDB 재구성 전용 함수.
+    process_and_update_db는 uploaded_file을 MASTER_EXCEL_PATH와 비교해
+    전부 중복으로 처리하는 문제가 있어, 재인덱싱은 이 함수를 사용한다.
+    """
+    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
+        return 0
+    try:
+        df = pd.read_excel(MASTER_EXCEL_PATH)
+        col_map = {str(c).strip().replace(" ", "").upper(): c for c in df.columns}
+
+        id_col       = next((v for k, v in col_map.items() if "출원번호" in k or "번호" in k), df.columns[0])
+        title_col    = next((v for k, v in col_map.items() if "명칭" in k or "제목" in k or "특허명" in k), None)
+        abstract_col = next((v for k, v in col_map.items() if "요약" in k or "초록" in k), None)
+        claims_col   = next((v for k, v in col_map.items() if "청구" in k or "범위" in k or "청구항" in k), None)
+        app_date_col = next((v for k, v in col_map.items() if "출원일" in k), None)
+        reg_date_col = next((v for k, v in col_map.items() if "등록일" in k), None)
+        ipc_col      = next((v for k, v in col_map.items() if "IPC" in k), None)
+        cpc_col      = next((v for k, v in col_map.items() if "CPC" in k), None)
+        inventor_col = next((v for k, v in col_map.items() if "발명자" in k or "발명인" in k), None)
+        applicant_col= next((v for k, v in col_map.items() if "출원인" in k or "권리자" in k), None)
+
+        ids, docs, metas = [], [], []
+        for _, row in df.iterrows():
+            pat_id = str(row[id_col]).replace("-", "").strip()
+            if not pat_id or pat_id == "nan":
+                continue
+            parts = []
+            if title_col:    parts.append(str(row.get(title_col, "")))
+            if abstract_col: parts.append(str(row.get(abstract_col, "")))
+            if claims_col:   parts.append(str(row.get(claims_col, "")))
+            doc = " ".join(p for p in parts if p and p != "nan") or pat_id
+
+            meta = {"patent_id": pat_id}
+            for key, col in [("title", title_col), ("application_date", app_date_col),
+                              ("registration_date", reg_date_col), ("ipc", ipc_col),
+                              ("cpc", cpc_col), ("inventor", inventor_col), ("applicant", applicant_col)]:
+                if col:
+                    meta[key] = str(row.get(col, ""))
+
+            ids.append(pat_id)
+            docs.append(doc)
+            metas.append(meta)
+
+        BATCH = 100
+        for i in range(0, len(ids), BATCH):
+            collection.upsert(
+                ids=ids[i:i+BATCH],
+                documents=docs[i:i+BATCH],
+                metadatas=metas[i:i+BATCH]
+            )
+        return len(ids)
+    except Exception as e:
+        print(f"재인덱싱 실패: {e}")
+        return 0
+
+
 def process_and_update_db(uploaded_file, collection):
     import copy
     file_for_links = copy.deepcopy(uploaded_file)
@@ -702,8 +760,8 @@ def run_main_portal():
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
         try:
             with st.spinner("📦 벡터 DB 자동 재인덱싱 중... (특허 수에 따라 1~3분 소요)"):
-                process_and_update_db(MASTER_EXCEL_PATH, collection)
-            st.toast(f"✅ 벡터 DB 복원 완료 ({collection.count()}건)")
+                restored = reindex_from_master_excel(collection)
+            st.toast(f"✅ 벡터 DB 복원 완료 ({restored}건)")
         except Exception as e:
             st.warning(f"자동 재인덱싱 오류: {e}")
 
