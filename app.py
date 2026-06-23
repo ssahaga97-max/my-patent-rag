@@ -41,6 +41,8 @@ if "github_synced" not in st.session_state:
     st.session_state.github_synced = False
 if "upload_feedback" not in st.session_state:
     st.session_state.upload_feedback = None
+if "sync_feedback" not in st.session_state:
+    st.session_state.sync_feedback = None
 if "auto_reindex_attempted" not in st.session_state:
     st.session_state.auto_reindex_attempted = False
 if "_last_chroma_count" not in st.session_state:
@@ -1338,6 +1340,66 @@ def _get_chroma_ids(collection) -> set:
         return set()
 
 
+def _count_chroma_unique_ids(collection) -> int:
+    """ChromaDB 고유 document id 수 (중복 ID 문서 제외한 실질 특허 수)."""
+    return len(_get_chroma_ids(collection))
+
+
+def _render_feedback_box(feedback: dict | None) -> None:
+    """session_state 피드백 메시지 렌더."""
+    if not feedback:
+        return
+    level = feedback.get("level", "info")
+    message = feedback.get("message", "")
+    if level == "success":
+        st.success(message)
+    elif level == "warning":
+        st.warning(message)
+    elif level == "error":
+        st.error(message)
+    else:
+        st.info(message)
+
+
+def _build_db_count_status(chroma_n: int, master_n: int | None, unique_chroma_n: int) -> str:
+    """Chroma·마스터 건수 비교 상태 문구."""
+    count_md = f"📊 **누적 적재 데이터 (ChromaDB):** `{chroma_n}` 건"
+    if master_n is None:
+        return count_md
+
+    count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
+    if unique_chroma_n and unique_chroma_n != chroma_n:
+        count_md += f"  \n🔑 **ChromaDB 고유 ID:** `{unique_chroma_n}` 건"
+
+    if master_n == chroma_n:
+        return count_md
+
+    if chroma_n > master_n:
+        dup_docs = chroma_n - unique_chroma_n
+        if master_n >= unique_chroma_n:
+            count_md += (
+                f"  \n✅ 마스터 엑셀이 Chroma **고유 특허 전체({master_n}건)** 와 동기화되었습니다."
+            )
+            if dup_docs > 0:
+                count_md += (
+                    f"  \nℹ️ ChromaDB 문서 수에는 동일 특허 **중복 ID {dup_docs}건**이 "
+                    f"포함되어 있습니다 (분석·검색에는 영향 없음)."
+                )
+        else:
+            gap = unique_chroma_n - master_n
+            count_md += (
+                f"  \n⚠️ 마스터가 Chroma 고유 특허보다 **{gap}건** 부족합니다. "
+                f"**ChromaDB → 마스터 엑셀 역동기화** 후 GitHub 백업하세요."
+            )
+    else:
+        gap = master_n - chroma_n
+        count_md += (
+            f"  \n⚠️ 마스터가 ChromaDB보다 **{gap}건** 많습니다. "
+            f"**ChromaDB 누락분 복구** 버튼을 실행하세요."
+        )
+    return count_md
+
+
 def _upsert_patent_batches(collection, ids: list, docs: list, metas: list, batch_size: int = 100) -> None:
     """배치 upsert. 실패 시 예외 전파."""
     for i in range(0, len(ids), batch_size):
@@ -1897,54 +1959,45 @@ def run_main_portal():
                         }
 
             if st.session_state.upload_feedback:
-                fb = st.session_state.upload_feedback
-                if fb["level"] == "success":
-                    st.success(fb["message"])
-                elif fb["level"] == "warning":
-                    st.warning(fb["message"])
-                elif fb["level"] == "error":
-                    st.error(fb["message"])
-                else:
-                    st.info(fb["message"])
+                _render_feedback_box(st.session_state.upload_feedback)
 
             st.divider()
-            chroma_n = safe_count(collection)
-            master_n = _count_master_excel_patents()
-            count_md = f"📊 **누적 적재 데이터 (ChromaDB):** `{chroma_n}` 건"
-            if master_n is not None:
-                count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
-                if master_n != chroma_n:
-                    if chroma_n > master_n:
-                        gap = chroma_n - master_n
-                        count_md += (
-                            f"  \n⚠️ ChromaDB가 마스터보다 **{gap}건** 많습니다. "
-                            f"재시작 시 Chroma 데이터가 소실될 수 있으니 "
-                            f"**ChromaDB → 마스터 엑셀 역동기화** 후 GitHub 백업하세요."
-                        )
-                    else:
-                        gap = master_n - chroma_n
-                        count_md += (
-                            f"  \n⚠️ 마스터가 ChromaDB보다 **{gap}건** 많습니다. "
-                            f"**ChromaDB 누락분 복구** 버튼을 실행하세요."
-                        )
-            st.markdown(count_md)
+            chroma_n       = safe_count(collection)
+            master_n       = _count_master_excel_patents()
+            unique_chroma_n = _count_chroma_unique_ids(collection)
+            st.markdown(_build_db_count_status(chroma_n, master_n, unique_chroma_n))
 
-            if master_n is not None and chroma_n > master_n:
+            if st.session_state.sync_feedback:
+                _render_feedback_box(st.session_state.sync_feedback)
+
+            needs_reverse_sync = (
+                master_n is not None
+                and unique_chroma_n > 0
+                and master_n < unique_chroma_n
+            )
+            if needs_reverse_sync:
                 if st.button("📥 ChromaDB → 마스터 엑셀 역동기화", use_container_width=True):
-                    gap = chroma_n - master_n
                     with st.spinner(
                         f"ChromaDB {chroma_n}건을 마스터 엑셀로 보내는 중 "
                         f"(재임베딩 없음, 약 1~3분)..."
                     ):
                         exported, before_n, after_n = sync_master_from_chroma(collection)
                     if exported > 0:
-                        st.success(
-                            f"✅ 역동기화 완료: Chroma **{exported}건** 반영 → "
-                            f"마스터 **{before_n} → {after_n}건** (ChromaDB는 그대로 유지)"
-                        )
-                        st.toast("💾 GitHub 마스터 백업을 실행해 영속화하세요.")
+                        st.session_state.sync_feedback = {
+                            "level": "success",
+                            "message": (
+                                f"✅ 역동기화 완료: Chroma **{exported}건** 반영 → "
+                                f"마스터 **{before_n} → {after_n}건** (ChromaDB는 그대로 유지)  \n"
+                                f"💾 **GitHub 마스터 백업**을 실행해 영속화하세요."
+                            ),
+                        }
+                        st.rerun()
                     else:
-                        st.error("역동기화 실패 — ChromaDB 데이터를 읽지 못했습니다.")
+                        st.session_state.sync_feedback = {
+                            "level": "error",
+                            "message": "❌ 역동기화 실패 — ChromaDB 데이터를 읽지 못했습니다.",
+                        }
+                        st.rerun()
 
             if master_n is not None and master_n > chroma_n:
                 if st.button("🔧 ChromaDB 누락분 복구 (마스터 엑셀 기준)", use_container_width=True):
@@ -1953,10 +2006,19 @@ def run_main_portal():
                         synced = sync_chroma_missing_from_master(collection)
                     st.session_state._last_chroma_count = safe_count(collection)
                     if synced > 0:
-                        st.success(f"✅ ChromaDB 누락분 {synced}건 복구 완료 (현재 {safe_count(collection)}건)")
-                        st.toast("GitHub 백업을 실행하는 것을 권장합니다.")
+                        st.session_state.sync_feedback = {
+                            "level": "success",
+                            "message": (
+                                f"✅ ChromaDB 누락분 **{synced}건** 복구 완료 "
+                                f"(현재 {safe_count(collection)}건). GitHub 백업을 권장합니다."
+                            ),
+                        }
                     else:
-                        st.info("복구할 누락분이 없거나 이미 동기화되어 있습니다.")
+                        st.session_state.sync_feedback = {
+                            "level": "info",
+                            "message": "복구할 누락분이 없거나 이미 동기화되어 있습니다.",
+                        }
+                    st.rerun()
 
             if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
                 file_kb = os.path.getsize(MASTER_EXCEL_PATH) // 1024
@@ -1968,14 +2030,21 @@ def run_main_portal():
                         )
                     if ok:
                         master_now = _count_master_excel_patents()
-                        st.success(
-                            f"✅ GitHub 백업 성공! (마스터 엑셀 **{master_now}건** → GitHub 저장 완료)"
-                        )
+                        st.session_state.sync_feedback = {
+                            "level": "success",
+                            "message": (
+                                f"✅ GitHub 백업 성공! (마스터 엑셀 **{master_now}건** → GitHub 저장 완료)"
+                            ),
+                        }
                     else:
-                        st.error(
-                            "❌ 백업 실패. 아래 '🔍 GitHub 연결 진단' 버튼으로 원인 확인 후 재시도하세요.  \n"
-                            "토큰 권한이 `repo` (쓰기) 권한인지, 만료되지 않았는지 확인하세요."
-                        )
+                        st.session_state.sync_feedback = {
+                            "level": "error",
+                            "message": (
+                                "❌ 백업 실패. **🔍 GitHub 연결 진단**으로 원인 확인 후 재시도하세요.  \n"
+                                "토큰 `repo` 쓰기 권한·만료 여부를 확인하세요."
+                            ),
+                        }
+                    st.rerun()
             else:
                 st.caption("로컬 마스터 파일 없음 (업로드 후 활성화)")
 
@@ -2002,6 +2071,9 @@ def run_main_portal():
                                 st.warning("GitHub 삭제 실패 — GitHub 연결 진단 후 재시도하세요.")
 
                         reset_collection()
+
+                        st.session_state.sync_feedback = None
+                        st.session_state.upload_feedback = None
 
                         # github_synced = True: 포맷 직후 리런에서 GitHub 재다운로드 방지
                         # (이전에 False로 설정 시 GitHub의 기존 데이터가 즉시 복원되는 문제 해결)
