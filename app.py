@@ -233,7 +233,13 @@ def save_user_registry(registry: dict):
         json.dump(registry, f, ensure_ascii=False, indent=2)
 
 
-def download_user_registry_from_github() -> bool:
+def download_user_registry_from_github():
+    """
+    반환값:
+      True  = 다운로드 성공
+      None  = GitHub에 파일 없음 (404) — 정상 상태 (포맷 후 / 최초 배포)
+      False = 실제 오류 (토큰 없음, 인증 실패, 네트워크 오류 등)
+    """
     token, repo_url = _get_github_secrets()
     if not token:
         return False
@@ -260,8 +266,7 @@ def download_user_registry_from_github() -> bool:
         return True
     except HTTPError as e:
         if e.code == 404:
-            # 파일이 아직 GitHub에 없음 (최초 배포) — 정상 상태, 오류 아님
-            return False
+            return None  # 파일 없음 = 정상 상태 (오류 아님)
         print(f"사용자 레지스트리 복원 실패: HTTP {e.code} {e.reason}")
         return False
     except Exception as e:
@@ -276,8 +281,8 @@ def upload_user_registry_to_github() -> bool:
 def sync_all_from_github():
     """
     세션 최초 진입 시(프로세스 재시작 감지) GitHub에서 모든 영구 데이터를 무조건 동기화.
-    조건부 다운로드(파일 없을 때만) 방식의 누락을 원천 차단.
-    반환값: (excel_ok, registry_ok)
+    반환값: (excel_result, registry_result)
+      각 값: True=다운로드 성공, None=GitHub에 파일 없음(정상), False=실제 오류
     """
     excel_ok    = download_master_excel_from_github()
     registry_ok = download_user_registry_from_github()
@@ -369,7 +374,10 @@ def download_logo_from_github():
 def download_master_excel_from_github():
     """
     컨테이너 재시작으로 로컬 파일이 소실된 경우 GitHub에서 마스터 엑셀을 내려받아 복원.
-    성공 여부를 bool로 반환.
+    반환값:
+      True  = 다운로드 성공
+      None  = GitHub에 파일 없음 (404) — 정상 상태 (포맷 후 / 최초 배포)
+      False = 실제 오류 (토큰 없음, 인증 실패, 네트워크 오류 등)
     """
     token, repo_url = _get_github_secrets()
     if not token:
@@ -404,8 +412,7 @@ def download_master_excel_from_github():
         return True
     except HTTPError as e:
         if e.code == 404:
-            # 파일이 아직 GitHub에 없음 (최초 배포) — 정상 상태, 오류 아님
-            return False
+            return None  # 파일 없음 = 정상 상태 (오류 아님)
         print(f"GitHub 마스터 엑셀 복원 실패: HTTP {e.code} {e.reason}")
         return False
     except Exception as e:
@@ -785,12 +792,15 @@ def run_main_portal():
         with st.spinner("🔄 GitHub 데이터 웨어하우스 동기화 중..."):
             excel_ok, registry_ok = sync_all_from_github()
 
-        if excel_ok:
+        if excel_ok is True:
             st.toast("✅ GitHub에서 마스터 특허 데이터 복원 완료")
-        if registry_ok:
+        if registry_ok is True:
             st.toast("✅ GitHub에서 회원 정보 복원 완료")
-        if not excel_ok and not registry_ok:
-            st.toast("ℹ️ GitHub에 저장된 데이터 없음 (최초 배포 또는 시크릿 미설정)")
+        if excel_ok is False or registry_ok is False:
+            # 실제 오류 (토큰/네트워크 문제) — None(파일 없음)은 오류 아님
+            st.toast("⚠️ GitHub 동기화 중 오류 발생 — 사이드바 'GitHub 연결 진단' 확인 권장")
+        elif excel_ok is None and registry_ok is None:
+            st.toast("ℹ️ GitHub에 저장된 데이터 없음 (포맷 후 초기 상태 또는 최초 배포)")
 
         st.session_state.github_synced = True
         # 엑셀 복원 여부와 무관하게 재인덱싱은 아래 조건에서 처리
@@ -831,12 +841,18 @@ def run_main_portal():
             if st.button("🔄 GitHub 데이터 강제 재동기화", use_container_width=True):
                 with st.spinner("GitHub → 로컬 전체 동기화 중..."):
                     excel_ok, reg_ok = sync_all_from_github()
-                if excel_ok or reg_ok:
+                if excel_ok is True or reg_ok is True:
+                    # 하나 이상 성공적으로 다운로드됨
                     st.session_state.github_synced = False
-                    st.toast("✅ 동기화 완료 — 앱을 새로고침하면 최신 데이터가 반영됩니다.")
+                    st.toast("✅ 동기화 완료 — 최신 데이터가 복원됩니다.")
                     st.rerun()
+                elif excel_ok is False or reg_ok is False:
+                    # 실제 연결/인증 오류
+                    st.warning("⚠️ GitHub 동기화 실패 — 아래 '🔍 GitHub 연결 진단' 버튼으로 원인을 확인하세요.")
                 else:
-                    st.warning("⚠️ GitHub 동기화 실패 — 아래 진단 버튼으로 원인을 확인하세요.")
+                    # 둘 다 None → GitHub 연결은 정상이나 파일이 없는 상태 (포맷 후 등)
+                    st.info("ℹ️ GitHub에 저장된 데이터가 없습니다. "
+                            "Excel 파일을 업로드하면 자동으로 GitHub에 백업됩니다.")
 
             # GitHub 연결 진단 버튼
             if st.button("🔍 GitHub 연결 진단", use_container_width=True):
