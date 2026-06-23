@@ -546,6 +546,9 @@ def _build_infra():
 
     # Groq Cloud API 기반 Llama 3.3 엔진 (키는 반드시 Streamlit Secrets에서 로드)
     groq_api_key = st.secrets.get("GROQ_API_KEY", "")
+    # GitHub 토큰과 동일하게: 복사·붙여넣기 시 섞여 들어온
+    # 비가시적 유니코드 문자(BOM, Zero-Width Space 등)를 ASCII 필터로 제거
+    groq_api_key = groq_api_key.encode("ascii", errors="ignore").decode("ascii").strip()
     if not groq_api_key:
         raise ValueError("Streamlit Secrets에 GROQ_API_KEY가 설정되어 있지 않습니다.")
     llm = ChatGroq(
