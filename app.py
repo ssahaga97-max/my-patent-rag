@@ -246,6 +246,12 @@ def download_user_registry_from_github() -> bool:
         with open(USER_REGISTRY_PATH, "wb") as f:
             f.write(raw)
         return True
+    except HTTPError as e:
+        if e.code == 404:
+            # 파일이 아직 GitHub에 없음 (최초 배포) — 정상 상태, 오류 아님
+            return False
+        print(f"사용자 레지스트리 복원 실패: HTTP {e.code} {e.reason}")
+        return False
     except Exception as e:
         print(f"사용자 레지스트리 복원 실패: {e}")
         return False
@@ -338,6 +344,11 @@ def download_logo_from_github():
         with open(logo_path, "wb") as f:
             f.write(raw)
         return True
+    except HTTPError as e:
+        if e.code == 404:
+            return False  # 로고 미업로드 상태 — 정상
+        print(f"로고 복원 실패: HTTP {e.code} {e.reason}")
+        return False
     except Exception as e:
         print(f"로고 복원 실패: {e}")
         return False
@@ -379,6 +390,12 @@ def download_master_excel_from_github():
         with open(MASTER_EXCEL_PATH, "wb") as f:
             f.write(raw_content)
         return True
+    except HTTPError as e:
+        if e.code == 404:
+            # 파일이 아직 GitHub에 없음 (최초 배포) — 정상 상태, 오류 아님
+            return False
+        print(f"GitHub 마스터 엑셀 복원 실패: HTTP {e.code} {e.reason}")
+        return False
     except Exception as e:
         print(f"GitHub 마스터 엑셀 복원 실패: {e}")
         return False
