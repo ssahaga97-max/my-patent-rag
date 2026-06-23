@@ -927,15 +927,56 @@ def run_main_portal():
             else:
                 st.caption("로컬 마스터 파일 없음 (업로드 후 활성화)")
 
+            also_clear_github = st.checkbox(
+                "GitHub 백업도 함께 초기화 (master_patents.xlsx 삭제)",
+                value=False,
+                help="체크 시 GitHub에 저장된 master_patents.xlsx도 삭제합니다. "
+                     "원본 Excel을 다시 업로드하여 완전히 새로 시작할 때 사용하세요."
+            )
             if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
                 with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
                     try:
-                        # 마스터 엑셀 삭제
+                        # 1. 로컬 마스터 엑셀 삭제
                         if os.path.exists(MASTER_EXCEL_PATH):
                             os.remove(MASTER_EXCEL_PATH)
-                        # EphemeralClient는 _build_infra.clear() 없이
-                        # 컬렉션을 직접 초기화 — 캐시 파괴 시 스탈 참조로 인한
-                        # 'no such table' 오류를 방지한다.
+
+                        # 2. (옵션) GitHub 백업도 삭제
+                        github_cleared = False
+                        if also_clear_github:
+                            token, repo_url = _get_github_secrets()
+                            if token:
+                                try:
+                                    raw_url   = repo_url.replace(".git", "")
+                                    repo_path = raw_url.split("github.com/")[-1]
+                                    api_url   = f"https://api.github.com/repos/{repo_path}/contents/my_patent_folder/master_patents.xlsx"
+                                    req_get   = Request(api_url, headers={
+                                        "Authorization": f"Bearer {token}",
+                                        "Accept": "application/vnd.github.v3+json"
+                                    })
+                                    with urlopen(req_get, timeout=15) as r:
+                                        sha = json.loads(r.read().decode()).get("sha", "")
+                                    if sha:
+                                        del_payload = json.dumps({
+                                            "message": "[Format] Delete master_patents.xlsx",
+                                            "sha": sha,
+                                            "branch": "main"
+                                        }).encode("utf-8")
+                                        req_del = Request(api_url, data=del_payload, headers={
+                                            "Authorization": f"Bearer {token}",
+                                            "Content-Type": "application/json",
+                                            "Accept": "application/vnd.github.v3+json"
+                                        }, method="DELETE")
+                                        with urlopen(req_del, timeout=30):
+                                            github_cleared = True
+                                except HTTPError as e:
+                                    if e.code == 404:
+                                        github_cleared = True  # 이미 없음
+                                    else:
+                                        st.warning(f"GitHub 삭제 실패: HTTP {e.code} {e.reason}")
+                                except Exception as e:
+                                    st.warning(f"GitHub 삭제 중 오류: {e}")
+
+                        # 3. ChromaDB 컬렉션 재생성
                         try:
                             chroma_client.delete_collection("competitor_patents")
                         except Exception:
@@ -943,16 +984,26 @@ def run_main_portal():
                         sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
                             model_name="jhgan/ko-sroberta-multitask"
                         )
-                        new_col = chroma_client.get_or_create_collection(
+                        chroma_client.get_or_create_collection(
                             name="competitor_patents",
                             embedding_function=sentence_transformer_ef
                         )
-                        # 캐시된 인프라의 collection을 교체할 수 없으므로
-                        # 캐시를 초기화하고 새 세션에서 다시 빌드하도록 유도
+
+                        # 4. 캐시 초기화
                         _build_infra.clear()
                         st.session_state.pop("infra_initialized", None)
-                        st.session_state.github_synced = False
-                        st.toast("✅ 데이터 웨어하우스 전체 초기화 완료. 새 엑셀을 업로드해 주세요.")
+
+                        # github_synced = True: 포맷 직후 리런에서 GitHub 재다운로드 방지
+                        # (이전에 False로 설정 시 GitHub의 기존 데이터가 즉시 복원되는 문제 해결)
+                        # 컨테이너 재시작 시에는 session_state가 초기화되므로 정상적으로 GitHub 동기화됨
+                        st.session_state.github_synced = True
+
+                        if also_clear_github and github_cleared:
+                            st.toast("✅ 로컬 + GitHub 데이터 완전 초기화 완료. 원본 Excel을 새로 업로드해 주세요.")
+                        elif also_clear_github and not github_cleared:
+                            st.toast("⚠️ 로컬 초기화 완료. GitHub 삭제 실패 — GitHub 연결 진단 후 재시도하세요.")
+                        else:
+                            st.toast("✅ 로컬 초기화 완료. 원본 Excel을 업로드하면 GitHub 이전 데이터와 무관하게 새로 적재됩니다.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"초기화 중 오류 발생: {e}")
