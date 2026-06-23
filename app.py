@@ -549,6 +549,13 @@ def check_authentication():
 # ==========================================
 # 2. [프로세스 레벨 싱글톤] @st.cache_resource 기반 인프라 팩토리
 # ==========================================
+
+# 모듈 레벨 ChromaDB 클라이언트 싱글톤.
+# _build_infra.clear() 호출 후에도 이 참조는 살아 있어 동일 인스턴스를 재사용.
+# → ChromaDB 내부 _identifiers_to_system 레지스트리 충돌(ValueError) 원천 차단.
+_CHROMA_CLIENT: chromadb.EphemeralClient | None = None
+
+
 @st.cache_resource
 def _build_infra():
     """
@@ -559,8 +566,16 @@ def _build_infra():
     접근할 때 'no such table: tenants/collections/embeddings' 레이스 컨디션이 발생한다.
     ChromaDB 데이터 영속성은 GitHub 백업/복원으로 이미 보장되므로,
     SQLite 파일 불필요 → EphemeralClient(순수 인메모리)로 교체하여 모든 SQLite 오류 원천 제거.
+
+    [_CHROMA_CLIENT 전역 싱글톤 이유]
+    _build_infra.clear() 후 재실행 시 chromadb.EphemeralClient()를 재생성하면
+    내부 _identifiers_to_system 레지스트리에 이전 인스턴스가 남아 ValueError 충돌 발생.
+    → 모듈 레벨 변수에 클라이언트를 보관해 재생성 없이 재사용.
     """
-    chroma_client = chromadb.EphemeralClient()
+    global _CHROMA_CLIENT
+    if _CHROMA_CLIENT is None:
+        _CHROMA_CLIENT = chromadb.EphemeralClient()
+    chroma_client = _CHROMA_CLIENT
 
     # 다국어 임베딩 함수 및 컬렉션
     # paraphrase-multilingual-mpnet-base-v2: 50개 언어 지원, 한국어↔영어 교차 언어 검색 가능
