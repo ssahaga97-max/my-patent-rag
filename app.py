@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import io
+import re
 import chromadb
 from chromadb.api.client import SharedSystemClient
 from chromadb.utils import embedding_functions
@@ -44,6 +45,8 @@ if "auto_reindex_attempted" not in st.session_state:
     st.session_state.auto_reindex_attempted = False
 if "_last_chroma_count" not in st.session_state:
     st.session_state._last_chroma_count = 0
+if "chroma_gap_sync_done" not in st.session_state:
+    st.session_state.chroma_gap_sync_done = False
 
 
 # ==========================================
@@ -60,25 +63,43 @@ def _hash_pw(password: str) -> str:
 
 def _normalize_patent_id(value) -> str:
     """
-    출원번호를 ChromaDB id용 문자열로 통일.
-    Excel float/지수표기(1.02E+12)·하이픈·'.0' 접미사를 정규화해 중복 id 방지.
+    출원번호 정규화(canonical ID) — 특허DB·Excel마다 다른 표기를 하나의 키로 통일.
+
+    처리 순서:
+      1) Excel float / 지수표기(1.02E+12) → 정수 문자열
+      2) 구분자(하이픈·공백·슬래시·점) 제거
+      3) KR/kr 접두사 제거
+      4) 영숫자만 유지(대문자) — PCT/US 등 국제출원번호 대응
+
+    동일 특허의 서로 다른 표기(10-2020-0012345 / 1020200012345)는 같은 ID가 됨.
+    정규화 후에도 다른 ID면 별도 건으로 유지(누락 방지 우선).
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
-    if isinstance(value, float):
-        if value == int(value):
-            return str(int(value))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if float(value) == int(float(value)):
+                return str(int(float(value)))
+        except (ValueError, OverflowError):
+            pass
+
     s = str(value).strip()
-    if not s or s.lower() == "nan":
+    if not s or s.lower() in ("nan", "none", ""):
         return ""
+
+    if re.fullmatch(r"-?\d+\.?\d*[eE][+\-]?\d+", s):
+        try:
+            return str(int(float(s)))
+        except (ValueError, OverflowError):
+            pass
+
     if s.endswith(".0") and s[:-2].replace(".", "", 1).isdigit():
         s = s[:-2]
-    try:
-        if "e" in s.lower():
-            return str(int(float(s)))
-    except (ValueError, OverflowError):
-        pass
-    return s.replace("-", "").strip()
+
+    s = re.sub(r"[\s\-_./\\]+", "", s)
+    s = re.sub(r"^(KR|kr)", "", s)
+    s = re.sub(r"[^A-Za-z0-9]", "", s).upper()
+    return s
 
 
 # ==========================================
@@ -984,6 +1005,115 @@ def extract_excel_hyperlinks(uploaded_file):
     return link_dict
 
 
+def _get_chroma_ids(collection) -> set:
+    """ChromaDB에 이미 적재된 id 집합."""
+    try:
+        if collection.count() == 0:
+            return set()
+        return set(collection.get(include=[])["ids"])
+    except Exception as e:
+        print(f"[ChromaDB id 조회 오류] {e}")
+        return set()
+
+
+def _upsert_patent_batches(collection, ids: list, docs: list, metas: list, batch_size: int = 100) -> None:
+    """배치 upsert. 실패 시 예외 전파."""
+    for i in range(0, len(ids), batch_size):
+        collection.upsert(
+            ids=ids[i:i + batch_size],
+            documents=docs[i:i + batch_size],
+            metadatas=metas[i:i + batch_size],
+        )
+
+
+def _compact_master_excel() -> int:
+    """canonical 출원번호 기준 마스터 엑셀 중복 행 제거(마지막 행 유지). 제거된 행 수 반환."""
+    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
+        return 0
+    try:
+        df     = pd.read_excel(MASTER_EXCEL_PATH)
+        before = len(df)
+        cols   = _detect_columns(df)
+        deduped = _dedupe_dataframe_by_patent_id(df, cols)
+        after  = len(deduped)
+        if after < before:
+            deduped.to_excel(MASTER_EXCEL_PATH, index=False)
+            return before - after
+    except Exception as e:
+        print(f"[마스터 compact 오류] {e}")
+    return 0
+
+
+def sync_chroma_missing_from_master(collection, hyperlink_map: dict | None = None) -> int:
+    """
+    마스터 엑셀에는 있으나 ChromaDB에 없는 출원번호만 upsert.
+    엑셀 저장 후 Chroma 타임아웃·부분 실패로 생긴 누락 복구용.
+    시작 시 마스터 엑셀 canonical 중복 행도 자동 정리.
+    """
+    _compact_master_excel()
+    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
+        return 0
+    try:
+        df         = pd.read_excel(MASTER_EXCEL_PATH)
+        cols       = _detect_columns(df)
+        chroma_ids = _get_chroma_ids(collection)
+        hyperlink_map = hyperlink_map or {}
+
+        rows_by_id: dict = {}
+        for _, row in df.iterrows():
+            pat_id = _normalize_patent_id(row[cols["id"]])
+            if pat_id:
+                rows_by_id[pat_id] = row
+
+        ids, docs, metas = [], [], []
+        for pat_id, row in rows_by_id.items():
+            if pat_id in chroma_ids:
+                continue
+            patent_url = hyperlink_map.get(pat_id, "")
+            if not patent_url and cols["title"]:
+                clean_title = str(row[cols["title"]]).strip().replace("-", "")
+                patent_url  = hyperlink_map.get(clean_title, "")
+            ids.append(pat_id)
+            docs.append(_build_document(row, cols))
+            metas.append(_build_metadata(row, cols, patent_url=patent_url))
+
+        if not ids:
+            return 0
+        _upsert_patent_batches(collection, ids, docs, metas)
+        return len(ids)
+    except Exception as e:
+        print(f"[ChromaDB 누락분 동기화 오류] {e}")
+        return 0
+
+
+def _dedupe_dataframe_by_patent_id(df: pd.DataFrame, cols: dict) -> pd.DataFrame:
+    """마스터 엑셀 저장 전 canonical 출원번호 기준 중복 행 제거(마지막 행 유지)."""
+    if df.empty:
+        return df
+    keep_idx: dict[str, int] = {}
+    for idx, row in df.iterrows():
+        cid = _normalize_patent_id(row[cols["id"]])
+        if cid:
+            keep_idx[cid] = idx
+    if not keep_idx:
+        return df
+    return df.loc[sorted(keep_idx.values())].reset_index(drop=True)
+
+
+def _build_chroma_batches(rows_by_id: dict, cols: dict, hyperlink_map: dict):
+    """canonical id → row dict에서 ChromaDB upsert 배치 생성."""
+    batch_ids, batch_docs, batch_metas = [], [], []
+    for doc_id, row in rows_by_id.items():
+        patent_url = hyperlink_map.get(doc_id, "")
+        if not patent_url and cols["title"]:
+            clean_title = str(row[cols["title"]]).strip().replace("-", "")
+            patent_url  = hyperlink_map.get(clean_title, "")
+        batch_ids.append(doc_id)
+        batch_docs.append(_build_document(row, cols))
+        batch_metas.append(_build_metadata(row, cols, patent_url=patent_url))
+    return batch_ids, batch_docs, batch_metas
+
+
 def reindex_from_master_excel(collection) -> int:
     """
     재시작 후 ChromaDB 재구성 전용 함수.
@@ -996,22 +1126,22 @@ def reindex_from_master_excel(collection) -> int:
         df   = pd.read_excel(MASTER_EXCEL_PATH)
         cols = _detect_columns(df)
 
-        ids, docs, metas = [], [], []
+        rows_by_id: dict = {}
         for _, row in df.iterrows():
             pat_id = _normalize_patent_id(row[cols["id"]])
-            if not pat_id:
-                continue
+            if pat_id:
+                rows_by_id[pat_id] = row
+
+        if not rows_by_id:
+            return 0
+
+        ids, docs, metas = [], [], []
+        for pat_id, row in rows_by_id.items():
             ids.append(pat_id)
             docs.append(_build_document(row, cols))
             metas.append(_build_metadata(row, cols, patent_url=""))
 
-        BATCH = 100
-        for i in range(0, len(ids), BATCH):
-            collection.upsert(
-                ids=ids[i:i+BATCH],
-                documents=docs[i:i+BATCH],
-                metadatas=metas[i:i+BATCH]
-            )
+        _upsert_patent_batches(collection, ids, docs, metas)
         return len(ids)
     except Exception as e:
         print(f"재인덱싱 실패: {e}")
@@ -1019,6 +1149,17 @@ def reindex_from_master_excel(collection) -> int:
 
 
 def process_and_update_db(uploaded_file, collection):
+    """
+    업로드 파일 기준 누락 없는 적재 (canonical 출원번호 스키마).
+
+    원칙:
+      · 동일 canonical ID = 중복 1건 (표기 차이는 _normalize_patent_id로 통합)
+      · 업로드 파일의 모든 고유 ID는 ChromaDB에 반드시 존재해야 함
+        (마스터에만 있고 Chroma에 없으면 스킵하지 않고 upsert)
+      · ChromaDB 적재 성공 후 마스터 엑셀 저장 + canonical 기준 dedupe
+
+    반환: (chroma_신규적재, master_신규행, 파일내중복, 출원번호없음, gap추가복구)
+    """
     file_bytes    = uploaded_file.read()
     hyperlink_map = extract_excel_hyperlinks(io.BytesIO(file_bytes))
 
@@ -1026,69 +1167,69 @@ def process_and_update_db(uploaded_file, collection):
         new_df = pd.read_excel(io.BytesIO(file_bytes))
     except Exception as e:
         st.error(f"엑셀 파일 로드 실패: {e}")
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
 
     cols = _detect_columns(new_df)
 
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
         try:
-            master_df  = pd.read_excel(MASTER_EXCEL_PATH)
+            master_df   = pd.read_excel(MASTER_EXCEL_PATH)
             master_cols = _detect_columns(master_df)
-            existing_numbers = {
+            master_ids  = {
                 _normalize_patent_id(v)
                 for v in master_df[master_cols["id"]]
                 if _normalize_patent_id(v)
             }
         except Exception:
-            master_df        = pd.DataFrame(columns=new_df.columns)
-            existing_numbers = set()
+            master_df  = pd.DataFrame(columns=new_df.columns)
+            master_ids = set()
     else:
-        master_df        = pd.DataFrame(columns=new_df.columns)
-        existing_numbers = set()
+        master_df  = pd.DataFrame(columns=new_df.columns)
+        master_ids = set()
 
-    new_records     = []
-    duplicate_count = 0
-    skipped_empty   = 0
+    chroma_ids = _get_chroma_ids(collection)
+
+    file_rows: dict = {}
+    dup_in_file   = 0
+    skipped_empty = 0
 
     for _, row in new_df.iterrows():
-        current_number = _normalize_patent_id(row[cols["id"]])
-        if not current_number:
+        cid = _normalize_patent_id(row[cols["id"]])
+        if not cid:
             skipped_empty += 1
             continue
-        if current_number in existing_numbers:
-            duplicate_count += 1
-            continue
-        new_records.append(row)
-        existing_numbers.add(current_number)
+        if cid in file_rows:
+            dup_in_file += 1
+        file_rows[cid] = row
 
-    if not new_records:
-        return 0, duplicate_count, skipped_empty
+    chroma_needed = {cid: row for cid, row in file_rows.items() if cid not in chroma_ids}
+    master_needed = {cid: row for cid, row in file_rows.items() if cid not in master_ids}
+    already_indexed = len(file_rows) - len(chroma_needed)
 
-    added_df = pd.DataFrame(new_records)
-    updated_master_df = added_df if master_df.empty else pd.concat([master_df, added_df], ignore_index=True)
-    updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
+    chroma_ingested = 0
+    if chroma_needed:
+        batch_ids, batch_docs, batch_metas = _build_chroma_batches(chroma_needed, cols, hyperlink_map)
+        try:
+            _upsert_patent_batches(collection, batch_ids, batch_docs, batch_metas)
+            chroma_ingested = len(batch_ids)
+        except Exception as e:
+            st.error(f"ChromaDB 적재 실패 — 마스터 엑셀은 갱신하지 않았습니다: {e}")
+            return 0, 0, dup_in_file + already_indexed, skipped_empty, 0
 
-    batch_ids, batch_docs, batch_metas = [], [], []
-    for _, row in added_df.iterrows():
-        doc_id = _normalize_patent_id(row[cols["id"]])
+    master_added = 0
+    if master_needed:
+        added_df = pd.DataFrame(list(master_needed.values()))
+        if master_df.empty:
+            updated_master_df = added_df
+        else:
+            updated_master_df = pd.concat([master_df, added_df], ignore_index=True)
+        master_cols = _detect_columns(updated_master_df)
+        updated_master_df = _dedupe_dataframe_by_patent_id(updated_master_df, master_cols)
+        updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
+        master_added = len(master_needed)
 
-        patent_url = hyperlink_map.get(doc_id, "")
-        if not patent_url and cols["title"]:
-            clean_title = str(row[cols["title"]]).strip().replace("-", "")
-            patent_url  = hyperlink_map.get(clean_title, "")
-
-        batch_ids.append(doc_id)
-        batch_docs.append(_build_document(row, cols))
-        batch_metas.append(_build_metadata(row, cols, patent_url=patent_url))
-
-    BATCH = 100
-    for i in range(0, len(batch_ids), BATCH):
-        collection.upsert(
-            ids=batch_ids[i:i+BATCH],
-            documents=batch_docs[i:i+BATCH],
-            metadatas=batch_metas[i:i+BATCH]
-        )
-    return len(new_records), duplicate_count, skipped_empty
+    synced = sync_chroma_missing_from_master(collection, hyperlink_map)
+    return chroma_ingested, master_added, dup_in_file + already_indexed, skipped_empty, synced
 
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
@@ -1131,6 +1272,23 @@ def run_main_portal():
             st.toast(f"✅ 벡터 DB 복원 완료 ({restored}건)")
         except Exception as e:
             st.warning(f"자동 재인덱싱 오류: {e}")
+
+    elif (
+        master_n
+        and chroma_n > 0
+        and master_n > chroma_n
+        and not st.session_state.chroma_gap_sync_done
+    ):
+        st.session_state.chroma_gap_sync_done = True
+        gap = master_n - chroma_n
+        try:
+            with st.spinner(f"ChromaDB 누락분 자동 복구 중 ({chroma_n}→{master_n}, 약 {gap}건)..."):
+                synced = sync_chroma_missing_from_master(collection)
+            st.session_state._last_chroma_count = safe_count(collection)
+            if synced > 0:
+                st.toast(f"✅ ChromaDB 누락분 {synced}건 복구 완료")
+        except Exception as e:
+            st.warning(f"ChromaDB 누락분 자동 복구 오류: {e}")
 
     is_admin = st.session_state.get("is_admin", False)
 
@@ -1221,19 +1379,26 @@ def run_main_portal():
                     except Exception as diag_e:
                         st.warning(f"파일 사전 진단 실패: {diag_e}")
 
-                    with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
-                        added, dup, skipped = process_and_update_db(uploaded_file, collection)
+                    with st.spinner("canonical 출원번호 정규화 및 ChromaDB 적재 중..."):
+                        chroma_new, master_new, dup, skipped, synced = process_and_update_db(
+                            uploaded_file, collection
+                        )
 
                     total_now = safe_count(collection)
+                    master_now = _count_master_excel_patents()
                     summary = (
-                        f"📊 처리 결과: 신규 **{added}건** 추가 / 중복 제외 **{dup}건** / "
-                        f"DB 총 **{total_now}건**"
+                        f"📊 처리 결과: Chroma 신규 **{chroma_new}건** / 마스터 신규 **{master_new}건** / "
+                        f"이미 색인됨 **{dup}건** / ChromaDB 총 **{total_now}건**"
                     )
+                    if master_now is not None:
+                        summary += f" / 마스터 엑셀 **{master_now}건**"
                     if skipped:
                         summary += f" / 출원번호 없음 **{skipped}건** 스킵"
+                    if synced:
+                        summary += f" / 마스터→Chroma 추가복구 **{synced}건**"
 
                     github_ok = None
-                    if added > 0:
+                    if chroma_new > 0 or master_new > 0 or synced > 0:
                         with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중... (대용량 파일은 최대 2분 소요)"):
                             github_ok = commit_and_push_data()
                         if github_ok:
@@ -1241,10 +1406,10 @@ def run_main_portal():
                                 "level": "success",
                                 "message": (
                                     f"{summary}\n\n"
-                                    f"✅ 신규 {added}건 인덱싱 및 GitHub 백업 성공 — 재시작 후에도 데이터가 보존됩니다."
+                                    f"✅ 인덱싱 및 GitHub 백업 성공 — 재시작 후에도 데이터가 보존됩니다."
                                 ),
                             }
-                            st.toast(f"✅ 신규 {added}건 적재 완료 (DB 총 {total_now}건)")
+                            st.toast(f"✅ 적재 완료 (ChromaDB {total_now}건)")
                         else:
                             st.session_state.upload_feedback = {
                                 "level": "warning",
@@ -1256,10 +1421,12 @@ def run_main_portal():
                             }
                     elif dup > 0:
                         st.session_state.upload_feedback = {
-                            "level": "warning",
+                            "level": "info",
                             "message": (
                                 f"{summary}\n\n"
-                                f"⚠️ 업로드 파일의 특허가 이미 DB에 존재합니다. 새로운 데이터가 없습니다."
+                                f"ℹ️ 업로드 파일의 특허는 이미 ChromaDB에 색인되어 있습니다. "
+                                f"ChromaDB({total_now})와 마스터({master_now}) 건수가 다르면 "
+                                f"아래 **ChromaDB 누락분 복구** 버튼을 실행하세요."
                             ),
                         }
                     else:
@@ -1289,8 +1456,20 @@ def run_main_portal():
             if master_n is not None:
                 count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
                 if master_n != chroma_n:
-                    count_md += "  \n⚠️ ChromaDB와 마스터 엑셀 건수가 다릅니다. 재업로드 없이 맞추려면 컨테이너 재시작 후 자동 재인덱싱을 기다리세요."
+                    count_md += "  \n⚠️ ChromaDB와 마스터 엑셀 건수가 다릅니다. 아래 **ChromaDB 누락분 복구** 버튼을 실행하세요."
             st.markdown(count_md)
+
+            if master_n is not None and master_n > chroma_n:
+                if st.button("🔧 ChromaDB 누락분 복구 (마스터 엑셀 기준)", use_container_width=True):
+                    gap = master_n - chroma_n
+                    with st.spinner(f"마스터 엑셀 → ChromaDB 누락분 복구 중 (약 {gap}건)..."):
+                        synced = sync_chroma_missing_from_master(collection)
+                    st.session_state._last_chroma_count = safe_count(collection)
+                    if synced > 0:
+                        st.success(f"✅ ChromaDB 누락분 {synced}건 복구 완료 (현재 {safe_count(collection)}건)")
+                        st.toast("GitHub 백업을 실행하는 것을 권장합니다.")
+                    else:
+                        st.info("복구할 누락분이 없거나 이미 동기화되어 있습니다.")
 
             if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
                 file_kb = os.path.getsize(MASTER_EXCEL_PATH) // 1024
