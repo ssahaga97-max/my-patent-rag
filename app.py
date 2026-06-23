@@ -23,11 +23,6 @@ MASTER_EXCEL_PATH    = os.path.join(BASE_DIR, "my_patent_folder", "master_patent
 USER_REGISTRY_PATH   = os.path.join(BASE_DIR, "my_patent_folder", "user_registry.json")
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 
-# ChromaDB 텔레메트리 비활성화 — EphemeralClient(settings=...) 방식은
-# _create_system_if_not_exists에서 "An instance already exists" ValueError를 유발하므로
-# 환경변수 방식으로 대체
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-
 st.set_page_config(page_title="AI 경쟁사 특허 조사 분석", layout="wide", page_icon="🔬")
 
 
@@ -565,11 +560,27 @@ _EMBED_MODEL       = "sentence-transformers/paraphrase-multilingual-mpnet-base-v
 
 
 def _get_or_create_chroma_client():
-    """EphemeralClient를 스레드 안전하게 단 한 번만 생성·반환."""
+    """
+    EphemeralClient를 스레드 안전하게 단 한 번만 생성·반환.
+    레지스트리에 잔존 인스턴스가 있어 ValueError가 발생하면
+    chromadb 공식 API인 clear_system_cache()로 초기화 후 재시도한다.
+    """
     global _CHROMA_CLIENT
     with _CHROMA_LOCK:
-        if _CHROMA_CLIENT is None:
-            _CHROMA_CLIENT = chromadb.EphemeralClient()
+        if _CHROMA_CLIENT is not None:
+            return _CHROMA_CLIENT
+        for attempt in range(2):
+            try:
+                _CHROMA_CLIENT = chromadb.EphemeralClient()
+                return _CHROMA_CLIENT
+            except ValueError:
+                if attempt == 0:
+                    try:
+                        chromadb.Client.clear_system_cache()
+                    except Exception:
+                        pass
+                else:
+                    raise
         return _CHROMA_CLIENT
 
 
