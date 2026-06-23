@@ -573,6 +573,32 @@ def load_permanent_infra_singleton():
     return _build_infra()
 
 
+def safe_count(collection) -> int:
+    """
+    collection.count()를 안전하게 호출.
+    SQLite 손상·연결 끊김 등의 OperationalError 발생 시
+    ChromaDB 캐시를 파괴하고 앱을 재시작하여 자동 복구.
+    """
+    try:
+        return collection.count()
+    except Exception as e:
+        err_str = str(e).lower()
+        if any(kw in err_str for kw in ["sqlite", "operational", "no such table", "database"]):
+            # ChromaDB SQLite 손상 → 캐시 + 디렉토리 정리 후 재시작
+            try:
+                _build_infra.clear()
+                st.session_state.pop("infra_initialized", None)
+                st.session_state.github_synced = False
+                if os.path.exists(DB_PATH):
+                    shutil.rmtree(DB_PATH)
+                os.makedirs(DB_PATH, exist_ok=True)
+            except Exception:
+                pass
+            st.warning("⚠️ 벡터 DB가 일시적으로 손상되었습니다. 자동 복구 중... 앱을 새로고침해 주세요.")
+            st.stop()
+        return 0
+
+
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
 def extract_excel_hyperlinks(uploaded_file):
     link_dict = {}
@@ -770,7 +796,7 @@ def run_main_portal():
         # 엑셀 복원 여부와 무관하게 재인덱싱은 아래 조건에서 처리
 
     # ChromaDB가 비어 있으면(재시작) 엑셀 기반 자동 재인덱싱
-    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and collection.count() == 0:
+    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and safe_count(collection) == 0:
         try:
             with st.spinner("📦 벡터 DB 자동 재인덱싱 중... (특허 수에 따라 1~3분 소요)"):
                 restored = reindex_from_master_excel(collection)
@@ -788,7 +814,7 @@ def run_main_portal():
     with col_title:
         st.title("AI 경쟁사 특허 조사 분석")
         mode_label = "🔧 관리자" if is_admin else "👤 사용자"
-        st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | 적재 특허: {collection.count()}건")
+        st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | 적재 특허: {safe_count(collection)}건")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in   = False
@@ -865,7 +891,7 @@ def run_main_portal():
                     with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
                         added, dup = process_and_update_db(uploaded_file, collection)
 
-                    st.info(f"📊 처리 결과: 신규 **{added}건** 추가 / 중복 제외 **{dup}건** / DB 총 **{collection.count()}건**")
+                    st.info(f"📊 처리 결과: 신규 **{added}건** 추가 / 중복 제외 **{dup}건** / DB 총 **{safe_count(collection)}건**")
 
                     if added > 0:
                         with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중..."):
@@ -878,7 +904,7 @@ def run_main_portal():
                     st.rerun()
 
             st.divider()
-            st.markdown(f"📊 **누적 적재 데이터:** `{collection.count()}` 건")
+            st.markdown(f"📊 **누적 적재 데이터:** `{safe_count(collection)}` 건")
 
             if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
                 with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
@@ -957,7 +983,7 @@ def run_main_portal():
     if st.button("🧬 가상 전문가 엔진 구동"):
         if user_query.strip() == "":
             st.warning("분석 내용을 입력해 주세요.")
-        elif collection.count() == 0:
+        elif safe_count(collection) == 0:
             st.error("서버 DB에 적재된 특허 소스가 없습니다. 좌측 메뉴에서 엑셀을 먼저 등록해 주세요.")
         else:
             with st.spinner("가상 전문가가 실시간 시맨틱 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
@@ -1018,7 +1044,7 @@ def run_main_portal():
                 else:
                     # 침해 분석은 7건, 나머지는 5건으로 품질 향상
                     n_results = 7 if "🛡" in analysis_mode else 5
-                    n_results = min(n_results, collection.count())
+                    n_results = min(n_results, safe_count(collection))
 
                     results = collection.query(
                         query_texts=[user_query.strip()],
