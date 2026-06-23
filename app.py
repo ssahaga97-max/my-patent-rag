@@ -1340,9 +1340,36 @@ def _get_chroma_ids(collection) -> set:
         return set()
 
 
-def _count_chroma_unique_ids(collection) -> int:
-    """ChromaDB 고유 document id 수 (중복 ID 문서 제외한 실질 특허 수)."""
-    return len(_get_chroma_ids(collection))
+def _count_chroma_unique_patents(collection, batch_size: int = 500) -> int:
+    """
+    ChromaDB 내 고유 출원번호(canonical) 수.
+    마스터 엑셀 _count_master_excel_patents()와 동일 기준 — document id 중복과 무관.
+    """
+    try:
+        if collection.count() == 0:
+            return 0
+        all_ids = collection.get(include=[])["ids"]
+        canonical: set[str] = set()
+        for i in range(0, len(all_ids), batch_size):
+            batch = collection.get(
+                ids=all_ids[i:i + batch_size],
+                include=["metadatas"],
+            )
+            for chroma_id, meta in zip(
+                batch.get("ids", []),
+                batch.get("metadatas", []),
+            ):
+                meta = meta or {}
+                cid = (
+                    _normalize_patent_id(meta.get("출원번호", ""))
+                    or _normalize_patent_id(chroma_id)
+                )
+                if cid:
+                    canonical.add(cid)
+        return len(canonical)
+    except Exception as e:
+        print(f"[ChromaDB 고유 출원번호 조회 오류] {e}")
+        return 0
 
 
 def _render_feedback_box(feedback: dict | None) -> None:
@@ -1361,40 +1388,38 @@ def _render_feedback_box(feedback: dict | None) -> None:
         st.info(message)
 
 
-def _build_db_count_status(chroma_n: int, master_n: int | None, unique_chroma_n: int) -> str:
-    """Chroma·마스터 건수 비교 상태 문구."""
+def _build_db_count_status(chroma_n: int, master_n: int | None, unique_patent_n: int) -> str:
+    """Chroma·마스터 건수 비교 상태 문구 (출원번호 canonical 기준)."""
     count_md = f"📊 **누적 적재 데이터 (ChromaDB):** `{chroma_n}` 건"
     if master_n is None:
         return count_md
 
     count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
-    if unique_chroma_n and unique_chroma_n != chroma_n:
-        count_md += f"  \n🔑 **ChromaDB 고유 ID:** `{unique_chroma_n}` 건"
+    if unique_patent_n and unique_patent_n != chroma_n:
+        count_md += f"  \n🔑 **ChromaDB 고유 출원번호:** `{unique_patent_n}` 건"
 
-    if master_n == chroma_n:
+    if master_n == unique_patent_n:
+        count_md += (
+            f"  \n✅ 마스터 엑셀과 Chroma **고유 출원번호({master_n}건)** 가 일치합니다."
+        )
+        if chroma_n > unique_patent_n:
+            dup_docs = chroma_n - unique_patent_n
+            count_md += (
+                f"  \nℹ️ ChromaDB 문서 수에는 표기 차이로 인한 **중복 문서 {dup_docs}건**이 "
+                f"포함됩니다 (재시작·백업에는 고유 {master_n}건 기준 적용)."
+            )
         return count_md
 
     if chroma_n > master_n:
-        dup_docs = chroma_n - unique_chroma_n
-        if master_n >= unique_chroma_n:
-            count_md += (
-                f"  \n✅ 마스터 엑셀이 Chroma **고유 특허 전체({master_n}건)** 와 동기화되었습니다."
-            )
-            if dup_docs > 0:
-                count_md += (
-                    f"  \nℹ️ ChromaDB 문서 수에는 동일 특허 **중복 ID {dup_docs}건**이 "
-                    f"포함되어 있습니다 (분석·검색에는 영향 없음)."
-                )
-        else:
-            gap = unique_chroma_n - master_n
-            count_md += (
-                f"  \n⚠️ 마스터가 Chroma 고유 특허보다 **{gap}건** 부족합니다. "
-                f"**ChromaDB → 마스터 엑셀 역동기화** 후 GitHub 백업하세요."
-            )
+        gap = unique_patent_n - master_n
+        count_md += (
+            f"  \n⚠️ 마스터가 Chroma 고유 출원번호보다 **{gap}건** 부족합니다. "
+            f"**ChromaDB → 마스터 엑셀 역동기화** 후 GitHub 백업하세요."
+        )
     else:
         gap = master_n - chroma_n
         count_md += (
-            f"  \n⚠️ 마스터가 ChromaDB보다 **{gap}건** 많습니다. "
+            f"  \n⚠️ 마스터가 ChromaDB 문서 수보다 **{gap}건** 많습니다. "
             f"**ChromaDB 누락분 복구** 버튼을 실행하세요."
         )
     return count_md
@@ -1962,18 +1987,18 @@ def run_main_portal():
                 _render_feedback_box(st.session_state.upload_feedback)
 
             st.divider()
-            chroma_n       = safe_count(collection)
-            master_n       = _count_master_excel_patents()
-            unique_chroma_n = _count_chroma_unique_ids(collection)
-            st.markdown(_build_db_count_status(chroma_n, master_n, unique_chroma_n))
+            chroma_n          = safe_count(collection)
+            master_n          = _count_master_excel_patents()
+            unique_patent_n   = _count_chroma_unique_patents(collection)
+            st.markdown(_build_db_count_status(chroma_n, master_n, unique_patent_n))
 
             if st.session_state.sync_feedback:
                 _render_feedback_box(st.session_state.sync_feedback)
 
             needs_reverse_sync = (
                 master_n is not None
-                and unique_chroma_n > 0
-                and master_n < unique_chroma_n
+                and unique_patent_n > 0
+                and master_n < unique_patent_n
             )
             if needs_reverse_sync:
                 if st.button("📥 ChromaDB → 마스터 엑셀 역동기화", use_container_width=True):
