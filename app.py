@@ -20,10 +20,7 @@ from urllib.error import HTTPError
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH    = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
 USER_REGISTRY_PATH   = os.path.join(BASE_DIR, "my_patent_folder", "user_registry.json")
-DB_PATH = "/tmp/my_patent_vector_db"
-
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
-os.makedirs(DB_PATH, exist_ok=True)
 
 st.set_page_config(page_title="AI 경쟁사 특허 조사 분석", layout="wide", page_icon="🔬")
 
@@ -529,34 +526,14 @@ def check_authentication():
 def _build_infra():
     """
     @st.cache_resource: 프로세스당 단 한 번만 실행되어 동일 인스턴스를 모든 세션·리런에서 재사용.
-    PersistentClient를 중복 생성하려 할 때 발생하는
-    'An instance of Chroma already exists' ValueError를 구조적으로 원천 차단.
-    """
-    # ChromaDB 클라이언트 초기화
-    # _validate_tenant_database ValueError는 chromadb 내부 싱글톤 레지스트리에
-    # 이전 인스턴스가 남아 있을 때 발생한다. 레지스트리를 직접 초기화하여 해결.
-    def _reset_chromadb_registry():
-        try:
-            from chromadb.api.client import SharedSystemClient
-            SharedSystemClient._identifer_to_system.clear()
-        except Exception:
-            pass
-        try:
-            from chromadb import Client as _C
-            if hasattr(_C, "_instances"):
-                _C._instances.clear()
-        except Exception:
-            pass
 
-    try:
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
-    except Exception:
-        # 레지스트리 초기화 후 디렉토리 정화 및 재시도
-        _reset_chromadb_registry()
-        if os.path.exists(DB_PATH):
-            shutil.rmtree(DB_PATH)
-        os.makedirs(DB_PATH, exist_ok=True)
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
+    [PersistentClient → EphemeralClient 전환 이유]
+    chromadb 0.5.0에서 Streamlit Cloud 복수 Worker Process가 동시에 같은 SQLite 파일에
+    접근할 때 'no such table: tenants/collections/embeddings' 레이스 컨디션이 발생한다.
+    ChromaDB 데이터 영속성은 GitHub 백업/복원으로 이미 보장되므로,
+    SQLite 파일 불필요 → EphemeralClient(순수 인메모리)로 교체하여 모든 SQLite 오류 원천 제거.
+    """
+    chroma_client = chromadb.EphemeralClient()
 
     # Ko-SRoBERTa 임베딩 함수 및 컬렉션
     sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -916,9 +893,6 @@ def run_main_portal():
                     try:
                         if os.path.exists(MASTER_EXCEL_PATH):
                             os.remove(MASTER_EXCEL_PATH)
-                        if os.path.exists(DB_PATH):
-                            shutil.rmtree(DB_PATH)
-                        os.makedirs(DB_PATH, exist_ok=True)
                         _build_infra.clear()
                         if "infra_initialized" in st.session_state:
                             del st.session_state["infra_initialized"]
