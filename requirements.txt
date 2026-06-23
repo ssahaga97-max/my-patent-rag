@@ -6,6 +6,3 @@ protobuf==4.25.3
 numpy<2.0.0
 sentence-transformers>=2.2.2
 langchain-groq
-torchvision
-scikit-learn
-tqdm
