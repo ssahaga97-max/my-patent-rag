@@ -532,10 +532,27 @@ def _build_infra():
     PersistentClient를 중복 생성하려 할 때 발생하는
     'An instance of Chroma already exists' ValueError를 구조적으로 원천 차단.
     """
-    # ChromaDB 클라이언트 — 실패 시 디렉토리 정화 후 재시도
+    # ChromaDB 클라이언트 초기화
+    # _validate_tenant_database ValueError는 chromadb 내부 싱글톤 레지스트리에
+    # 이전 인스턴스가 남아 있을 때 발생한다. 레지스트리를 직접 초기화하여 해결.
+    def _reset_chromadb_registry():
+        try:
+            from chromadb.api.client import SharedSystemClient
+            SharedSystemClient._identifer_to_system.clear()
+        except Exception:
+            pass
+        try:
+            from chromadb import Client as _C
+            if hasattr(_C, "_instances"):
+                _C._instances.clear()
+        except Exception:
+            pass
+
     try:
         chroma_client = chromadb.PersistentClient(path=DB_PATH)
     except Exception:
+        # 레지스트리 초기화 후 디렉토리 정화 및 재시도
+        _reset_chromadb_registry()
         if os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
         os.makedirs(DB_PATH, exist_ok=True)
@@ -576,26 +593,14 @@ def load_permanent_infra_singleton():
 def safe_count(collection) -> int:
     """
     collection.count()를 안전하게 호출.
-    SQLite 손상·연결 끊김 등의 OperationalError 발생 시
-    ChromaDB 캐시를 파괴하고 앱을 재시작하여 자동 복구.
+    SQLite 오류 발생 시 0을 반환하여 앱 크래시 방지.
+    캐시 초기화는 하지 않음 — 기존 ChromaDB 인스턴스가 메모리에 살아있는 채로
+    _build_infra.clear() 후 PersistentClient 재생성 시 충돌(ValueError)이 발생하기 때문.
     """
     try:
         return collection.count()
     except Exception as e:
-        err_str = str(e).lower()
-        if any(kw in err_str for kw in ["sqlite", "operational", "no such table", "database"]):
-            # ChromaDB SQLite 손상 → 캐시 + 디렉토리 정리 후 재시작
-            try:
-                _build_infra.clear()
-                st.session_state.pop("infra_initialized", None)
-                st.session_state.github_synced = False
-                if os.path.exists(DB_PATH):
-                    shutil.rmtree(DB_PATH)
-                os.makedirs(DB_PATH, exist_ok=True)
-            except Exception:
-                pass
-            st.warning("⚠️ 벡터 DB가 일시적으로 손상되었습니다. 자동 복구 중... 앱을 새로고침해 주세요.")
-            st.stop()
+        print(f"[ChromaDB safe_count 오류] {e}")
         return 0
 
 
