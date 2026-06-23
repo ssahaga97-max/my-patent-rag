@@ -50,6 +50,8 @@ if "_last_chroma_count" not in st.session_state:
 if "chroma_gap_sync_done" not in st.session_state:
     st.session_state.chroma_gap_sync_done = False
 
+_PATENT_COUNT_CACHE_KEY = "_patent_count_cache"
+
 
 # ==========================================
 # 공통 유틸리티
@@ -801,10 +803,6 @@ def check_authentication():
         st.image(logo_path, width=160)
     st.title("AI 경쟁사 특허 조사 분석")
 
-    # 로그인 화면 진입 시에도 레지스트리가 없으면 GitHub에서 복원
-    if not os.path.exists(USER_REGISTRY_PATH):
-        download_user_registry_from_github()
-
     tab_login, tab_register = st.tabs(["🔑 로그인", "📝 신규 회원 가입"])
 
     # ── 로그인 탭 ──
@@ -1296,10 +1294,65 @@ def _build_document(row, cols: dict) -> str:
     return f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
 
 
-def _count_master_excel_patents() -> int | None:
+def _patent_url_from_row(
+    row,
+    cols: dict,
+    patent_id: str,
+    hyperlink_map: dict | None = None,
+) -> str:
+    """마스터 행·하이퍼링크 맵에서 특허 URL 추출 (유효한 http URL만)."""
+    hyperlink_map = hyperlink_map or {}
+
+    if "URL" in getattr(row, "index", []):
+        raw_url = row.get("URL")
+        if pd.notna(raw_url):
+            url = str(raw_url).strip()
+            if url.startswith("http"):
+                return url
+
+    url = hyperlink_map.get(patent_id, "")
+    if url and str(url).startswith("http"):
+        return str(url)
+
+    if cols.get("title"):
+        clean_title = str(row[cols["title"]]).strip().replace("-", "")
+        url = hyperlink_map.get(clean_title, "")
+        if url and str(url).startswith("http"):
+            return str(url)
+
+    return ""
+
+
+def _master_excel_mtime() -> float:
+    """마스터 엑셀 mtime. 없거나 비어 있으면 -1."""
+    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
+        return os.path.getmtime(MASTER_EXCEL_PATH)
+    return -1.0
+
+
+def _invalidate_patent_count_cache() -> None:
+    """마스터·Chroma 건수 캐시 무효화 (데이터 변경 직후 호출)."""
+    st.session_state.pop(_PATENT_COUNT_CACHE_KEY, None)
+
+
+def _get_patent_count_cache() -> dict:
+    if _PATENT_COUNT_CACHE_KEY not in st.session_state:
+        st.session_state[_PATENT_COUNT_CACHE_KEY] = {}
+    return st.session_state[_PATENT_COUNT_CACHE_KEY]
+
+
+def _count_master_excel_patents(force: bool = False) -> int | None:
     """마스터 엑셀의 고유 출원번호 건수. 파일 없으면 None."""
-    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
+    mtime = _master_excel_mtime()
+    cache = _get_patent_count_cache()
+    if not force and cache.get("master_mtime") == mtime and "master_n" in cache:
+        return cache["master_n"]
+
+    if mtime < 0:
+        cache["master_mtime"] = mtime
+        cache["master_n"] = None
         return None
+
     try:
         df   = pd.read_excel(MASTER_EXCEL_PATH)
         cols = _detect_columns(df)
@@ -1308,10 +1361,14 @@ def _count_master_excel_patents() -> int | None:
             for v in df[cols["id"]]
             if _normalize_patent_id(v)
         }
-        return len(ids)
+        result = len(ids)
     except Exception as e:
         print(f"[마스터 엑셀 건수 조회 오류] {e}")
-        return None
+        result = None
+
+    cache["master_mtime"] = mtime
+    cache["master_n"] = result
+    return result
 
 
 def extract_excel_hyperlinks(uploaded_file):
@@ -1340,36 +1397,49 @@ def _get_chroma_ids(collection) -> set:
         return set()
 
 
-def _count_chroma_unique_patents(collection, batch_size: int = 500) -> int:
+def _count_chroma_unique_patents(
+    collection, batch_size: int = 500, force: bool = False
+) -> int:
     """
     ChromaDB 내 고유 출원번호(canonical) 수.
     마스터 엑셀 _count_master_excel_patents()와 동일 기준 — document id 중복과 무관.
     """
+    chroma_n = safe_count(collection)
+    cache = _get_patent_count_cache()
+    cache_key = (chroma_n, _master_excel_mtime())
+    if not force and cache.get("chroma_key") == cache_key and "chroma_unique_n" in cache:
+        return cache["chroma_unique_n"]
+
     try:
-        if collection.count() == 0:
-            return 0
-        all_ids = collection.get(include=[])["ids"]
-        canonical: set[str] = set()
-        for i in range(0, len(all_ids), batch_size):
-            batch = collection.get(
-                ids=all_ids[i:i + batch_size],
-                include=["metadatas"],
-            )
-            for chroma_id, meta in zip(
-                batch.get("ids", []),
-                batch.get("metadatas", []),
-            ):
-                meta = meta or {}
-                cid = (
-                    _normalize_patent_id(meta.get("출원번호", ""))
-                    or _normalize_patent_id(chroma_id)
+        if chroma_n == 0:
+            result = 0
+        else:
+            all_ids = collection.get(include=[])["ids"]
+            canonical: set[str] = set()
+            for i in range(0, len(all_ids), batch_size):
+                batch = collection.get(
+                    ids=all_ids[i:i + batch_size],
+                    include=["metadatas"],
                 )
-                if cid:
-                    canonical.add(cid)
-        return len(canonical)
+                for chroma_id, meta in zip(
+                    batch.get("ids", []),
+                    batch.get("metadatas", []),
+                ):
+                    meta = meta or {}
+                    cid = (
+                        _normalize_patent_id(meta.get("출원번호", ""))
+                        or _normalize_patent_id(chroma_id)
+                    )
+                    if cid:
+                        canonical.add(cid)
+            result = len(canonical)
     except Exception as e:
         print(f"[ChromaDB 고유 출원번호 조회 오류] {e}")
-        return 0
+        result = 0
+
+    cache["chroma_key"] = cache_key
+    cache["chroma_unique_n"] = result
+    return result
 
 
 def _render_feedback_box(feedback: dict | None) -> None:
@@ -1400,20 +1470,20 @@ def _build_db_count_status(chroma_n: int, master_n: int | None, unique_patent_n:
     if master_n == unique_patent_n:
         return count_md
 
-    # 불일치 시에만 상세·안내
+    # 불일치 시에만 상세·안내 (고유 출원번호 기준 비교)
     if unique_patent_n:
         count_md += f"  \n🔑 **ChromaDB 고유 출원번호:** `{unique_patent_n}` 건"
 
-    if chroma_n > master_n:
+    if master_n < unique_patent_n:
         gap = unique_patent_n - master_n
         count_md += (
             f"  \n⚠️ 마스터가 Chroma 고유 출원번호보다 **{gap}건** 부족합니다. "
             f"**ChromaDB → 마스터 엑셀 역동기화** 후 GitHub 백업하세요."
         )
-    else:
-        gap = master_n - chroma_n
+    elif master_n > unique_patent_n:
+        gap = master_n - unique_patent_n
         count_md += (
-            f"  \n⚠️ 마스터가 ChromaDB 문서 수보다 **{gap}건** 많습니다. "
+            f"  \n⚠️ 마스터가 Chroma 고유 출원번호보다 **{gap}건** 많습니다. "
             f"**ChromaDB 누락분 복구** 버튼을 실행하세요."
         )
     return count_md
@@ -1441,6 +1511,7 @@ def _compact_master_excel() -> int:
         after  = len(deduped)
         if after < before:
             deduped.to_excel(MASTER_EXCEL_PATH, index=False)
+            _invalidate_patent_count_cache()
             return before - after
     except Exception as e:
         print(f"[마스터 compact 오류] {e}")
@@ -1472,10 +1543,7 @@ def sync_chroma_missing_from_master(collection, hyperlink_map: dict | None = Non
         for pat_id, row in rows_by_id.items():
             if pat_id in chroma_ids:
                 continue
-            patent_url = hyperlink_map.get(pat_id, "")
-            if not patent_url and cols["title"]:
-                clean_title = str(row[cols["title"]]).strip().replace("-", "")
-                patent_url  = hyperlink_map.get(clean_title, "")
+            patent_url = _patent_url_from_row(row, cols, pat_id, hyperlink_map)
             ids.append(pat_id)
             docs.append(_build_document(row, cols))
             metas.append(_build_metadata(row, cols, patent_url=patent_url))
@@ -1483,6 +1551,7 @@ def sync_chroma_missing_from_master(collection, hyperlink_map: dict | None = Non
         if not ids:
             return 0
         _upsert_patent_batches(collection, ids, docs, metas)
+        _invalidate_patent_count_cache()
         return len(ids)
     except Exception as e:
         print(f"[ChromaDB 누락분 동기화 오류] {e}")
@@ -1620,6 +1689,7 @@ def sync_master_from_chroma(collection, batch_size: int = 500) -> tuple[int, int
     df_out = pd.DataFrame(list(rows_by_id.values()), columns=list(_MASTER_EXCEL_COLUMNS))
     os.makedirs(os.path.dirname(MASTER_EXCEL_PATH), exist_ok=True)
     df_out.to_excel(MASTER_EXCEL_PATH, index=False)
+    _invalidate_patent_count_cache()
 
     master_after = len(rows_by_id)
     return exported, master_before, master_after
@@ -1643,10 +1713,7 @@ def _build_chroma_batches(rows_by_id: dict, cols: dict, hyperlink_map: dict):
     """canonical id → row dict에서 ChromaDB upsert 배치 생성."""
     batch_ids, batch_docs, batch_metas = [], [], []
     for doc_id, row in rows_by_id.items():
-        patent_url = hyperlink_map.get(doc_id, "")
-        if not patent_url and cols["title"]:
-            clean_title = str(row[cols["title"]]).strip().replace("-", "")
-            patent_url  = hyperlink_map.get(clean_title, "")
+        patent_url = _patent_url_from_row(row, cols, doc_id, hyperlink_map)
         batch_ids.append(doc_id)
         batch_docs.append(_build_document(row, cols))
         batch_metas.append(_build_metadata(row, cols, patent_url=patent_url))
@@ -1678,9 +1745,11 @@ def reindex_from_master_excel(collection) -> int:
         for pat_id, row in rows_by_id.items():
             ids.append(pat_id)
             docs.append(_build_document(row, cols))
-            metas.append(_build_metadata(row, cols, patent_url=""))
+            patent_url = _patent_url_from_row(row, cols, pat_id)
+            metas.append(_build_metadata(row, cols, patent_url=patent_url))
 
         _upsert_patent_batches(collection, ids, docs, metas)
+        _invalidate_patent_count_cache()
         return len(ids)
     except Exception as e:
         print(f"재인덱싱 실패: {e}")
@@ -1765,15 +1834,18 @@ def process_and_update_db(uploaded_file, collection):
         master_cols = _detect_columns(updated_master_df)
         updated_master_df = _dedupe_dataframe_by_patent_id(updated_master_df, master_cols)
         updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
+        _invalidate_patent_count_cache()
         master_added = len(master_needed)
 
     synced = sync_chroma_missing_from_master(collection, hyperlink_map)
+    if chroma_ingested or master_added or synced:
+        _invalidate_patent_count_cache()
     return chroma_ingested, master_added, dup_in_file + already_indexed, skipped_empty, synced
 
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
 def run_main_portal():
-    chroma_client, collection, llm = load_permanent_infra_singleton()
+    _, collection, llm = load_permanent_infra_singleton()
 
     # ── 세션 최초 진입 시: GitHub → 로컬 전체 동기화 ──
     # github_synced는 세션 단위 플래그. 프로세스 재시작(컨테이너 재생성) 시 항상 False로 초기화됨.
@@ -1783,6 +1855,7 @@ def run_main_portal():
             excel_ok, registry_ok = sync_all_from_github()
 
         if excel_ok is True:
+            _invalidate_patent_count_cache()
             st.toast("✅ GitHub에서 마스터 특허 데이터 복원 완료")
         if registry_ok is True:
             st.toast("✅ GitHub에서 회원 정보 복원 완료")
@@ -1798,6 +1871,7 @@ def run_main_portal():
     # ChromaDB가 비어 있으면(재시작) 엑셀 기반 자동 재인덱싱 — 세션당 1회만
     chroma_n = safe_count(collection)
     master_n = _count_master_excel_patents()
+    unique_patent_n = _count_chroma_unique_patents(collection) if chroma_n > 0 else 0
     if (
         master_n
         and chroma_n == 0
@@ -1808,6 +1882,7 @@ def run_main_portal():
             with st.spinner("📦 벡터 DB 자동 재인덱싱 중... (특허 수에 따라 1~3분 소요)"):
                 restored = reindex_from_master_excel(collection)
             st.session_state._last_chroma_count = safe_count(collection)
+            _invalidate_patent_count_cache()
             st.toast(f"✅ 벡터 DB 복원 완료 ({restored}건)")
         except Exception as e:
             st.warning(f"자동 재인덱싱 오류: {e}")
@@ -1815,15 +1890,20 @@ def run_main_portal():
     elif (
         master_n
         and chroma_n > 0
-        and master_n > chroma_n
+        and unique_patent_n > 0
+        and master_n > unique_patent_n
         and not st.session_state.chroma_gap_sync_done
     ):
         st.session_state.chroma_gap_sync_done = True
-        gap = master_n - chroma_n
+        gap = master_n - unique_patent_n
         try:
-            with st.spinner(f"ChromaDB 누락분 자동 복구 중 ({chroma_n}→{master_n}, 약 {gap}건)..."):
+            with st.spinner(
+                f"ChromaDB 누락분 자동 복구 중 "
+                f"(Chroma 고유 {unique_patent_n}→{master_n}, 약 {gap}건)..."
+            ):
                 synced = sync_chroma_missing_from_master(collection)
             st.session_state._last_chroma_count = safe_count(collection)
+            _invalidate_patent_count_cache()
             if synced > 0:
                 st.toast(f"✅ ChromaDB 누락분 {synced}건 복구 완료")
         except Exception as e:
@@ -1856,14 +1936,25 @@ def run_main_portal():
         if is_admin:
             st.header("📂 데이터 관리 센터")
 
-            # GitHub 수동 재동기화 버튼
-            if st.button("🔄 GitHub 데이터 강제 재동기화", use_container_width=True):
+            st.checkbox(
+                "⚠️ 로컬 마스터·회원 데이터를 GitHub 버전으로 덮어쓰기 (확인)",
+                value=False,
+                key="confirm_github_overwrite",
+                help="체크하지 않으면 강제 재동기화를 실행할 수 없습니다. "
+                     "로컬에만 있는 미백업 데이터는 사라질 수 있습니다.",
+            )
+            if st.button(
+                "🔄 GitHub 데이터 강제 재동기화",
+                use_container_width=True,
+                disabled=not st.session_state.get("confirm_github_overwrite", False),
+            ):
                 with st.spinner("GitHub → 로컬 전체 동기화 중..."):
                     excel_ok, reg_ok = sync_all_from_github()
                 if excel_ok is True or reg_ok is True:
-                    # 하나 이상 성공적으로 다운로드됨
-                    st.session_state.github_synced = False
-                    st.toast("✅ 동기화 완료 — 최신 데이터가 복원됩니다.")
+                    _invalidate_patent_count_cache()
+                    st.session_state.github_synced = True
+                    st.session_state.confirm_github_overwrite = False
+                    st.toast("✅ 동기화 완료 — 최신 GitHub 데이터가 로컬에 반영되었습니다.")
                     st.rerun()
                 elif excel_ok is False or reg_ok is False:
                     # 실제 연결/인증 오류
@@ -1905,9 +1996,10 @@ def run_main_portal():
                     try:
                         preview_bytes = uploaded_file.read()
                         uploaded_file.seek(0)
-                        preview_df    = pd.read_excel(io.BytesIO(preview_bytes), nrows=3)
-                        detected_cols = _detect_columns(preview_df)
-                        total_rows    = pd.read_excel(io.BytesIO(preview_bytes)).shape[0]
+                        full_df       = pd.read_excel(io.BytesIO(preview_bytes))
+                        preview_df    = full_df.head(3)
+                        detected_cols = _detect_columns(full_df)
+                        total_rows    = len(full_df)
                         uploaded_file.seek(0)
 
                         with st.expander("📋 업로드 파일 열 감지 결과 (클릭 확인)", expanded=True):
@@ -1924,7 +2016,8 @@ def run_main_portal():
                         )
 
                     total_now = safe_count(collection)
-                    master_now = _count_master_excel_patents()
+                    _invalidate_patent_count_cache()
+                    master_now = _count_master_excel_patents(force=True)
                     summary = (
                         f"📊 처리 결과: Chroma 신규 **{chroma_new}건** / 마스터 신규 **{master_new}건** / "
                         f"이미 색인됨 **{dup}건** / ChromaDB 총 **{total_now}건**"
@@ -2005,12 +2098,25 @@ def run_main_portal():
                     ):
                         exported, before_n, after_n = sync_master_from_chroma(collection)
                     if exported > 0:
+                        _invalidate_patent_count_cache()
+                        backup_msg = ""
+                        with st.spinner("💾 GitHub 마스터 자동 백업 중..."):
+                            github_ok = upload_file_to_github_api(
+                                MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx"
+                            )
+                        if github_ok:
+                            backup_msg = "  \n✅ GitHub 마스터 백업 자동 완료"
+                        else:
+                            backup_msg = (
+                                "  \n⚠️ GitHub 자동 백업 실패 — "
+                                "**💾 GitHub 마스터 백업 재시도** 버튼을 실행하세요."
+                            )
                         st.session_state.sync_feedback = {
-                            "level": "success",
+                            "level": "success" if github_ok else "warning",
                             "message": (
                                 f"✅ 역동기화 완료: Chroma **{exported}건** 반영 → "
-                                f"마스터 **{before_n} → {after_n}건** (ChromaDB는 그대로 유지)  \n"
-                                f"💾 **GitHub 마스터 백업**을 실행해 영속화하세요."
+                                f"마스터 **{before_n} → {after_n}건** (ChromaDB는 그대로 유지)"
+                                f"{backup_msg}"
                             ),
                         }
                         st.rerun()
@@ -2021,12 +2127,21 @@ def run_main_portal():
                         }
                         st.rerun()
 
-            if master_n is not None and master_n > chroma_n:
+            needs_gap_sync = (
+                master_n is not None
+                and unique_patent_n > 0
+                and master_n > unique_patent_n
+            )
+            if needs_gap_sync:
                 if st.button("🔧 ChromaDB 누락분 복구 (마스터 엑셀 기준)", use_container_width=True):
-                    gap = master_n - chroma_n
-                    with st.spinner(f"마스터 엑셀 → ChromaDB 누락분 복구 중 (약 {gap}건)..."):
+                    gap = master_n - unique_patent_n
+                    with st.spinner(
+                        f"마스터 엑셀 → ChromaDB 누락분 복구 중 "
+                        f"(Chroma 고유 {unique_patent_n}→{master_n}, 약 {gap}건)..."
+                    ):
                         synced = sync_chroma_missing_from_master(collection)
                     st.session_state._last_chroma_count = safe_count(collection)
+                    _invalidate_patent_count_cache()
                     if synced > 0:
                         st.session_state.sync_feedback = {
                             "level": "success",
@@ -2051,7 +2166,8 @@ def run_main_portal():
                             MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx"
                         )
                     if ok:
-                        master_now = _count_master_excel_patents()
+                        _invalidate_patent_count_cache()
+                        master_now = _count_master_excel_patents(force=True)
                         st.session_state.sync_feedback = {
                             "level": "success",
                             "message": (
@@ -2096,6 +2212,8 @@ def run_main_portal():
 
                         st.session_state.sync_feedback = None
                         st.session_state.upload_feedback = None
+                        _invalidate_patent_count_cache()
+                        st.session_state._last_chroma_count = 0
 
                         # github_synced = True: 포맷 직후 리런에서 GitHub 재다운로드 방지
                         # (이전에 False로 설정 시 GitHub의 기존 데이터가 즉시 복원되는 문제 해결)
@@ -2118,10 +2236,6 @@ def run_main_portal():
             if not registry:
                 st.caption("등록된 일반 회원 없음")
             else:
-                # 변경 상태를 session_state에 누적 후 한 번에 저장
-                if "registry_dirty" not in st.session_state:
-                    st.session_state.registry_dirty = False
-
                 updated_registry = dict(registry)
                 for uid, info in registry.items():
                     is_active   = info.get("active", True)
