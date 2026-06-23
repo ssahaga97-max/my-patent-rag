@@ -306,6 +306,124 @@ def _year_counts_table(series: pd.Series) -> tuple[pd.DataFrame, str]:
     return df, "\n".join(lines)
 
 
+def _extract_year_filter_from_query(query: str) -> tuple[int | None, int | None]:
+    """질의문에서 출원연도 필터 추출. (min_year, max_year) — max_year None이면 상한 없음."""
+    min_y, max_y = None, None
+
+    m = re.search(r"(\d{4})\s*년?\s*[~\-–]\s*(\d{4})\s*년?", query)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    for pat in (
+        r"(\d{4})\s*년?\s*(이후|부터|이상)",
+        r"(\d{4})\s*년?\s*~\s*(현재|지금|now)",
+        r"after\s*(\d{4})",
+        r"since\s*(\d{4})",
+    ):
+        m = re.search(pat, query, re.IGNORECASE)
+        if m:
+            min_y = int(m.group(1))
+            break
+
+    m = re.search(r"(\d{4})\s*년?\s*(이전|까지|미만)", query)
+    if m:
+        max_y = int(m.group(1))
+
+    return min_y, max_y
+
+
+def _wants_applicant_cohort(query: str) -> bool:
+    """출원인별·경쟁사별 코호트 분석 의도 감지."""
+    q = query.lower()
+    keywords = (
+        "출원인별", "출원인 별", "권리자별", "회사별", "경쟁사별", "업체별",
+        "applicant", "by applicant", "출원인마다", "출원인 마다", "각 출원인",
+    )
+    if any(k in q for k in keywords):
+        return True
+    return "각각" in query and "출원인" in query
+
+
+def _filter_metadata_df_by_year(
+    df: pd.DataFrame, min_year: int | None, max_year: int | None = None
+) -> pd.DataFrame:
+    """메타데이터 DataFrame을 출원연도 범위로 필터."""
+    if min_year is None and max_year is None:
+        return df
+    if "출원일" not in df.columns:
+        return df
+    years = pd.to_numeric(df["출원일"].astype(str).str[:4], errors="coerce")
+    mask = years.notna()
+    if min_year is not None:
+        mask &= years >= min_year
+    if max_year is not None:
+        mask &= years <= max_year
+    return df[mask].copy()
+
+
+def _metadata_df_with_applicant_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """복수 출원인(구분자) 행을 출원인 단위로 펼침."""
+    records: list[dict] = []
+    for _, row in df.iterrows():
+        apps = _explode_multi_values(row.get("출원인", ""), allow_comma=False)
+        if not apps:
+            canon = _canonical_applicant_name(row.get("출원인", ""))
+            apps = [canon] if canon else []
+        else:
+            apps = [c for a in apps if (c := _canonical_applicant_name(a))]
+        if not apps:
+            apps = ["미기재"]
+        for app in apps:
+            rec = row.to_dict()
+            rec["_대표출원인"] = app
+            records.append(rec)
+    return pd.DataFrame(records) if records else pd.DataFrame()
+
+
+def _build_applicant_cohort_context(
+    df: pd.DataFrame,
+    max_applicants: int = 25,
+    titles_per: int = 15,
+    ipc_per: int = 8,
+) -> tuple[str, pd.DataFrame]:
+    """
+    필터된 메타데이터에서 출원인별 IPC·특허명 코호트 요약 생성.
+    RAG 10건 제한 없이 전체(필터 범위) 집계 데이터를 LLM에 전달.
+    """
+    exploded = _metadata_df_with_applicant_rows(df)
+    if exploded.empty:
+        return "(조건에 맞는 데이터 없음)", pd.DataFrame(columns=["출원인(대표명)", "특허건수"])
+
+    parts: list[str] = []
+    summary_rows: list[dict] = []
+    app_counts = exploded["_대표출원인"].value_counts()
+
+    for app, cnt in app_counts.head(max_applicants).items():
+        sub = exploded[exploded["_대표출원인"] == app]
+        _, ipc_md = _top_counts_table(
+            sub.get("IPC", pd.Series(dtype=str)),
+            n=ipc_per,
+            label="IPC",
+            explode=True,
+            allow_comma=True,
+        )
+        titles = [
+            str(t).strip()
+            for t in sub.get("명칭", pd.Series(dtype=str))
+            if str(t).strip() not in ("", "없음", "정보없음", "nan", "none")
+        ][:titles_per]
+        title_block = "\n".join(f"  - {t}" for t in titles) if titles else "  - (명칭 없음)"
+
+        parts.append(
+            f"#### {app} — {int(cnt)}건\n"
+            f"주요 IPC:\n{ipc_md}\n"
+            f"대표 특허명 ({len(titles)}건):\n{title_block}\n"
+        )
+        summary_rows.append({"출원인(대표명)": app, "특허건수": int(cnt)})
+
+    return "\n".join(parts), pd.DataFrame(summary_rows)
+
+
 # ==========================================
 # GitHub API
 # ==========================================
@@ -1954,7 +2072,10 @@ def run_main_portal():
         "💡 단순 키워드 매칭 및 특허 검색": "검색하고자 하는 핵심 키워드들을 입력하세요. (예: 카세트 도어 잠금장치)",
         "🔬 특정 기술 관련 심층 특허 분석": "동향을 파악할 타겟 기술이나 모듈명을 입력하세요. (예: 센서 기반 매체 지폐 잼 장애 예측 알고리즘)",
         "🛡 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
-        "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": "통계 요약을 보고 싶은 조건이나 '전체 통계 요약해줘'라고 입력하세요."
+        "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": (
+            "조건·질의 예: '2021년 이후 출원된 특허의 출원인별로 각각 중점적으로 개발한 기술 분석' "
+            "(연도·출원인별 코호트 전체 집계 — 10건 제한 없음)"
+        )
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
 
@@ -1964,6 +2085,10 @@ def run_main_portal():
             "🔢 3단계: 참조할 관련 특허 수",
             min_value=3, max_value=20, value=default_n, step=1,
             help="AI가 분석에 참조할 최대 특허 건수입니다. Groq API 입력 한도(6,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다."
+        )
+        st.caption(
+            "💡 **출원연도·출원인별 전체 동향** 분석(예: '2021년 이후 출원인별 기술')은 "
+            "위 **📊 통계조사 모드**를 선택하세요. 10~20건 제한 없이 DB 전체를 집계합니다."
         )
     else:
         n_results_user = 10  # 통계 모드는 슬라이더 불필요 (전체 데이터 집계)
@@ -1989,32 +2114,56 @@ def run_main_portal():
 
                     stats_df = pd.DataFrame(all_metas)
 
+                    min_year, max_year = _extract_year_filter_from_query(user_query)
+                    use_year_filter = min_year is not None or max_year is not None
+                    analysis_df = (
+                        _filter_metadata_df_by_year(stats_df, min_year, max_year)
+                        if use_year_filter else stats_df
+                    )
+                    filtered_count = len(analysis_df)
+                    cohort_mode = _wants_applicant_cohort(user_query) or (
+                        use_year_filter and filtered_count > 0
+                    )
+
+                    if use_year_filter:
+                        yr_label = f"{min_year or '…'}년 ~ {max_year or '현재'}"
+                        st.info(
+                            f"📅 질의에서 추출한 출원일 조건: **{yr_label}** → "
+                            f"**{filtered_count}건** / 전체 {total_count}건"
+                        )
+                        if filtered_count == 0:
+                            st.warning("조건에 맞는 특허가 없습니다. 연도 표현을 확인해 주세요.")
+                            st.stop()
+
                     applicant_df, applicant_stat = _top_counts_table(
-                        stats_df.get("출원인", pd.Series(dtype=str)),
+                        analysis_df.get("출원인", pd.Series(dtype=str)),
                         n=15,
                         label="출원인(대표명)",
                         normalizer=_canonical_applicant_name,
                         explode=True,
                     )
                     ipc_df, ipc_stat = _top_counts_table(
-                        stats_df.get("IPC", pd.Series(dtype=str)),
+                        analysis_df.get("IPC", pd.Series(dtype=str)),
                         n=10,
                         label="IPC",
                         explode=True,
                         allow_comma=True,
                     )
                     inventor_df, inventor_stat = _top_counts_table(
-                        stats_df.get("발명자", pd.Series(dtype=str)),
+                        analysis_df.get("발명자", pd.Series(dtype=str)),
                         n=10,
                         label="발명자",
                         explode=True,
                         allow_comma=True,
                     )
                     year_df, year_stat = _year_counts_table(
-                        stats_df.get("출원일", pd.Series(dtype=str))
+                        analysis_df.get("출원일", pd.Series(dtype=str))
                     )
 
-                    st.markdown("### 📊 사전 집계 통계 (경쟁사 대표명·복수값 분리 반영)")
+                    scope_label = (
+                        f"조건 필터 ({filtered_count}건)" if use_year_filter else "전체 DB"
+                    )
+                    st.markdown(f"### 📊 사전 집계 통계 ({scope_label})")
                     stat_col1, stat_col2 = st.columns(2)
                     with stat_col1:
                         st.markdown("**출원인별 (대표명 통합)**")
@@ -2027,8 +2176,25 @@ def run_main_portal():
                         st.markdown("**출원 연도별**")
                         st.dataframe(year_df, use_container_width=True, hide_index=True)
 
-                    context_text = f"""[전체 DB 통계 요약] 총 {total_count}건
-※ 출원인은 경쟁사 대표명으로 통합·표기 차이 병합됨. 발명자·IPC는 복수값 분리 후 집계.
+                    cohort_md = ""
+                    if cohort_mode:
+                        cohort_md, cohort_df = _build_applicant_cohort_context(analysis_df)
+                        st.markdown("### 🏢 출원인별 기술 코호트 (전체 집계 · 10건 제한 없음)")
+                        st.caption(
+                            "각 출원인의 필터 범위 내 **전체 특허명·IPC**를 집계했습니다. "
+                            "AI는 아래 코호트 전체를 기준으로 기술 동향을 분석합니다."
+                        )
+                        st.dataframe(cohort_df, use_container_width=True, hide_index=True)
+
+                    filter_note = ""
+                    if use_year_filter:
+                        filter_note = (
+                            f"※ 분석 대상: 출원일 {min_year or '…'}년~{max_year or '현재'} "
+                            f"({filtered_count}건 / 전체 {total_count}건)\n"
+                        )
+
+                    context_text = f"""[DB 통계 요약] {filter_note}분석 범위 내 {filtered_count if use_year_filter else total_count}건
+※ 출원인은 경쟁사 대표명으로 통합. 발명자·IPC는 복수값 분리 후 집계.
 
 ■ 출원인별 상위 현황 (대표명)
 {applicant_stat}
@@ -2042,20 +2208,36 @@ def run_main_portal():
 ■ 출원 연도별 건수 추이
 {year_stat}
 """
-                    # 질의 관련 시맨틱 매칭 상위 특허도 추가
-                    sem_results = collection.query(
-                        query_texts=[user_query.strip()],
-                        n_results=min(total_count, 10)
-                    )
-                    if sem_results and sem_results["documents"][0]:
-                        context_text += "\n■ 질의 관련 시맨틱 매칭 상위 특허\n"
-                        for i, m in enumerate(sem_results["metadatas"][0]):
-                            context_text += f"  [{i+1}] {m.get('출원번호','')} | {m.get('명칭','')} | {m.get('출원인','')}\n"
+                    if cohort_md:
+                        context_text += (
+                            f"\n■ 출원인별 기술 코호트 (필터 범위 전체 — 샘플 10건 아님)\n"
+                            f"{cohort_md}\n"
+                        )
+                    elif not cohort_mode:
+                        sem_results = collection.query(
+                            query_texts=[user_query.strip()],
+                            n_results=min(filtered_count if use_year_filter else total_count, 10),
+                        )
+                        if sem_results and sem_results["documents"][0]:
+                            context_text += "\n■ 질의 관련 시맨틱 매칭 상위 특허\n"
+                            for i, m in enumerate(sem_results["metadatas"][0]):
+                                context_text += (
+                                    f"  [{i+1}] {m.get('출원번호','')} | "
+                                    f"{m.get('명칭','')} | {m.get('출원인','')}\n"
+                                )
 
                     system_prompt = (
                         "당신은 특허 데이터 통계 전문 분석가입니다. "
                         "아래 집계 표의 숫자(건수)는 이미 확정된 값이므로 변경·재계산·추정하지 말고 그대로 인용하세요. "
                         "출원인은 경쟁사 대표명으로 통합된 결과입니다. "
+                    )
+                    if cohort_md:
+                        system_prompt += (
+                            "'출원인별 기술 코호트' 섹션에 각 출원인의 **필터 범위 내 전체 특허명·IPC**가 포함되어 있습니다. "
+                            "10건 샘플이 아닌 코호트 전체를 근거로, 출원인별로 중점 개발 기술·기술 포트폴리오·IPC 기반 기술 분야를 "
+                            "구체적으로 비교 분석하세요. "
+                        )
+                    system_prompt += (
                         "마크다운 표를 작성할 때 반드시 '항목/출원인/발명자/IPC/연도' 열과 '건수' 열을 구분하고, "
                         "건수 열에는 숫자만 넣으세요. "
                         "집계 통계를 기반으로 출원 동향, 핵심 출원인, 기술 분야 분포를 "
