@@ -553,7 +553,7 @@ def check_authentication():
 # 모듈 레벨 ChromaDB 클라이언트 싱글톤.
 # _build_infra.clear() 호출 후에도 이 참조는 살아 있어 동일 인스턴스를 재사용.
 # → ChromaDB 내부 _identifiers_to_system 레지스트리 충돌(ValueError) 원천 차단.
-_CHROMA_CLIENT: chromadb.EphemeralClient | None = None
+_CHROMA_CLIENT = None  # chromadb EphemeralClient 인스턴스 (모듈 레벨 싱글톤)
 
 
 @st.cache_resource
