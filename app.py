@@ -38,6 +38,12 @@ if "is_admin" not in st.session_state:
 # 프로세스 재시작 감지용 플래그 — @st.cache_resource가 초기화되면 항상 True
 if "github_synced" not in st.session_state:
     st.session_state.github_synced = False
+if "upload_feedback" not in st.session_state:
+    st.session_state.upload_feedback = None
+if "auto_reindex_attempted" not in st.session_state:
+    st.session_state.auto_reindex_attempted = False
+if "_last_chroma_count" not in st.session_state:
+    st.session_state._last_chroma_count = 0
 
 
 # ==========================================
@@ -50,6 +56,29 @@ def _clean_ascii(value: str) -> str:
 
 def _hash_pw(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _normalize_patent_id(value) -> str:
+    """
+    출원번호를 ChromaDB id용 문자열로 통일.
+    Excel float/지수표기(1.02E+12)·하이픈·'.0' 접미사를 정규화해 중복 id 방지.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, float):
+        if value == int(value):
+            return str(int(value))
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    if s.endswith(".0") and s[:-2].replace(".", "", 1).isdigit():
+        s = s[:-2]
+    try:
+        if "e" in s.lower():
+            return str(int(float(s)))
+    except (ValueError, OverflowError):
+        pass
+    return s.replace("-", "").strip()
 
 
 # ==========================================
@@ -621,13 +650,15 @@ def load_permanent_infra_singleton():
 def safe_count(collection) -> int:
     """
     collection.count()를 안전하게 호출.
-    SQLite 오류 발생 시 0을 반환하여 앱 크래시 방지.
+    일시 오류 시 0 대신 마지막 정상 값을 반환 — 0이면 자동 재인덱싱이 오작동함.
     """
     try:
-        return collection.count()
+        n = collection.count()
+        st.session_state._last_chroma_count = n
+        return n
     except Exception as e:
         print(f"[ChromaDB safe_count 오류] {e}")
-        return 0
+        return st.session_state.get("_last_chroma_count", 0)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -843,20 +874,43 @@ def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str)
 
 
 # --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
+def _find_column(col_map: dict, *keywords: str) -> str | None:
+    """col_map(대문자 키)에서 keywords 순서대로 첫 매칭 컬럼명 반환."""
+    for kw in keywords:
+        for k, v in col_map.items():
+            if kw in k:
+                return v
+    return None
+
+
 def _detect_columns(df: pd.DataFrame) -> dict:
     """DataFrame 컬럼명을 분석해 각 필드에 해당하는 실제 컬럼명 반환."""
     col_map = {str(c).strip().replace(" ", "").upper(): c for c in df.columns}
+
+    # 출원번호: '공개번호'/'등록번호' 등 '번호'만 포함된 열을 먼저 잡지 않도록 우선순위 지정
+    id_col = (
+        _find_column(col_map, "출원번호", "APPLICATIONNO", "APPNO", "APPLNO")
+        or _find_column(col_map, "특허번호", "PATENTNO")
+    )
+    if not id_col:
+        for k, v in col_map.items():
+            if "번호" in k and not any(x in k for x in ("공개", "등록", "연번", "일련", "SEQ")):
+                id_col = v
+                break
+    if not id_col:
+        id_col = df.columns[0]
+
     return {
-        "id":        next((v for k, v in col_map.items() if "출원번호" in k or "번호" in k), df.columns[0]),
-        "title":     next((v for k, v in col_map.items() if "명칭" in k or "제목" in k or "특허명" in k), None),
-        "abstract":  next((v for k, v in col_map.items() if "요약" in k or "초록" in k), None),
-        "claims":    next((v for k, v in col_map.items() if "청구" in k or "범위" in k or "청구항" in k), None),
-        "app_date":  next((v for k, v in col_map.items() if "출원일" in k or "출원일자" in k), None),
-        "reg_date":  next((v for k, v in col_map.items() if "등록일" in k or "등록일자" in k), None),
-        "ipc":       next((v for k, v in col_map.items() if "IPC" in k), None),
-        "cpc":       next((v for k, v in col_map.items() if "CPC" in k), None),
-        "inventor":  next((v for k, v in col_map.items() if "발명자" in k or "발명인" in k), None),
-        "applicant": next((v for k, v in col_map.items() if "출원인" in k or "권리자" in k), None),
+        "id":        id_col,
+        "title":     _find_column(col_map, "명칭", "제목", "특허명", "INVENTIONTITLE") or None,
+        "abstract":  _find_column(col_map, "요약", "초록", "ABSTRACT") or None,
+        "claims":    _find_column(col_map, "청구항", "청구", "범위", "CLAIM") or None,
+        "app_date":  _find_column(col_map, "출원일", "출원일자", "APPDATE", "FILINGDATE") or None,
+        "reg_date":  _find_column(col_map, "등록일", "등록일자", "REGDATE") or None,
+        "ipc":       _find_column(col_map, "IPC") or None,
+        "cpc":       _find_column(col_map, "CPC") or None,
+        "inventor":  _find_column(col_map, "발명자", "발명인", "INVENTOR") or None,
+        "applicant": _find_column(col_map, "출원인", "권리자", "APPLICANT", "ASSIGNEE") or None,
     }
 
 
@@ -897,6 +951,24 @@ def _build_document(row, cols: dict) -> str:
     return f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
 
 
+def _count_master_excel_patents() -> int | None:
+    """마스터 엑셀의 고유 출원번호 건수. 파일 없으면 None."""
+    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
+        return None
+    try:
+        df   = pd.read_excel(MASTER_EXCEL_PATH)
+        cols = _detect_columns(df)
+        ids  = {
+            _normalize_patent_id(v)
+            for v in df[cols["id"]]
+            if _normalize_patent_id(v)
+        }
+        return len(ids)
+    except Exception as e:
+        print(f"[마스터 엑셀 건수 조회 오류] {e}")
+        return None
+
+
 def extract_excel_hyperlinks(uploaded_file):
     link_dict = {}
     try:
@@ -926,8 +998,8 @@ def reindex_from_master_excel(collection) -> int:
 
         ids, docs, metas = [], [], []
         for _, row in df.iterrows():
-            pat_id = str(row[cols["id"]]).replace("-", "").strip()
-            if not pat_id or pat_id == "nan":
+            pat_id = _normalize_patent_id(row[cols["id"]])
+            if not pat_id:
                 continue
             ids.append(pat_id)
             docs.append(_build_document(row, cols))
@@ -954,16 +1026,19 @@ def process_and_update_db(uploaded_file, collection):
         new_df = pd.read_excel(io.BytesIO(file_bytes))
     except Exception as e:
         st.error(f"엑셀 파일 로드 실패: {e}")
-        return 0, 0
+        return 0, 0, 0
 
     cols = _detect_columns(new_df)
 
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
         try:
-            master_df        = pd.read_excel(MASTER_EXCEL_PATH)
-            existing_numbers = set(
-                master_df[cols["id"]].astype(str).str.replace("-", "").str.strip().tolist()
-            )
+            master_df  = pd.read_excel(MASTER_EXCEL_PATH)
+            master_cols = _detect_columns(master_df)
+            existing_numbers = {
+                _normalize_patent_id(v)
+                for v in master_df[master_cols["id"]]
+                if _normalize_patent_id(v)
+            }
         except Exception:
             master_df        = pd.DataFrame(columns=new_df.columns)
             existing_numbers = set()
@@ -973,10 +1048,12 @@ def process_and_update_db(uploaded_file, collection):
 
     new_records     = []
     duplicate_count = 0
+    skipped_empty   = 0
 
     for _, row in new_df.iterrows():
-        current_number = str(row[cols["id"]]).replace("-", "").strip()
-        if not current_number or current_number == "nan":
+        current_number = _normalize_patent_id(row[cols["id"]])
+        if not current_number:
+            skipped_empty += 1
             continue
         if current_number in existing_numbers:
             duplicate_count += 1
@@ -985,7 +1062,7 @@ def process_and_update_db(uploaded_file, collection):
         existing_numbers.add(current_number)
 
     if not new_records:
-        return 0, duplicate_count
+        return 0, duplicate_count, skipped_empty
 
     added_df = pd.DataFrame(new_records)
     updated_master_df = added_df if master_df.empty else pd.concat([master_df, added_df], ignore_index=True)
@@ -993,7 +1070,7 @@ def process_and_update_db(uploaded_file, collection):
 
     batch_ids, batch_docs, batch_metas = [], [], []
     for _, row in added_df.iterrows():
-        doc_id = str(row[cols["id"]]).replace("-", "").strip()
+        doc_id = _normalize_patent_id(row[cols["id"]])
 
         patent_url = hyperlink_map.get(doc_id, "")
         if not patent_url and cols["title"]:
@@ -1011,7 +1088,7 @@ def process_and_update_db(uploaded_file, collection):
             documents=batch_docs[i:i+BATCH],
             metadatas=batch_metas[i:i+BATCH]
         )
-    return len(new_records), duplicate_count
+    return len(new_records), duplicate_count, skipped_empty
 
 
 # --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
@@ -1038,11 +1115,19 @@ def run_main_portal():
         st.session_state.github_synced = True
         # 엑셀 복원 여부와 무관하게 재인덱싱은 아래 조건에서 처리
 
-    # ChromaDB가 비어 있으면(재시작) 엑셀 기반 자동 재인덱싱
-    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0 and safe_count(collection) == 0:
+    # ChromaDB가 비어 있으면(재시작) 엑셀 기반 자동 재인덱싱 — 세션당 1회만
+    chroma_n = safe_count(collection)
+    master_n = _count_master_excel_patents()
+    if (
+        master_n
+        and chroma_n == 0
+        and not st.session_state.auto_reindex_attempted
+    ):
+        st.session_state.auto_reindex_attempted = True
         try:
             with st.spinner("📦 벡터 DB 자동 재인덱싱 중... (특허 수에 따라 1~3분 소요)"):
                 restored = reindex_from_master_excel(collection)
+            st.session_state._last_chroma_count = safe_count(collection)
             st.toast(f"✅ 벡터 DB 복원 완료 ({restored}건)")
         except Exception as e:
             st.warning(f"자동 재인덱싱 오류: {e}")
@@ -1057,7 +1142,11 @@ def run_main_portal():
     with col_title:
         st.title("AI 경쟁사 특허 조사 분석")
         mode_label = "🔧 관리자" if is_admin else "👤 사용자"
-        st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | 적재 특허: {safe_count(collection)}건")
+        master_n = _count_master_excel_patents()
+        count_line = f"적재 특허(ChromaDB): {safe_count(collection)}건"
+        if master_n is not None:
+            count_line += f" | 마스터 엑셀: {master_n}건"
+        st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | {count_line}")
     with col_logout:
         if st.button("🔒 로그아웃"):
             st.session_state.logged_in   = False
@@ -1112,6 +1201,7 @@ def run_main_portal():
                             language="toml"
                         )
             st.divider()
+
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
             if uploaded_file is not None:
                 if st.button("🚀 신규 특허 무결성 적재"):
@@ -1132,25 +1222,75 @@ def run_main_portal():
                         st.warning(f"파일 사전 진단 실패: {diag_e}")
 
                     with st.spinner("중복 제거 및 실시간 인덱싱 중..."):
-                        added, dup = process_and_update_db(uploaded_file, collection)
+                        added, dup, skipped = process_and_update_db(uploaded_file, collection)
 
-                    st.info(f"📊 처리 결과: 신규 **{added}건** 추가 / 중복 제외 **{dup}건** / DB 총 **{safe_count(collection)}건**")
+                    total_now = safe_count(collection)
+                    summary = (
+                        f"📊 처리 결과: 신규 **{added}건** 추가 / 중복 제외 **{dup}건** / "
+                        f"DB 총 **{total_now}건**"
+                    )
+                    if skipped:
+                        summary += f" / 출원번호 없음 **{skipped}건** 스킵"
 
+                    github_ok = None
                     if added > 0:
                         with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중... (대용량 파일은 최대 2분 소요)"):
                             github_ok = commit_and_push_data()
                         if github_ok:
-                            st.success(f"✅ 완료! 신규 {added}건 인덱싱 및 GitHub 백업 성공 — 재시작 후에도 데이터가 보존됩니다.")
+                            st.session_state.upload_feedback = {
+                                "level": "success",
+                                "message": (
+                                    f"{summary}\n\n"
+                                    f"✅ 신규 {added}건 인덱싱 및 GitHub 백업 성공 — 재시작 후에도 데이터가 보존됩니다."
+                                ),
+                            }
+                            st.toast(f"✅ 신규 {added}건 적재 완료 (DB 총 {total_now}건)")
                         else:
-                            st.warning(f"⚠️ 신규 {added}건이 ChromaDB에 인덱싱되었으나 GitHub 백업 실패. 위 오류 메시지를 확인하세요.")
+                            st.session_state.upload_feedback = {
+                                "level": "warning",
+                                "message": (
+                                    f"{summary}\n\n"
+                                    f"⚠️ ChromaDB 인덱싱은 완료되었으나 GitHub 백업 실패. "
+                                    f"'💾 GitHub 마스터 백업 재시도' 버튼으로 다시 업로드하세요."
+                                ),
+                            }
                     elif dup > 0:
-                        st.warning(f"⚠️ 업로드한 파일의 특허 {dup}건이 이미 DB에 존재합니다. 새로운 데이터가 없습니다.")
+                        st.session_state.upload_feedback = {
+                            "level": "warning",
+                            "message": (
+                                f"{summary}\n\n"
+                                f"⚠️ 업로드 파일의 특허가 이미 DB에 존재합니다. 새로운 데이터가 없습니다."
+                            ),
+                        }
                     else:
-                        st.error("❌ 처리된 데이터가 없습니다. 위 열 감지 결과에서 '출원번호' 열이 올바르게 감지됐는지 확인하세요.")
-                    st.rerun()
+                        st.session_state.upload_feedback = {
+                            "level": "error",
+                            "message": (
+                                f"{summary}\n\n"
+                                f"❌ 처리된 데이터가 없습니다. 열 감지 결과에서 '출원번호' 열이 올바른지 확인하세요."
+                            ),
+                        }
+
+            if st.session_state.upload_feedback:
+                fb = st.session_state.upload_feedback
+                if fb["level"] == "success":
+                    st.success(fb["message"])
+                elif fb["level"] == "warning":
+                    st.warning(fb["message"])
+                elif fb["level"] == "error":
+                    st.error(fb["message"])
+                else:
+                    st.info(fb["message"])
 
             st.divider()
-            st.markdown(f"📊 **누적 적재 데이터:** `{safe_count(collection)}` 건")
+            chroma_n = safe_count(collection)
+            master_n = _count_master_excel_patents()
+            count_md = f"📊 **누적 적재 데이터 (ChromaDB):** `{chroma_n}` 건"
+            if master_n is not None:
+                count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
+                if master_n != chroma_n:
+                    count_md += "  \n⚠️ ChromaDB와 마스터 엑셀 건수가 다릅니다. 재업로드 없이 맞추려면 컨테이너 재시작 후 자동 재인덱싱을 기다리세요."
+            st.markdown(count_md)
 
             if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
                 file_kb = os.path.getsize(MASTER_EXCEL_PATH) // 1024
