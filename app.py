@@ -1389,26 +1389,20 @@ def _render_feedback_box(feedback: dict | None) -> None:
 
 
 def _build_db_count_status(chroma_n: int, master_n: int | None, unique_patent_n: int) -> str:
-    """Chroma·마스터 건수 비교 상태 문구 (출원번호 canonical 기준)."""
+    """Chroma·마스터 건수 표시. 정상 동기화 시 건수만, 불일치 시에만 안내 문구."""
     count_md = f"📊 **누적 적재 데이터 (ChromaDB):** `{chroma_n}` 건"
     if master_n is None:
         return count_md
 
     count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
-    if unique_patent_n and unique_patent_n != chroma_n:
-        count_md += f"  \n🔑 **ChromaDB 고유 출원번호:** `{unique_patent_n}` 건"
 
+    # 고유 출원번호 일치 = 정상 — 추가 경고·안내 없이 건수만 표시
     if master_n == unique_patent_n:
-        count_md += (
-            f"  \n✅ 마스터 엑셀과 Chroma **고유 출원번호({master_n}건)** 가 일치합니다."
-        )
-        if chroma_n > unique_patent_n:
-            dup_docs = chroma_n - unique_patent_n
-            count_md += (
-                f"  \nℹ️ ChromaDB 문서 수에는 표기 차이로 인한 **중복 문서 {dup_docs}건**이 "
-                f"포함됩니다 (재시작·백업에는 고유 {master_n}건 기준 적용)."
-            )
         return count_md
+
+    # 불일치 시에만 상세·안내
+    if unique_patent_n:
+        count_md += f"  \n🔑 **ChromaDB 고유 출원번호:** `{unique_patent_n}` 건"
 
     if chroma_n > master_n:
         gap = unique_patent_n - master_n
@@ -1994,6 +1988,9 @@ def run_main_portal():
 
             if st.session_state.sync_feedback:
                 _render_feedback_box(st.session_state.sync_feedback)
+                if st.button("✕ 알림 닫기", key="dismiss_sync_feedback", use_container_width=True):
+                    st.session_state.sync_feedback = None
+                    st.rerun()
 
             needs_reverse_sync = (
                 master_n is not None
