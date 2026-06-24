@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import os
+
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 import io
 import re
 import chromadb
