@@ -23,8 +23,10 @@ try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+    from googleapiclient.errors import HttpError
     _GOOGLE_DRIVE_AVAILABLE = True
 except ImportError:
+    HttpError = Exception  # type: ignore
     _GOOGLE_DRIVE_AVAILABLE = False
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
@@ -846,12 +848,107 @@ def _get_gcp_credentials():
         pk = sa_info.get("private_key", "")
         if isinstance(pk, str) and "\\n" in pk and "-----BEGIN" in pk:
             sa_info["private_key"] = pk.replace("\\n", "\n")
-        return service_account.Credentials.from_service_account_info(
+        creds = service_account.Credentials.from_service_account_info(
             sa_info, scopes=_DRIVE_SCOPES
         )
+        # Workspace 도메인 위임(선택) — 개인 Gmail은 미지원
+        delegate = _clean_ascii(str(st.secrets.get("GOOGLE_DRIVE_DELEGATE_EMAIL", "")))
+        if delegate:
+            creds = creds.with_subject(delegate)
+        return creds
     except Exception as e:
         print(f"[GCP credentials 오류] {e}")
         return None
+
+
+def _drive_format_error(exc: Exception) -> str:
+    """Drive API HttpError → 사용자용 메시지."""
+    if isinstance(exc, HttpError):
+        detail = ""
+        try:
+            body = json.loads(exc.content.decode()) if exc.content else {}
+            for err in body.get("error", {}).get("errors", []):
+                detail = err.get("reason", "") or err.get("message", "")
+                if detail:
+                    break
+            if not detail:
+                detail = body.get("error", {}).get("message", "")
+        except Exception:
+            detail = ""
+        base = f"HTTP {exc.resp.status}"
+        if detail:
+            return f"{base} ({detail})"
+        return base
+    return str(exc)[:400]
+
+
+def _drive_folder_meta(service, folder_id: str) -> dict:
+    return service.files().get(
+        fileId=folder_id,
+        fields="id,name,mimeType,capabilities,driveId,owners",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def _drive_sa_permission_role(service, folder_id: str, client_email: str) -> str:
+    """폴더 permissions 목록에서 서비스 계정 역할 조회."""
+    if not client_email:
+        return "unknown"
+    try:
+        resp = service.permissions().list(
+            fileId=folder_id,
+            fields="permissions(emailAddress,role,type)",
+            supportsAllDrives=True,
+        ).execute()
+        for perm in resp.get("permissions", []):
+            if perm.get("emailAddress", "").lower() == client_email.lower():
+                return perm.get("role", "unknown")
+    except Exception:
+        pass
+    return "not_listed"
+
+
+def _drive_create_or_update_file(
+    service,
+    folder_id: str,
+    drive_filename: str,
+    local_file_path: str,
+    file_id: str | None,
+    *,
+    shared_drive: bool,
+) -> None:
+    """My Drive 공유 폴더 / 공유 드라이브 모두 대응하는 업로드."""
+    size = os.path.getsize(local_file_path)
+    media = MediaFileUpload(
+        local_file_path,
+        mimetype="application/octet-stream",
+        resumable=size > 5 * 1024 * 1024,
+    )
+    strategies: list[bool] = [True] if shared_drive else [False, True]
+
+    last_exc: Exception | None = None
+    for use_shared_drive_flag in strategies:
+        try:
+            if file_id:
+                kwargs: dict = {"fileId": file_id, "media_body": media}
+                if use_shared_drive_flag:
+                    kwargs["supportsAllDrives"] = True
+                service.files().update(**kwargs).execute()
+            else:
+                kwargs = {
+                    "body": {"name": drive_filename, "parents": [folder_id]},
+                    "media_body": media,
+                    "fields": "id",
+                }
+                if use_shared_drive_flag:
+                    kwargs["supportsAllDrives"] = True
+                service.files().create(**kwargs).execute()
+            return
+        except Exception as e:
+            last_exc = e
+            continue
+    if last_exc:
+        raise last_exc
 
 
 @st.cache_resource
@@ -889,36 +986,51 @@ def upload_file_to_drive(local_file_path: str, drive_filename: str) -> tuple[boo
     if not os.path.exists(local_file_path):
         return False, f"로컬 파일 없음: {local_file_path}"
     try:
+        sa_email = ""
+        try:
+            sa_email = st.secrets["gcp_service_account"].get("client_email", "")
+        except Exception:
+            pass
+
+        folder_meta = _drive_folder_meta(service, folder_id)
+        caps = folder_meta.get("capabilities", {})
+        shared_drive = bool(folder_meta.get("driveId"))
+
+        if not caps.get("canAddChildren", False):
+            return False, (
+                "폴더에 파일 추가 권한 없음 (canAddChildren=false). "
+                f"Drive → 폴더 공유 → 아래 이메일을 **편집자**로 추가하세요:\n"
+                f"`{sa_email}`"
+            )
+
         file_id = _find_drive_file_id(service, folder_id, drive_filename)
-        media = MediaFileUpload(
-            local_file_path,
-            mimetype="application/octet-stream",
-            resumable=True,
+        _drive_create_or_update_file(
+            service, folder_id, drive_filename, local_file_path, file_id,
+            shared_drive=shared_drive,
         )
-        if file_id:
-            service.files().update(
-                fileId=file_id,
-                media_body=media,
-                supportsAllDrives=True,
-            ).execute()
-        else:
-            service.files().create(
-                body={"name": drive_filename, "parents": [folder_id]},
-                media_body=media,
-                fields="id",
-                supportsAllDrives=True,
-            ).execute()
         size_kb = os.path.getsize(local_file_path) // 1024
         return True, f"{drive_filename} ({size_kb} KB)"
     except Exception as e:
-        err = str(e)
+        err = _drive_format_error(e)
         print(f"[Drive upload 오류] {drive_filename}: {e}")
-        if "storageQuotaExceeded" in err or "403" in err:
+        sa_email = ""
+        try:
+            sa_email = st.secrets["gcp_service_account"].get("client_email", "")
+        except Exception:
+            pass
+        if "storageQuota" in err or "storage quota" in err.lower():
             return False, (
-                f"{drive_filename} 업로드 실패: 저장 공간/권한(403). "
-                f"폴더를 서비스 계정에 '편집자'로 공유했는지 확인하세요."
+                f"{drive_filename} 업로드 실패: {err}\n"
+                "서비스 계정은 저장 용량이 없습니다. **내 Drive 폴더**를 서비스 계정에 "
+                f"**편집자**로 공유해야 합니다 (공유 대상: `{sa_email}`). "
+                "공유 드라이브(팀 드라이브) 멤버로 추가하는 방법도 있습니다."
             )
-        return False, f"{drive_filename} 업로드 실패: {err[:300]}"
+        if "403" in err or "forbidden" in err.lower():
+            return False, (
+                f"{drive_filename} 업로드 실패: {err}\n"
+                f"폴더 공유 대상 이메일이 정확한지 확인: `{sa_email}` (편집자)"
+            )
+        return False, f"{drive_filename} 업로드 실패: {err}"
 
 
 def download_file_from_drive(drive_filename: str, local_path: str):
@@ -960,6 +1072,10 @@ def diagnose_google_drive() -> dict:
         "snapshot_on_drive": False,
         "write_test_ok": False,
         "folder_name": "",
+        "can_add_children": False,
+        "sa_permission_role": "",
+        "is_shared_drive": False,
+        "write_test_detail": "",
         "error": "",
     }
     if not _GOOGLE_DRIVE_AVAILABLE:
@@ -991,15 +1107,19 @@ def diagnose_google_drive() -> dict:
     result["service_ok"] = True
 
     try:
-        # 폴더 자체 접근 가능 여부 (공유·ID 오류 조기 감지)
-        folder_meta = service.files().get(
-            fileId=folder_id,
-            fields="id,name,mimeType,capabilities",
-            supportsAllDrives=True,
-        ).execute()
+        folder_meta = _drive_folder_meta(service, folder_id)
         if folder_meta.get("mimeType") != "application/vnd.google-apps.folder":
             result["error"] = "GOOGLE_DRIVE_FOLDER_ID가 폴더가 아닙니다 (파일 ID일 수 있음)."
             return result
+
+        caps = folder_meta.get("capabilities", {})
+        result["folder_accessible"] = True
+        result["folder_name"] = folder_meta.get("name", "")
+        result["can_add_children"] = bool(caps.get("canAddChildren", False))
+        result["is_shared_drive"] = bool(folder_meta.get("driveId"))
+        result["sa_permission_role"] = _drive_sa_permission_role(
+            service, folder_id, result["client_email"]
+        )
 
         resp = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
@@ -1009,12 +1129,9 @@ def diagnose_google_drive() -> dict:
             includeItemsFromAllDrives=True,
         ).execute()
         names = {f.get("name") for f in resp.get("files", [])}
-        result["folder_accessible"] = True
-        result["folder_name"] = folder_meta.get("name", "")
         result["manifest_on_drive"] = VECTOR_MANIFEST_FILENAME in names
         result["snapshot_on_drive"] = VECTOR_SNAPSHOT_FILENAME in names
 
-        # 소용량 테스트 업로드 (쓰기 권한 확인)
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
         ) as tf:
@@ -1023,8 +1140,9 @@ def diagnose_google_drive() -> dict:
         try:
             ok, msg = upload_file_to_drive(test_path, "_patentrag_write_test.txt")
             result["write_test_ok"] = ok
+            result["write_test_detail"] = msg
             if not ok:
-                result["error"] = f"폴더 읽기는 되나 업로드 실패: {msg}"
+                result["error"] = msg
         finally:
             try:
                 os.remove(test_path)
@@ -2537,17 +2655,37 @@ def run_main_portal():
                     write_line = (
                         "✅ 쓰기 테스트 통과"
                         if dd.get("write_test_ok")
-                        else "⚠️ 쓰기 테스트 실패 — 편집자 권한 확인"
+                        else "⚠️ 쓰기 테스트 실패"
                     )
+                    role = dd.get("sa_permission_role", "unknown")
+                    add_ok = "✅" if dd.get("can_add_children") else "❌"
                     st.success(
-                        f"✅ Drive 연결 정상\n\n"
+                        f"✅ Drive 폴더 읽기 정상\n\n"
                         f"- 폴더: `{dd.get('folder_name', '')}` (`{dd['folder_id']}`)\n"
+                        f"- 공유 드라이브: {'예' if dd.get('is_shared_drive') else '아니오 (내 Drive)'}\n"
                         f"- 서비스 계정: `{dd.get('client_email', '')}`\n"
+                        f"- 공유 역할(permissions): **{role}** (writer/contentmanager 필요)\n"
+                        f"- 파일 추가 권한(canAddChildren): {add_ok}\n"
                         f"- manifest: {'있음' if dd['manifest_on_drive'] else '없음'}\n"
                         f"- snapshot: {'있음' if dd['snapshot_on_drive'] else '없음'}\n"
                         f"- {write_line}"
                     )
-                    if dd.get("error"):
+                    if not dd.get("write_test_ok"):
+                        st.error(
+                            "**쓰기 실패 상세**\n\n"
+                            f"{dd.get('write_test_detail') or dd.get('error', '')}"
+                        )
+                        st.info(
+                            "**해결 체크리스트**\n"
+                            "1. Drive에서 `PatentRAG_VectorStore` 폴더 → **공유**\n"
+                            f"2. 위 **서비스 계정 이메일**을 **편집자**로 추가 (링크 공유만으로는 안 됨)\n"
+                            "3. 공유 후 1~2분 대기 후 진단 재실행\n"
+                            "4. (Google Workspace) **공유 드라이브**에 폴더를 만들고 "
+                            "서비스 계정을 **콘텐츠 관리자**로 추가하는 방법도 있습니다.\n"
+                            "5. (Workspace) 도메인 위임 사용 시 Secrets에 "
+                            "`GOOGLE_DRIVE_DELEGATE_EMAIL = \"본인@회사.com\"` 추가"
+                        )
+                    elif dd.get("error"):
                         st.warning(dd["error"])
                 else:
                     st.error(f"❌ Drive 연결 실패\n\n**원인:**\n{dd['error']}")
