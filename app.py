@@ -14,8 +14,10 @@ import openpyxl
 import json
 import base64
 import hashlib
+import hmac
 import smtplib
 import tempfile
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -24,15 +26,11 @@ from urllib.error import HTTPError
 
 try:
     from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-    from googleapiclient.errors import HttpError
     from google.cloud import storage as gcs_storage
-    _GOOGLE_DRIVE_AVAILABLE = True
+    _GCP_AVAILABLE = True
 except ImportError:
-    HttpError = Exception  # type: ignore
     gcs_storage = None  # type: ignore
-    _GOOGLE_DRIVE_AVAILABLE = False
+    _GCP_AVAILABLE = False
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,8 +75,11 @@ if "gap_sync_synced_session" not in st.session_state:
     st.session_state.gap_sync_synced_session = 0
 
 _PATENT_COUNT_CACHE_KEY = "_patent_count_cache"
+_STATS_METAS_CACHE_KEY = "_stats_metadatas_cache"
+_REGISTRY_REFRESH_TTL_SEC = 30
 # Streamlit 연결 타임아웃 방지 — 누락분 복구 시 1회 실행당 임베딩 건수
 _GAP_SYNC_CHUNK = 15
+_GAP_SYNC_MAX_BATCHES = 200
 
 
 # ==========================================
@@ -91,6 +92,20 @@ def _clean_ascii(value: str) -> str:
 
 def _hash_pw(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _is_sha256_hex(value: str) -> bool:
+    s = str(value or "").strip().lower()
+    return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+
+def _verify_password(plain: str, stored_hash: str) -> bool:
+    """타이밍 공격 완화 — stored_hash는 SHA-256 hex만 허용."""
+    if not plain or not stored_hash:
+        return False
+    if not _is_sha256_hex(stored_hash):
+        return False
+    return hmac.compare_digest(stored_hash.strip().lower(), _hash_pw(plain))
 
 
 def _normalize_patent_id(value) -> str:
@@ -723,12 +738,17 @@ def load_user_registry() -> dict:
     return {}
 
 
-def refresh_user_registry_from_github() -> dict:
-    """GitHub 최신 user_registry.json → 로컬 후 반환 (로그인·승인 직후 동기화)."""
+def refresh_user_registry_from_github(*, force: bool = False) -> dict:
+    """GitHub 최신 user_registry.json → 로컬 후 반환. TTL 내 재호출 시 로컬 캐시."""
+    now = time.time()
+    last = st.session_state.get("_registry_refresh_ts", 0.0)
+    if not force and (now - last) < _REGISTRY_REFRESH_TTL_SEC:
+        return load_user_registry()
     try:
         download_user_registry_from_github()
     except Exception as e:
         print(f"[회원 레지스트리 GitHub 동기화 스킵] {e}")
+    st.session_state["_registry_refresh_ts"] = now
     return load_user_registry()
 
 
@@ -819,416 +839,25 @@ def download_master_excel_from_github():
 
 
 # ==========================================
-# Google Drive API (벡터 스냅샷 영속화)
-# 개인 Gmail + 서비스 계정은 storageQuotaExceeded(403)가 자주 발생 → GCS 버킷 권장
+# Google Cloud (GCS 벡터 스냅샷)
 # ==========================================
-_GCP_SCOPES = (
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/devstorage.read_write",
-)
-
-
-def _drive_configured() -> bool:
-    """Secrets에 Drive 폴더 ID + gcp_service_account가 설정되어 있는지."""
-    if not _GOOGLE_DRIVE_AVAILABLE:
-        return False
-    try:
-        folder_id = _get_google_drive_folder_id()
-        return bool(folder_id and "gcp_service_account" in st.secrets)
-    except Exception:
-        return False
-
-
-def _parse_google_drive_folder_id(value: str) -> str | None:
-    """
-    Drive 폴더 ID 추출. Secrets에 URL 전체를 넣어도 ID만 사용.
-    예: https://drive.google.com/drive/folders/1abc... → 1abc...
-    """
-    raw = _clean_ascii(str(value or "")).strip()
-    if not raw:
-        return None
-    if "/" not in raw and "?" not in raw:
-        return raw
-    m = re.search(r"/folders/([^/?&#]+)", raw)
-    if m:
-        return m.group(1)
-    m = re.search(r"[?&]id=([^&]+)", raw)
-    if m:
-        return m.group(1)
-    return raw
-
-
-def _get_google_drive_folder_id() -> str | None:
-    try:
-        return _parse_google_drive_folder_id(st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", ""))
-    except Exception:
-        return None
+_GCP_SCOPES = ("https://www.googleapis.com/auth/devstorage.read_write",)
 
 
 def _get_gcp_credentials():
-    if not _GOOGLE_DRIVE_AVAILABLE:
+    if not _GCP_AVAILABLE:
         return None
     try:
         sa_info = dict(st.secrets["gcp_service_account"])
         pk = sa_info.get("private_key", "")
         if isinstance(pk, str) and "\\n" in pk and "-----BEGIN" in pk:
             sa_info["private_key"] = pk.replace("\\n", "\n")
-        creds = service_account.Credentials.from_service_account_info(
+        return service_account.Credentials.from_service_account_info(
             sa_info, scopes=_GCP_SCOPES
         )
-        # Workspace 도메인 위임(선택) — 개인 Gmail은 미지원
-        delegate = _clean_ascii(str(st.secrets.get("GOOGLE_DRIVE_DELEGATE_EMAIL", "")))
-        if delegate:
-            creds = creds.with_subject(delegate)
-        return creds
     except Exception as e:
         print(f"[GCP credentials 오류] {e}")
         return None
-
-
-def _drive_format_error(exc: Exception) -> str:
-    """Drive API HttpError → 사용자용 메시지."""
-    if isinstance(exc, HttpError):
-        detail = ""
-        try:
-            body = json.loads(exc.content.decode()) if exc.content else {}
-            for err in body.get("error", {}).get("errors", []):
-                detail = err.get("reason", "") or err.get("message", "")
-                if detail:
-                    break
-            if not detail:
-                detail = body.get("error", {}).get("message", "")
-        except Exception:
-            detail = ""
-        base = f"HTTP {exc.resp.status}"
-        if detail:
-            return f"{base} ({detail})"
-        return base
-    return str(exc)[:400]
-
-
-def _drive_folder_meta(service, folder_id: str) -> dict:
-    return service.files().get(
-        fileId=folder_id,
-        fields="id,name,mimeType,capabilities,driveId,owners",
-        supportsAllDrives=True,
-    ).execute()
-
-
-def _drive_sa_permission_role(service, folder_id: str, client_email: str) -> str:
-    """폴더 permissions 목록에서 서비스 계정 역할 조회."""
-    if not client_email:
-        return "unknown"
-    try:
-        resp = service.permissions().list(
-            fileId=folder_id,
-            fields="permissions(emailAddress,role,type)",
-            supportsAllDrives=True,
-        ).execute()
-        for perm in resp.get("permissions", []):
-            if perm.get("emailAddress", "").lower() == client_email.lower():
-                return perm.get("role", "unknown")
-    except Exception:
-        pass
-    return "not_listed"
-
-
-def _drive_two_step_create(
-    service,
-    folder_id: str,
-    drive_filename: str,
-    local_file_path: str,
-    *,
-    shared_drive: bool,
-) -> None:
-    """메타데이터만 먼저 생성 후 본문 업로드 — storageQuotaExceeded 우회 시도."""
-    body = {"name": drive_filename, "parents": [folder_id]}
-    create_kw: dict = {"body": body, "fields": "id"}
-    if shared_drive:
-        create_kw["supportsAllDrives"] = True
-    created = service.files().create(**create_kw).execute()
-    file_id = created["id"]
-
-    size = os.path.getsize(local_file_path)
-    media = MediaFileUpload(
-        local_file_path,
-        mimetype="application/octet-stream",
-        resumable=size > 5 * 1024 * 1024,
-    )
-    update_kw: dict = {"fileId": file_id, "media_body": media}
-    if shared_drive:
-        update_kw["supportsAllDrives"] = True
-    service.files().update(**update_kw).execute()
-
-
-def _drive_create_or_update_file(
-    service,
-    folder_id: str,
-    drive_filename: str,
-    local_file_path: str,
-    file_id: str | None,
-    *,
-    shared_drive: bool,
-) -> None:
-    """My Drive 공유 폴더 / 공유 드라이브 모두 대응하는 업로드."""
-    size = os.path.getsize(local_file_path)
-    media = MediaFileUpload(
-        local_file_path,
-        mimetype="application/octet-stream",
-        resumable=size > 5 * 1024 * 1024,
-    )
-    strategies: list[bool] = [True] if shared_drive else [False, True]
-
-    last_exc: Exception | None = None
-    for use_shared_drive_flag in strategies:
-        try:
-            if file_id:
-                kwargs: dict = {"fileId": file_id, "media_body": media}
-                if use_shared_drive_flag:
-                    kwargs["supportsAllDrives"] = True
-                service.files().update(**kwargs).execute()
-            else:
-                kwargs = {
-                    "body": {"name": drive_filename, "parents": [folder_id]},
-                    "media_body": media,
-                    "fields": "id",
-                }
-                if use_shared_drive_flag:
-                    kwargs["supportsAllDrives"] = True
-                service.files().create(**kwargs).execute()
-            return
-        except Exception as e:
-            last_exc = e
-            err = _drive_format_error(e)
-            if (
-                not file_id
-                and ("storageQuota" in err or "storage quota" in err.lower())
-            ):
-                try:
-                    _drive_two_step_create(
-                        service, folder_id, drive_filename, local_file_path,
-                        shared_drive=use_shared_drive_flag,
-                    )
-                    return
-                except Exception as e2:
-                    last_exc = e2
-                    continue
-            continue
-    if last_exc:
-        raise last_exc
-
-
-@st.cache_resource
-def _get_drive_service():
-    creds = _get_gcp_credentials()
-    if not creds:
-        return None
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-
-def _find_drive_file_id(service, folder_id: str, filename: str) -> str | None:
-    safe_name = filename.replace("'", "\\'")
-    query = (
-        f"name='{safe_name}' and '{folder_id}' in parents and trashed=false"
-    )
-    resp = service.files().list(
-        q=query,
-        fields="files(id,name)",
-        pageSize=1,
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-    ).execute()
-    files = resp.get("files", [])
-    return files[0]["id"] if files else None
-
-
-def upload_file_to_drive(local_file_path: str, drive_filename: str) -> tuple[bool, str]:
-    """로컬 파일을 Drive 폴더에 업로드(동일 이름이면 갱신). (성공 여부, 메시지)"""
-    service = _get_drive_service()
-    folder_id = _get_google_drive_folder_id()
-    if not service:
-        return False, "Drive API 서비스 초기화 실패 (gcp_service_account 확인)"
-    if not folder_id:
-        return False, "GOOGLE_DRIVE_FOLDER_ID 없음"
-    if not os.path.exists(local_file_path):
-        return False, f"로컬 파일 없음: {local_file_path}"
-    try:
-        sa_email = ""
-        try:
-            sa_email = st.secrets["gcp_service_account"].get("client_email", "")
-        except Exception:
-            pass
-
-        folder_meta = _drive_folder_meta(service, folder_id)
-        caps = folder_meta.get("capabilities", {})
-        shared_drive = bool(folder_meta.get("driveId"))
-
-        if not caps.get("canAddChildren", False):
-            return False, (
-                "폴더에 파일 추가 권한 없음 (canAddChildren=false). "
-                f"Drive → 폴더 공유 → 아래 이메일을 **편집자**로 추가하세요:\n"
-                f"`{sa_email}`"
-            )
-
-        file_id = _find_drive_file_id(service, folder_id, drive_filename)
-        _drive_create_or_update_file(
-            service, folder_id, drive_filename, local_file_path, file_id,
-            shared_drive=shared_drive,
-        )
-        size_kb = os.path.getsize(local_file_path) // 1024
-        return True, f"{drive_filename} ({size_kb} KB)"
-    except Exception as e:
-        err = _drive_format_error(e)
-        print(f"[Drive upload 오류] {drive_filename}: {e}")
-        sa_email = ""
-        try:
-            sa_email = st.secrets["gcp_service_account"].get("client_email", "")
-        except Exception:
-            pass
-        if "storageQuota" in err or "storage quota" in err.lower():
-            return False, (
-                f"{drive_filename} 업로드 실패: {err}\n"
-                "서비스 계정은 저장 용량이 없습니다. **내 Drive 폴더**를 서비스 계정에 "
-                f"**편집자**로 공유해야 합니다 (공유 대상: `{sa_email}`). "
-                "공유 드라이브(팀 드라이브) 멤버로 추가하는 방법도 있습니다."
-            )
-        if "403" in err or "forbidden" in err.lower():
-            return False, (
-                f"{drive_filename} 업로드 실패: {err}\n"
-                f"폴더 공유 대상 이메일이 정확한지 확인: `{sa_email}` (편집자)"
-            )
-        return False, f"{drive_filename} 업로드 실패: {err}"
-
-
-def download_file_from_drive(drive_filename: str, local_path: str):
-    """
-    Drive 폴더에서 파일 다운로드.
-    반환: True=성공, None=파일 없음, False=오류
-    """
-    service = _get_drive_service()
-    folder_id = _get_google_drive_folder_id()
-    if not service or not folder_id:
-        return False
-    try:
-        file_id = _find_drive_file_id(service, folder_id, drive_filename)
-        if not file_id:
-            return None
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        with open(local_path, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-        return True
-    except Exception as e:
-        print(f"[Drive download 오류] {drive_filename}: {e}")
-        return False
-
-
-def diagnose_google_drive() -> dict:
-    """Google Drive 연결·스냅샷 파일 존재 여부 진단."""
-    result = {
-        "configured": False,
-        "library_ok": _GOOGLE_DRIVE_AVAILABLE,
-        "folder_id": "",
-        "client_email": "",
-        "service_ok": False,
-        "folder_accessible": False,
-        "manifest_on_drive": False,
-        "snapshot_on_drive": False,
-        "write_test_ok": False,
-        "folder_name": "",
-        "can_add_children": False,
-        "sa_permission_role": "",
-        "is_shared_drive": False,
-        "write_test_detail": "",
-        "error": "",
-    }
-    if not _GOOGLE_DRIVE_AVAILABLE:
-        result["error"] = (
-            "google-api-python-client / google-auth 패키지가 설치되지 않았습니다."
-        )
-        return result
-    folder_id = _get_google_drive_folder_id()
-    if not folder_id:
-        result["error"] = (
-            "GOOGLE_DRIVE_FOLDER_ID가 Streamlit Secrets에 없습니다."
-        )
-        return result
-    result["configured"] = True
-    result["folder_id"] = folder_id[:8] + "..."
-
-    try:
-        sa_info = dict(st.secrets.get("gcp_service_account", {}))
-        result["client_email"] = sa_info.get("client_email", "")
-    except Exception:
-        pass
-
-    service = _get_drive_service()
-    if not service:
-        result["error"] = (
-            "[gcp_service_account] Secrets 구조 또는 private_key 형식을 확인하세요."
-        )
-        return result
-    result["service_ok"] = True
-
-    try:
-        folder_meta = _drive_folder_meta(service, folder_id)
-        if folder_meta.get("mimeType") != "application/vnd.google-apps.folder":
-            result["error"] = "GOOGLE_DRIVE_FOLDER_ID가 폴더가 아닙니다 (파일 ID일 수 있음)."
-            return result
-
-        caps = folder_meta.get("capabilities", {})
-        result["folder_accessible"] = True
-        result["folder_name"] = folder_meta.get("name", "")
-        result["can_add_children"] = bool(caps.get("canAddChildren", False))
-        result["is_shared_drive"] = bool(folder_meta.get("driveId"))
-        result["sa_permission_role"] = _drive_sa_permission_role(
-            service, folder_id, result["client_email"]
-        )
-
-        resp = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id,name)",
-            pageSize=20,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        ).execute()
-        names = {f.get("name") for f in resp.get("files", [])}
-        result["manifest_on_drive"] = VECTOR_MANIFEST_FILENAME in names
-        result["snapshot_on_drive"] = VECTOR_SNAPSHOT_FILENAME in names
-
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write("PatentRAG Drive write test")
-            test_path = tf.name
-        try:
-            ok, msg = upload_file_to_drive(test_path, "_patentrag_write_test.txt")
-            result["write_test_ok"] = ok
-            result["write_test_detail"] = msg
-            if not ok:
-                result["error"] = msg
-        finally:
-            try:
-                os.remove(test_path)
-            except OSError:
-                pass
-    except Exception as e:
-        err = str(e)
-        if "drive.google.com" in str(st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", "")):
-            result["error"] = (
-                "GOOGLE_DRIVE_FOLDER_ID에 폴더 URL 전체가 들어가 있습니다. "
-                "ID만 넣으세요 (예: 1exsHPZIbCGooQdB3EWtdzkklYRGjLpf1). "
-                "또는 app.py 최신 버전은 URL도 자동 변환합니다."
-            )
-        else:
-            result["error"] = (
-                f"Drive 폴더 접근 실패 — 서비스 계정을 폴더 '편집자'로 공유했는지, "
-                f"GOOGLE_DRIVE_FOLDER_ID가 올바른지 확인: {e}"
-            )
-    return result
 
 
 # ==========================================
@@ -1243,7 +872,7 @@ def _get_gcs_bucket_name() -> str | None:
 
 
 def _gcs_configured() -> bool:
-    if not _GOOGLE_DRIVE_AVAILABLE or gcs_storage is None:
+    if not _GCP_AVAILABLE or gcs_storage is None:
         return False
     try:
         return bool(_get_gcs_bucket_name() and "gcp_service_account" in st.secrets)
@@ -1422,14 +1051,17 @@ def check_authentication():
 
         if submitted:
             admin_creds = _get_admin_credentials()
-            registry    = refresh_user_registry_from_github()
+            registry    = refresh_user_registry_from_github(force=True)
 
-            # 관리자 계정 확인 (Secrets 평문 또는 SHA-256 해시)
+            # 관리자 계정 확인 (Secrets SHA-256 해시만 허용)
             if username in admin_creds:
                 stored = admin_creds[username]
-                is_hex_hash = len(stored) == 64 and all(c in "0123456789abcdef" for c in stored.lower())
-                stored_hash = stored if is_hex_hash else _hash_pw(stored)
-                if stored_hash == _hash_pw(password):
+                if not _is_sha256_hex(stored):
+                    st.error(
+                        "⛔ 관리자 비밀번호는 Streamlit Secrets에 SHA-256 해시(64자)로만 설정하세요. "
+                        "평문 비밀번호는 허용되지 않습니다."
+                    )
+                elif _verify_password(password, stored):
                     st.session_state.logged_in = True
                     st.session_state.user_id   = username
                     st.session_state.is_admin  = True
@@ -1443,7 +1075,7 @@ def check_authentication():
                     st.error(
                         "⛔ 계정 승인 대기 중입니다. 관리자가 **활성화**한 뒤 로그인해 주세요."
                     )
-                elif user_rec.get("password_hash") == _hash_pw(password):
+                elif _verify_password(password, user_rec.get("password_hash", "")):
                     st.session_state.logged_in = True
                     st.session_state.user_id   = username
                     st.session_state.is_admin  = False
@@ -1605,13 +1237,18 @@ def load_permanent_infra_singleton():
     return _get_chroma_client(), _get_collection(), _get_llm()
 
 
+def chroma_count(collection) -> int:
+    """Chroma collection.count() — 세션 상태 없이 순수 호출."""
+    return collection.count()
+
+
 def safe_count(collection) -> int:
     """
     collection.count()를 안전하게 호출.
     일시 오류 시 0 대신 마지막 정상 값을 반환 — 0이면 자동 재인덱싱이 오작동함.
     """
     try:
-        n = collection.count()
+        n = chroma_count(collection)
         st.session_state._last_chroma_count = n
         return n
     except Exception as e:
@@ -1946,8 +1583,38 @@ def _master_excel_mtime() -> float:
 
 
 def _invalidate_patent_count_cache() -> None:
-    """마스터·Chroma 건수 캐시 무효화 (데이터 변경 직후 호출)."""
+    """마스터·Chroma 건수·통계 메타 캐시 무효화 (데이터 변경 직후 호출)."""
     st.session_state.pop(_PATENT_COUNT_CACHE_KEY, None)
+    st.session_state.pop(_STATS_METAS_CACHE_KEY, None)
+
+
+@st.cache_data(show_spinner=False)
+def _load_master_excel_cached(mtime: float) -> bytes | None:
+    if mtime < 0:
+        return None
+    with open(MASTER_EXCEL_PATH, "rb") as f:
+        return f.read()
+
+
+def _read_master_excel_df() -> pd.DataFrame | None:
+    """마스터 엑셀 DataFrame (mtime 기준 @st.cache_data)."""
+    mtime = _master_excel_mtime()
+    raw = _load_master_excel_cached(mtime)
+    if raw is None:
+        return None
+    return pd.read_excel(io.BytesIO(raw))
+
+
+def _get_all_metadatas_cached(collection) -> list:
+    """통계 모드용 전체 metadatas — chroma_n 기준 세션 캐시."""
+    chroma_n = safe_count(collection)
+    cache = st.session_state.get(_STATS_METAS_CACHE_KEY)
+    if cache and cache.get("chroma_n") == chroma_n:
+        return cache["metadatas"]
+    all_data = collection.get(include=["metadatas"])
+    metas = all_data.get("metadatas", [])
+    st.session_state[_STATS_METAS_CACHE_KEY] = {"chroma_n": chroma_n, "metadatas": metas}
+    return metas
 
 
 def _get_patent_count_cache() -> dict:
@@ -1969,14 +1636,17 @@ def _count_master_excel_patents(force: bool = False) -> int | None:
         return None
 
     try:
-        df   = pd.read_excel(MASTER_EXCEL_PATH)
-        cols = _detect_columns(df)
-        ids  = {
-            _normalize_patent_id(v)
-            for v in df[cols["id"]]
-            if _normalize_patent_id(v)
-        }
-        result = len(ids)
+        df = _read_master_excel_df()
+        if df is None:
+            result = None
+        else:
+            cols = _detect_columns(df)
+            ids = {
+                _normalize_patent_id(v)
+                for v in df[cols["id"]]
+                if _normalize_patent_id(v)
+            }
+            result = len(ids)
     except Exception as e:
         print(f"[마스터 엑셀 건수 조회 오류] {e}")
         result = None
@@ -2012,45 +1682,66 @@ def _get_chroma_ids(collection) -> set:
         return set()
 
 
+def _unique_patents_from_ids(collection) -> int:
+    """Chroma document id만으로 고유 출원번호 수 (빠른 경로)."""
+    try:
+        all_ids = collection.get(include=[])["ids"]
+        return len({
+            _normalize_patent_id(i)
+            for i in all_ids
+            if _normalize_patent_id(i)
+        })
+    except Exception as e:
+        print(f"[ChromaDB ID 고유 출원번호 오류] {e}")
+        return 0
+
+
+def _unique_patents_from_metadatas(collection, batch_size: int = 500) -> int:
+    """메타데이터 배치 스캔으로 고유 출원번호 수 (정밀 경로)."""
+    try:
+        all_ids = collection.get(include=[])["ids"]
+        canonical: set[str] = set()
+        for i in range(0, len(all_ids), batch_size):
+            batch = collection.get(
+                ids=all_ids[i:i + batch_size],
+                include=["metadatas"],
+            )
+            for chroma_id, meta in zip(
+                batch.get("ids", []),
+                batch.get("metadatas", []),
+            ):
+                meta = meta or {}
+                cid = (
+                    _normalize_patent_id(meta.get("출원번호", ""))
+                    or _normalize_patent_id(chroma_id)
+                )
+                if cid:
+                    canonical.add(cid)
+        return len(canonical)
+    except Exception as e:
+        print(f"[ChromaDB 메타 고유 출원번호 오류] {e}")
+        return 0
+
+
 def _count_chroma_unique_patents(
-    collection, batch_size: int = 500, force: bool = False
+    collection, batch_size: int = 500, force: bool = False, *, full_scan: bool = False
 ) -> int:
     """
     ChromaDB 내 고유 출원번호(canonical) 수.
-    마스터 엑셀 _count_master_excel_patents()와 동일 기준 — document id 중복과 무관.
+    기본은 ID 기반 빠른 경로, full_scan=True 시 메타데이터 정밀 스캔.
     """
     chroma_n = safe_count(collection)
     cache = _get_patent_count_cache()
     cache_key = (chroma_n, _master_excel_mtime())
-    if not force and cache.get("chroma_key") == cache_key and "chroma_unique_n" in cache:
+    if not force and not full_scan and cache.get("chroma_key") == cache_key and "chroma_unique_n" in cache:
         return cache["chroma_unique_n"]
 
-    try:
-        if chroma_n == 0:
-            result = 0
-        else:
-            all_ids = collection.get(include=[])["ids"]
-            canonical: set[str] = set()
-            for i in range(0, len(all_ids), batch_size):
-                batch = collection.get(
-                    ids=all_ids[i:i + batch_size],
-                    include=["metadatas"],
-                )
-                for chroma_id, meta in zip(
-                    batch.get("ids", []),
-                    batch.get("metadatas", []),
-                ):
-                    meta = meta or {}
-                    cid = (
-                        _normalize_patent_id(meta.get("출원번호", ""))
-                        or _normalize_patent_id(chroma_id)
-                    )
-                    if cid:
-                        canonical.add(cid)
-            result = len(canonical)
-    except Exception as e:
-        print(f"[ChromaDB 고유 출원번호 조회 오류] {e}")
+    if chroma_n == 0:
         result = 0
+    elif full_scan:
+        result = _unique_patents_from_metadatas(collection, batch_size)
+    else:
+        result = _unique_patents_from_ids(collection)
 
     cache["chroma_key"] = cache_key
     cache["chroma_unique_n"] = result
@@ -2119,7 +1810,9 @@ def _compact_master_excel() -> int:
     if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
         return 0
     try:
-        df     = pd.read_excel(MASTER_EXCEL_PATH)
+        df = _read_master_excel_df()
+        if df is None:
+            return 0
         before = len(df)
         cols   = _detect_columns(df)
         deduped = _dedupe_dataframe_by_patent_id(df, cols)
@@ -2139,7 +1832,9 @@ def _collect_missing_patents_from_master(
     """마스터 엑셀에만 있고 Chroma에 없는 출원번호 → (ids, docs, metas)."""
     if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
         return [], [], []
-    df = pd.read_excel(MASTER_EXCEL_PATH)
+    df = _read_master_excel_df()
+    if df is None:
+        return [], [], []
     cols = _detect_columns(df)
     chroma_ids = _get_chroma_ids(collection)
     hyperlink_map = hyperlink_map or {}
@@ -2202,6 +1897,9 @@ def run_gap_sync_step(collection, chunk_size: int = _GAP_SYNC_CHUNK) -> dict:
 def _start_gap_sync() -> None:
     st.session_state.gap_sync_active = True
     st.session_state.gap_sync_synced_session = 0
+    st.session_state.gap_sync_batch_n = 0
+    st.session_state.gap_sync_last_remaining = None
+    st.session_state.gap_sync_stall_n = 0
 
 
 def _run_gap_sync_if_active(collection) -> None:
@@ -2210,13 +1908,12 @@ def _run_gap_sync_if_active(collection) -> None:
         return
 
     master_n = _count_master_excel_patents()
-    unique_n = (
-        _count_chroma_unique_patents(collection, force=True)
-        if safe_count(collection) > 0
-        else 0
-    )
+    unique_n = _count_chroma_unique_patents(collection) if safe_count(collection) > 0 else 0
     gap = max(0, (master_n or 0) - unique_n)
-    batches_left = (gap + _GAP_SYNC_CHUNK - 1) // _GAP_SYNC_CHUNK
+    batches_left = min(
+        (gap + _GAP_SYNC_CHUNK - 1) // _GAP_SYNC_CHUNK,
+        _GAP_SYNC_MAX_BATCHES,
+    )
 
     with st.status(
         f"ChromaDB 누락분 복구 중 (고유 {unique_n}→{master_n}, 남음 약 {gap}건)...",
@@ -2236,6 +1933,21 @@ def _run_gap_sync_if_active(collection) -> None:
             }
             st.rerun()
 
+        batch_n = st.session_state.get("gap_sync_batch_n", 0) + 1
+        if batch_n > _GAP_SYNC_MAX_BATCHES:
+            st.session_state.gap_sync_active = False
+            st.session_state.sync_feedback = {
+                "level": "warning",
+                "message": (
+                    f"⚠️ 누락분 복구가 배치 상한({_GAP_SYNC_MAX_BATCHES}회)에 도달해 중단했습니다. "
+                    "**클라우드 스냅샷 → ChromaDB 수동 복원**을 먼저 시도하거나, "
+                    "잠시 후 복구 버튼을 다시 눌러 주세요."
+                ),
+            }
+            status.update(label="복구 중단 (배치 상한)", state="error")
+            st.rerun()
+        st.session_state.gap_sync_batch_n = batch_n
+
         step = run_gap_sync_step(collection)
         synced_session = (
             st.session_state.get("gap_sync_synced_session", 0)
@@ -2250,6 +1962,19 @@ def _run_gap_sync_if_active(collection) -> None:
             )
 
         if not step["done"]:
+            prev_remaining = st.session_state.get("gap_sync_last_remaining")
+            if (
+                prev_remaining is not None
+                and step["remaining"] >= prev_remaining
+                and step["synced_this_run"] == 0
+            ):
+                st.session_state.gap_sync_stall_n = (
+                    st.session_state.get("gap_sync_stall_n", 0) + 1
+                )
+            elif step["synced_this_run"] > 0:
+                st.session_state.gap_sync_stall_n = 0
+            st.session_state.gap_sync_last_remaining = step["remaining"]
+
             if step["synced_this_run"] == 0 and step["remaining"] > 0:
                 st.session_state.gap_sync_active = False
                 st.session_state.sync_feedback = {
@@ -2261,6 +1986,17 @@ def _run_gap_sync_if_active(collection) -> None:
                     ),
                 }
                 status.update(label="복구 중단", state="error")
+                st.rerun()
+            if st.session_state.get("gap_sync_stall_n", 0) >= 3 and step["remaining"] > 0:
+                st.session_state.gap_sync_active = False
+                st.session_state.sync_feedback = {
+                    "level": "error",
+                    "message": (
+                        "❌ 누락분 복구가 연속으로 진행되지 않습니다. "
+                        "**클라우드 스냅샷 → ChromaDB 수동 복원**을 먼저 시도해 주세요."
+                    ),
+                }
+                status.update(label="복구 중단 (정체)", state="error")
                 st.rerun()
             total = step["total_missing"] or gap
             done_est = max(0, total - step["remaining"])
@@ -2281,6 +2017,7 @@ def _run_gap_sync_if_active(collection) -> None:
         st.session_state.chroma_gap_sync_done = True
         st.session_state._last_chroma_count = safe_count(collection)
         _invalidate_patent_count_cache()
+        _count_chroma_unique_patents(collection, full_scan=True, force=True)
 
         if synced_session > 0:
             msg = (
@@ -2432,12 +2169,13 @@ def sync_master_from_chroma(collection, batch_size: int = 500) -> tuple[int, int
     # 기존 마스터 행 선적재 (Chroma에 없는 행 보존)
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
         try:
-            master_df   = pd.read_excel(MASTER_EXCEL_PATH)
-            master_cols = _detect_columns(master_df)
-            for _, row in master_df.iterrows():
-                cid = _normalize_patent_id(row[master_cols["id"]])
-                if cid:
-                    rows_by_id[cid] = _master_row_to_standard_dict(row, master_cols)
+            master_df = _read_master_excel_df()
+            if master_df is not None:
+                master_cols = _detect_columns(master_df)
+                for _, row in master_df.iterrows():
+                    cid = _normalize_patent_id(row[master_cols["id"]])
+                    if cid:
+                        rows_by_id[cid] = _master_row_to_standard_dict(row, master_cols)
         except Exception as e:
             print(f"[마스터 선적재 오류] {e}")
 
@@ -2513,7 +2251,9 @@ def reindex_from_master_excel(collection) -> int:
     if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
         return 0
     try:
-        df   = pd.read_excel(MASTER_EXCEL_PATH)
+        df = _read_master_excel_df()
+        if df is None:
+            return 0
         cols = _detect_columns(df)
 
         rows_by_id: dict = {}
@@ -2541,7 +2281,7 @@ def reindex_from_master_excel(collection) -> int:
 
 
 # ==========================================
-# 벡터 스냅샷 (Google Drive 영속 복원)
+# 벡터 스냅샷 (GCS 영속 복원)
 # ==========================================
 def _file_sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -2700,41 +2440,28 @@ def restore_chroma_from_snapshot(collection, batch_size: int = 100) -> int:
 
 def download_vector_snapshot_from_storage() -> bool:
     """GCS → 로컬 manifest + parquet (고정 경로, zip 미사용 — 경로 이중 중첩 없음)."""
-    if _gcs_configured():
-        man = download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
-        snap = download_file_from_gcs(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
-        return man is True and snap is True
-    if _drive_configured():
-        man = download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
-        snap = download_file_from_drive(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
-        return man is True and snap is True
-    return False
+    if not _gcs_configured():
+        return False
+    man = download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
+    snap = download_file_from_gcs(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
+    return man is True and snap is True
 
 
 def upload_vector_snapshot_to_storage() -> tuple[bool, str]:
-    """로컬 manifest + parquet → GCS(우선) 또는 Drive."""
+    """로컬 manifest + parquet → GCS."""
     if not os.path.exists(VECTOR_SNAPSHOT_PATH) or not os.path.exists(VECTOR_MANIFEST_PATH):
         return False, "로컬 스냅샷 파일 없음 — export 먼저 실행"
 
-    if _gcs_configured():
-        ok_m, msg_m = upload_file_to_gcs(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
-        if not ok_m:
-            return False, msg_m
-        ok_s, msg_s = upload_file_to_gcs(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
-        if not ok_s:
-            return False, f"manifest는 GCS 업로드됨. parquet 실패: {msg_s}"
-        return True, f"GCS 업로드 완료 — {msg_m}, {msg_s}"
+    if not _gcs_configured():
+        return False, "스냅샷 저장소 미설정 — Secrets에 GCS_BUCKET_NAME을 설정하세요."
 
-    if _drive_configured():
-        ok_m, msg_m = upload_file_to_drive(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
-        if not ok_m:
-            return False, msg_m
-        ok_s, msg_s = upload_file_to_drive(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
-        if not ok_s:
-            return False, f"manifest는 업로드됨. parquet 실패: {msg_s}"
-        return True, f"Drive 업로드 완료 — {msg_m}, {msg_s}"
-
-    return False, "스냅샷 저장소 미설정 (GCS_BUCKET_NAME 또는 GOOGLE_DRIVE_FOLDER_ID)"
+    ok_m, msg_m = upload_file_to_gcs(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
+    if not ok_m:
+        return False, msg_m
+    ok_s, msg_s = upload_file_to_gcs(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
+    if not ok_s:
+        return False, f"manifest는 GCS 업로드됨. parquet 실패: {msg_s}"
+    return True, f"GCS 업로드 완료 — {msg_m}, {msg_s}"
 
 
 def maybe_upload_vector_snapshot(collection) -> tuple[bool, str]:
@@ -2755,7 +2482,7 @@ def maybe_upload_vector_snapshot(collection) -> tuple[bool, str]:
 
 
 def try_restore_chroma_from_storage(collection) -> tuple[int, str]:
-    """GCS/Drive 스냅샷 다운로드 → 검증 → Chroma 복원."""
+    """GCS 스냅샷 다운로드 → 검증 → Chroma 복원."""
     if not _vector_storage_configured():
         return 0, "스냅샷 저장소 미설정"
     if not download_vector_snapshot_from_storage():
@@ -2787,8 +2514,6 @@ def load_vector_manifest_summary() -> dict | None:
     if not os.path.exists(VECTOR_MANIFEST_PATH) and _vector_storage_configured():
         if _gcs_configured():
             download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
-        elif _drive_configured():
-            download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
     if not os.path.exists(VECTOR_MANIFEST_PATH):
         return None
     try:
@@ -2823,13 +2548,17 @@ def process_and_update_db(uploaded_file, collection):
 
     if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
         try:
-            master_df   = pd.read_excel(MASTER_EXCEL_PATH)
-            master_cols = _detect_columns(master_df)
-            master_ids  = {
-                _normalize_patent_id(v)
-                for v in master_df[master_cols["id"]]
-                if _normalize_patent_id(v)
-            }
+            master_df = _read_master_excel_df()
+            if master_df is not None:
+                master_cols = _detect_columns(master_df)
+                master_ids = {
+                    _normalize_patent_id(v)
+                    for v in master_df[master_cols["id"]]
+                    if _normalize_patent_id(v)
+                }
+            else:
+                master_df = pd.DataFrame(columns=new_df.columns)
+                master_ids = set()
         except Exception:
             master_df  = pd.DataFrame(columns=new_df.columns)
             master_ids = set()
@@ -3032,14 +2761,14 @@ def run_main_portal():
                             'GITHUB_TOKEN = "ghp_새토큰값"\n'
                             'GITHUB_REPO_URL = "https://github.com/ssahaga97-max/my-patent-rag.git"\n\n'
                             "[USER_CREDENTIALS]\n"
-                            'admin = "1234!"',
+                            'admin = "64자_SHA256_해시_예: echo -n 비밀번호 | sha256sum"',
                             language="toml"
                         )
 
             st.divider()
             st.subheader("☁️ 벡터 스냅샷 (GCS)")
             storage_label = _vector_storage_label()
-            if not _GOOGLE_DRIVE_AVAILABLE:
+            if not _GCP_AVAILABLE:
                 st.caption("GCP 패키지 미설치 — requirements.txt 확인 후 재배포하세요.")
             elif not _gcs_configured():
                 st.caption(
@@ -3413,7 +3142,7 @@ def run_main_portal():
                             updated_registry[uid]["active"] = not is_active
                             save_user_registry(updated_registry)
                             upload_user_registry_to_github()
-                            refresh_user_registry_from_github()
+                            refresh_user_registry_from_github(force=True)
                             action = "활성화(승인)" if not is_active else "비활성화"
                             st.toast(f"✅ {uid} 계정을 {action}했습니다.")
                             st.rerun()
@@ -3469,8 +3198,7 @@ def run_main_portal():
 
                 # ── 통계 모드: 전체 메타데이터 pandas 집계 후 요약 컨텍스트 구성 ──
                 if "📊" in analysis_mode:
-                    all_data = collection.get(include=["metadatas"])
-                    all_metas = all_data.get("metadatas", [])
+                    all_metas = _get_all_metadatas_cached(collection)
                     total_count = len(all_metas)
 
                     if total_count == 0:
