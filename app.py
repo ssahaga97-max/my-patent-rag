@@ -12,6 +12,7 @@ import json
 import base64
 import hashlib
 import smtplib
+import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -811,10 +812,28 @@ def _drive_configured() -> bool:
         return False
 
 
+def _parse_google_drive_folder_id(value: str) -> str | None:
+    """
+    Drive 폴더 ID 추출. Secrets에 URL 전체를 넣어도 ID만 사용.
+    예: https://drive.google.com/drive/folders/1abc... → 1abc...
+    """
+    raw = _clean_ascii(str(value or "")).strip()
+    if not raw:
+        return None
+    if "/" not in raw and "?" not in raw:
+        return raw
+    m = re.search(r"/folders/([^/?&#]+)", raw)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([^&]+)", raw)
+    if m:
+        return m.group(1)
+    return raw
+
+
 def _get_google_drive_folder_id() -> str | None:
     try:
-        fid = _clean_ascii(str(st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", "")))
-        return fid if fid else None
+        return _parse_google_drive_folder_id(st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", ""))
     except Exception:
         return None
 
@@ -849,24 +868,38 @@ def _find_drive_file_id(service, folder_id: str, filename: str) -> str | None:
         f"name='{safe_name}' and '{folder_id}' in parents and trashed=false"
     )
     resp = service.files().list(
-        q=query, fields="files(id,name)", pageSize=1, supportsAllDrives=True
+        q=query,
+        fields="files(id,name)",
+        pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     ).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
 
 
-def upload_file_to_drive(local_file_path: str, drive_filename: str) -> bool:
-    """로컬 파일을 Drive 폴더에 업로드(동일 이름이면 갱신)."""
+def upload_file_to_drive(local_file_path: str, drive_filename: str) -> tuple[bool, str]:
+    """로컬 파일을 Drive 폴더에 업로드(동일 이름이면 갱신). (성공 여부, 메시지)"""
     service = _get_drive_service()
     folder_id = _get_google_drive_folder_id()
-    if not service or not folder_id or not os.path.exists(local_file_path):
-        return False
+    if not service:
+        return False, "Drive API 서비스 초기화 실패 (gcp_service_account 확인)"
+    if not folder_id:
+        return False, "GOOGLE_DRIVE_FOLDER_ID 없음"
+    if not os.path.exists(local_file_path):
+        return False, f"로컬 파일 없음: {local_file_path}"
     try:
         file_id = _find_drive_file_id(service, folder_id, drive_filename)
-        media = MediaFileUpload(local_file_path, resumable=True)
+        media = MediaFileUpload(
+            local_file_path,
+            mimetype="application/octet-stream",
+            resumable=True,
+        )
         if file_id:
             service.files().update(
-                fileId=file_id, media_body=media, supportsAllDrives=True
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
             ).execute()
         else:
             service.files().create(
@@ -875,10 +908,17 @@ def upload_file_to_drive(local_file_path: str, drive_filename: str) -> bool:
                 fields="id",
                 supportsAllDrives=True,
             ).execute()
-        return True
+        size_kb = os.path.getsize(local_file_path) // 1024
+        return True, f"{drive_filename} ({size_kb} KB)"
     except Exception as e:
+        err = str(e)
         print(f"[Drive upload 오류] {drive_filename}: {e}")
-        return False
+        if "storageQuotaExceeded" in err or "403" in err:
+            return False, (
+                f"{drive_filename} 업로드 실패: 저장 공간/권한(403). "
+                f"폴더를 서비스 계정에 '편집자'로 공유했는지 확인하세요."
+            )
+        return False, f"{drive_filename} 업로드 실패: {err[:300]}"
 
 
 def download_file_from_drive(drive_filename: str, local_path: str):
@@ -918,6 +958,8 @@ def diagnose_google_drive() -> dict:
         "folder_accessible": False,
         "manifest_on_drive": False,
         "snapshot_on_drive": False,
+        "write_test_ok": False,
+        "folder_name": "",
         "error": "",
     }
     if not _GOOGLE_DRIVE_AVAILABLE:
@@ -949,20 +991,58 @@ def diagnose_google_drive() -> dict:
     result["service_ok"] = True
 
     try:
+        # 폴더 자체 접근 가능 여부 (공유·ID 오류 조기 감지)
+        folder_meta = service.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType,capabilities",
+            supportsAllDrives=True,
+        ).execute()
+        if folder_meta.get("mimeType") != "application/vnd.google-apps.folder":
+            result["error"] = "GOOGLE_DRIVE_FOLDER_ID가 폴더가 아닙니다 (파일 ID일 수 있음)."
+            return result
+
         resp = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
             fields="files(id,name)",
             pageSize=20,
             supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
         ).execute()
         names = {f.get("name") for f in resp.get("files", [])}
         result["folder_accessible"] = True
+        result["folder_name"] = folder_meta.get("name", "")
         result["manifest_on_drive"] = VECTOR_MANIFEST_FILENAME in names
         result["snapshot_on_drive"] = VECTOR_SNAPSHOT_FILENAME in names
+
+        # 소용량 테스트 업로드 (쓰기 권한 확인)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write("PatentRAG Drive write test")
+            test_path = tf.name
+        try:
+            ok, msg = upload_file_to_drive(test_path, "_patentrag_write_test.txt")
+            result["write_test_ok"] = ok
+            if not ok:
+                result["error"] = f"폴더 읽기는 되나 업로드 실패: {msg}"
+        finally:
+            try:
+                os.remove(test_path)
+            except OSError:
+                pass
     except Exception as e:
-        result["error"] = (
-            f"Drive 폴더 접근 실패 — 서비스 계정을 폴더 '편집자'로 공유했는지 확인: {e}"
-        )
+        err = str(e)
+        if "drive.google.com" in str(st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", "")):
+            result["error"] = (
+                "GOOGLE_DRIVE_FOLDER_ID에 폴더 URL 전체가 들어가 있습니다. "
+                "ID만 넣으세요 (예: 1exsHPZIbCGooQdB3EWtdzkklYRGjLpf1). "
+                "또는 app.py 최신 버전은 URL도 자동 변환합니다."
+            )
+        else:
+            result["error"] = (
+                f"Drive 폴더 접근 실패 — 서비스 계정을 폴더 '편집자'로 공유했는지, "
+                f"GOOGLE_DRIVE_FOLDER_ID가 올바른지 확인: {e}"
+            )
     return result
 
 
@@ -1738,7 +1818,9 @@ def sync_chroma_missing_from_master(collection, hyperlink_map: dict | None = Non
             return 0
         _upsert_patent_batches(collection, ids, docs, metas)
         _invalidate_patent_count_cache()
-        maybe_upload_vector_snapshot(collection)
+        ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
+        if not ok_snap:
+            print(f"[gap 복구 후 스냅샷 업로드 스킵] {snap_msg}")
         return len(ids)
     except Exception as e:
         print(f"[ChromaDB 누락분 동기화 오류] {e}")
@@ -1937,7 +2019,9 @@ def reindex_from_master_excel(collection) -> int:
 
         _upsert_patent_batches(collection, ids, docs, metas)
         _invalidate_patent_count_cache()
-        maybe_upload_vector_snapshot(collection)
+        ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
+        if not ok_snap:
+            print(f"[재인덱싱 후 스냅샷 업로드 스킵] {snap_msg}")
         return len(ids)
     except Exception as e:
         print(f"재인덱싱 실패: {e}")
@@ -2006,14 +2090,15 @@ def _validate_local_vector_manifest() -> tuple[bool, str]:
         return False, str(e)
 
 
-def export_vector_snapshot(collection, batch_size: int = 500) -> bool:
+def export_vector_snapshot(collection, batch_size: int = 500) -> tuple[bool, str]:
     """ChromaDB → 로컬 parquet + manifest 생성 (재임베딩 없음)."""
     total = safe_count(collection)
     if total == 0:
-        return False
+        return False, "ChromaDB가 비어 있습니다."
     try:
         all_ids = collection.get(include=[])["ids"]
         records: list[dict] = []
+        skipped_no_emb = 0
         for i in range(0, len(all_ids), batch_size):
             batch = collection.get(
                 ids=all_ids[i:i + batch_size],
@@ -2026,6 +2111,7 @@ def export_vector_snapshot(collection, batch_size: int = 500) -> bool:
                 batch.get("metadatas", []),
             ):
                 if emb is None:
+                    skipped_no_emb += 1
                     continue
                 records.append({
                     "chroma_id": cid,
@@ -2034,7 +2120,10 @@ def export_vector_snapshot(collection, batch_size: int = 500) -> bool:
                     "metadata_json": json.dumps(meta or {}, ensure_ascii=False),
                 })
         if not records:
-            return False
+            return False, (
+                f"임베딩 추출 0건 (Chroma 문서 {total}건, 임베딩 없음 {skipped_no_emb}건). "
+                f"재인덱싱 완료 후 다시 시도하세요."
+            )
 
         os.makedirs(os.path.dirname(VECTOR_SNAPSHOT_PATH), exist_ok=True)
         pd.DataFrame(records).to_parquet(VECTOR_SNAPSHOT_PATH, index=False)
@@ -2052,10 +2141,14 @@ def export_vector_snapshot(collection, batch_size: int = 500) -> bool:
         }
         with open(VECTOR_MANIFEST_PATH, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
-        return True
+        size_mb = os.path.getsize(VECTOR_SNAPSHOT_PATH) / (1024 * 1024)
+        note = ""
+        if skipped_no_emb:
+            note = f" (임베딩 없음 스킵 {skipped_no_emb}건)"
+        return True, f"로컬 생성 완료: {len(records)}건, {size_mb:.1f} MB{note}"
     except Exception as e:
         print(f"[벡터 스냅샷 export 오류] {e}")
-        return False
+        return False, f"parquet 생성 오류: {e}"
 
 
 def restore_chroma_from_snapshot(collection, batch_size: int = 100) -> int:
@@ -2101,24 +2194,37 @@ def download_vector_snapshot_from_drive() -> bool:
     return man is True and snap is True
 
 
-def upload_vector_snapshot_to_drive() -> bool:
+def upload_vector_snapshot_to_drive() -> tuple[bool, str]:
     """로컬 manifest + parquet → Drive 업로드."""
     if not _drive_configured():
-        return False
+        return False, "Drive 미설정"
     if not os.path.exists(VECTOR_SNAPSHOT_PATH) or not os.path.exists(VECTOR_MANIFEST_PATH):
-        return False
-    ok1 = upload_file_to_drive(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
-    ok2 = upload_file_to_drive(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
-    return ok1 and ok2
+        return False, "로컬 스냅샷 파일 없음 — export 먼저 실행"
+
+    ok_m, msg_m = upload_file_to_drive(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
+    if not ok_m:
+        return False, msg_m
+
+    ok_s, msg_s = upload_file_to_drive(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
+    if not ok_s:
+        return False, f"manifest는 업로드됨. parquet 실패: {msg_s}"
+
+    return True, f"Drive 업로드 완료 — {msg_m}, {msg_s}"
 
 
-def maybe_upload_vector_snapshot(collection) -> bool:
+def maybe_upload_vector_snapshot(collection) -> tuple[bool, str]:
     """Chroma 변경 후 스냅샷 export + Drive 업로드."""
-    if not _drive_configured() or safe_count(collection) == 0:
-        return False
-    if not export_vector_snapshot(collection):
-        return False
-    return upload_vector_snapshot_to_drive()
+    if not _drive_configured():
+        return False, "Drive 미설정 (GOOGLE_DRIVE_FOLDER_ID, gcp_service_account)"
+    if safe_count(collection) == 0:
+        return False, "ChromaDB 비어 있음"
+    ok, msg = export_vector_snapshot(collection)
+    if not ok:
+        return False, f"export 실패: {msg}"
+    ok2, msg2 = upload_vector_snapshot_to_drive()
+    if not ok2:
+        return False, f"upload 실패: {msg2}"
+    return True, f"{msg} | {msg2}"
 
 
 def try_restore_chroma_from_drive(collection) -> tuple[int, str]:
@@ -2237,7 +2343,9 @@ def process_and_update_db(uploaded_file, collection):
     if chroma_ingested or master_added or synced:
         _invalidate_patent_count_cache()
         if chroma_ingested or synced:
-            maybe_upload_vector_snapshot(collection)
+            ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
+            if not ok_snap:
+                print(f"[적재 후 스냅샷 업로드 스킵] {snap_msg}")
     return chroma_ingested, master_added, dup_in_file + already_indexed, skipped_empty, synced
 
 
@@ -2426,13 +2534,21 @@ def run_main_portal():
                 with st.spinner("Drive 진단 중..."):
                     dd = diagnose_google_drive()
                 if dd["folder_accessible"]:
+                    write_line = (
+                        "✅ 쓰기 테스트 통과"
+                        if dd.get("write_test_ok")
+                        else "⚠️ 쓰기 테스트 실패 — 편집자 권한 확인"
+                    )
                     st.success(
                         f"✅ Drive 연결 정상\n\n"
-                        f"- 폴더 ID: `{dd['folder_id']}`\n"
+                        f"- 폴더: `{dd.get('folder_name', '')}` (`{dd['folder_id']}`)\n"
                         f"- 서비스 계정: `{dd.get('client_email', '')}`\n"
                         f"- manifest: {'있음' if dd['manifest_on_drive'] else '없음'}\n"
-                        f"- snapshot: {'있음' if dd['snapshot_on_drive'] else '없음'}"
+                        f"- snapshot: {'있음' if dd['snapshot_on_drive'] else '없음'}\n"
+                        f"- {write_line}"
                     )
+                    if dd.get("error"):
+                        st.warning(dd["error"])
                 else:
                     st.error(f"❌ Drive 연결 실패\n\n**원인:**\n{dd['error']}")
 
@@ -2447,21 +2563,24 @@ def run_main_portal():
                 with st.spinner(
                     f"ChromaDB {chroma_for_snap}건 스냅샷 생성 및 Drive 업로드 중..."
                 ):
-                    ok = maybe_upload_vector_snapshot(collection)
+                    ok, snap_detail = maybe_upload_vector_snapshot(collection)
                 if ok:
                     st.session_state.sync_feedback = {
                         "level": "success",
                         "message": (
                             f"✅ 벡터 스냅샷 Drive 업로드 완료 "
-                            f"({chroma_for_snap}건). 재시작 시 재임베딩 없이 복원됩니다."
+                            f"({chroma_for_snap}건). 재시작 시 재임베딩 없이 복원됩니다.\n\n"
+                            f"{snap_detail}"
                         ),
                     }
                 else:
                     st.session_state.sync_feedback = {
                         "level": "error",
                         "message": (
-                            "❌ 스냅샷 생성·업로드 실패 — "
-                            "**🔍 Google Drive 연결 진단**으로 폴더 공유·Secrets를 확인하세요."
+                            f"❌ 스냅샷 생성·업로드 실패\n\n"
+                            f"**상세:** {snap_detail}\n\n"
+                            f"👉 **🔍 Google Drive 연결 진단** 실행 후 "
+                            f"서비스 계정 편집자 공유·GOOGLE_DRIVE_FOLDER_ID를 확인하세요."
                         ),
                     }
                 st.rerun()
@@ -2531,17 +2650,21 @@ def run_main_portal():
 
                     github_ok = None
                     drive_ok = None
+                    drive_detail = ""
                     if chroma_new > 0 or master_new > 0 or synced > 0:
                         with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중... (대용량 파일은 최대 2분 소요)"):
                             github_ok = commit_and_push_data()
                         if chroma_new > 0 or synced > 0:
                             with st.spinner("☁️ Google Drive 벡터 스냅샷 업로드 중..."):
-                                drive_ok = maybe_upload_vector_snapshot(collection)
+                                drive_ok, drive_detail = maybe_upload_vector_snapshot(collection)
                         drive_note = ""
                         if drive_ok is True:
                             drive_note = " Drive 벡터 스냅샷도 업데이트되었습니다."
                         elif drive_ok is False and _drive_configured():
-                            drive_note = " Drive 스냅샷 업로드 실패 — 수동 생성 버튼을 실행하세요."
+                            drive_note = (
+                                f" Drive 스냅샷 업로드 실패 — {drive_detail} "
+                                f"수동 생성 버튼을 실행하세요."
+                            )
                         if github_ok:
                             st.session_state.upload_feedback = {
                                 "level": "success",
@@ -2660,7 +2783,11 @@ def run_main_portal():
                                 f"(현재 {safe_count(collection)}건). GitHub·Drive 백업을 권장합니다."
                             ),
                         }
-                        maybe_upload_vector_snapshot(collection)
+                        ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
+                        if not ok_snap:
+                            st.session_state.sync_feedback["message"] += (
+                                f"\n\n⚠️ Drive 스냅샷: {snap_msg}"
+                            )
                     else:
                         st.session_state.sync_feedback = {
                             "level": "info",
