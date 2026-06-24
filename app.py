@@ -37,7 +37,7 @@ MASTER_EXCEL_PATH    = os.path.join(BASE_DIR, "my_patent_folder", "master_patent
 USER_REGISTRY_PATH   = os.path.join(BASE_DIR, "my_patent_folder", "user_registry.json")
 VECTOR_SNAPSHOT_PATH = os.path.join(BASE_DIR, "my_patent_folder", "vector_snapshot.parquet")
 VECTOR_MANIFEST_PATH = os.path.join(BASE_DIR, "my_patent_folder", "vector_manifest.json")
-VECTOR_SNAPSHOT_FILENAME = "vector_snapshot.parquet"
+VECTOR_SNAPSHOT_FILENAME = "vector_snapshot.parquet"  # GCS 고정명 — 업로드 시 덮어쓰기(용량 누수 방지)
 VECTOR_MANIFEST_FILENAME = "vector_manifest.json"
 VECTOR_SNAPSHOT_VERSION  = 1
 _EMBED_DIM = 768  # paraphrase-multilingual-mpnet-base-v2
@@ -68,8 +68,14 @@ if "_last_chroma_count" not in st.session_state:
     st.session_state._last_chroma_count = 0
 if "chroma_gap_sync_done" not in st.session_state:
     st.session_state.chroma_gap_sync_done = False
+if "gap_sync_active" not in st.session_state:
+    st.session_state.gap_sync_active = False
+if "gap_sync_synced_session" not in st.session_state:
+    st.session_state.gap_sync_synced_session = 0
 
 _PATENT_COUNT_CACHE_KEY = "_patent_count_cache"
+# Streamlit 연결 타임아웃 방지 — 누락분 복구 시 1회 실행당 임베딩 건수
+_GAP_SYNC_CHUNK = 15
 
 
 # ==========================================
@@ -1233,14 +1239,12 @@ def _gcs_configured() -> bool:
 
 
 def _vector_storage_configured() -> bool:
-    return _gcs_configured() or _drive_configured()
+    return _gcs_configured()
 
 
 def _vector_storage_label() -> str:
     if _gcs_configured():
         return f"GCS (`{_get_gcs_bucket_name()}`)"
-    if _drive_configured():
-        return "Google Drive"
     return "미설정"
 
 
@@ -1267,6 +1271,7 @@ def upload_file_to_gcs(local_file_path: str, blob_name: str) -> tuple[bool, str]
     try:
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
+        # 동일 blob 이름 → 덮어쓰기. 날짜별 누적 없음 (GCS 5GB 무료 한도 보호).
         blob.upload_from_filename(local_file_path)
         size_kb = os.path.getsize(local_file_path) // 1024
         return True, f"gs://{bucket_name}/{blob_name} ({size_kb} KB)"
@@ -2107,43 +2112,176 @@ def _compact_master_excel() -> int:
     return 0
 
 
-def sync_chroma_missing_from_master(collection, hyperlink_map: dict | None = None) -> int:
+def _collect_missing_patents_from_master(
+    collection, hyperlink_map: dict | None = None
+) -> tuple[list, list, list]:
+    """마스터 엑셀에만 있고 Chroma에 없는 출원번호 → (ids, docs, metas)."""
+    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
+        return [], [], []
+    df = pd.read_excel(MASTER_EXCEL_PATH)
+    cols = _detect_columns(df)
+    chroma_ids = _get_chroma_ids(collection)
+    hyperlink_map = hyperlink_map or {}
+
+    rows_by_id: dict = {}
+    for _, row in df.iterrows():
+        pat_id = _normalize_patent_id(row[cols["id"]])
+        if pat_id:
+            rows_by_id[pat_id] = row
+
+    ids, docs, metas = [], [], []
+    for pat_id, row in rows_by_id.items():
+        if pat_id in chroma_ids:
+            continue
+        patent_url = _patent_url_from_row(row, cols, pat_id, hyperlink_map)
+        ids.append(pat_id)
+        docs.append(_build_document(row, cols))
+        metas.append(_build_metadata(row, cols, patent_url=patent_url))
+    return ids, docs, metas
+
+
+def run_gap_sync_step(collection, chunk_size: int = _GAP_SYNC_CHUNK) -> dict:
+    """
+    누락분 복구 1스텝(배치). Streamlit rerun 루프와 함께 사용.
+    완료 시 GCS 스냅샷 업로드 시도.
+    """
+    result = {
+        "synced_this_run": 0,
+        "remaining": 0,
+        "total_missing": 0,
+        "done": True,
+        "snapshot_ok": None,
+        "snapshot_msg": "",
+    }
+    _compact_master_excel()
+    try:
+        ids, docs, metas = _collect_missing_patents_from_master(collection)
+        total = len(ids)
+        result["total_missing"] = total
+        if total == 0:
+            return result
+
+        n = min(chunk_size, total)
+        _upsert_patent_batches(
+            collection, ids[:n], docs[:n], metas[:n], batch_size=10
+        )
+        _invalidate_patent_count_cache()
+        result["synced_this_run"] = n
+        result["remaining"] = total - n
+        result["done"] = n >= total
+        if result["done"]:
+            ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
+            result["snapshot_ok"] = ok_snap
+            result["snapshot_msg"] = snap_msg
+    except Exception as e:
+        result["done"] = True
+        result["snapshot_ok"] = False
+        result["snapshot_msg"] = str(e)
+        print(f"[ChromaDB 누락분 배치 오류] {e}")
+    return result
+
+
+def _start_gap_sync() -> None:
+    st.session_state.gap_sync_active = True
+    st.session_state.gap_sync_synced_session = 0
+
+
+def _run_gap_sync_if_active(collection) -> None:
+    """gap_sync_active이면 배치 복구 1스텝 실행 후 rerun."""
+    if not st.session_state.get("gap_sync_active"):
+        return
+
+    master_n = _count_master_excel_patents()
+    unique_n = (
+        _count_chroma_unique_patents(collection)
+        if safe_count(collection) > 0
+        else 0
+    )
+    gap = max(0, (master_n or 0) - unique_n)
+
+    with st.status(
+        f"ChromaDB 누락분 복구 중 (고유 {unique_n}→{master_n}, 남음 약 {gap}건)...",
+        expanded=True,
+    ) as status:
+        step = run_gap_sync_step(collection)
+        synced_session = (
+            st.session_state.get("gap_sync_synced_session", 0)
+            + step["synced_this_run"]
+        )
+        st.session_state.gap_sync_synced_session = synced_session
+
+        if step["synced_this_run"]:
+            st.write(
+                f"✓ 이번 배치 **+{step['synced_this_run']}건** "
+                f"(이번 세션 누적 {synced_session}건)"
+            )
+
+        if not step["done"]:
+            total = step["total_missing"] or gap
+            done_est = max(0, total - step["remaining"])
+            pct = min(0.99, done_est / max(1, total))
+            st.progress(pct, text=f"남음 {step['remaining']}건")
+            st.caption(
+                "⚠️ **연결 끊김 방지**를 위해 15건씩 처리합니다. "
+                "창을 닫거나 새로고침하지 마세요 — 자동으로 이어집니다."
+            )
+            status.update(label=f"누락분 복구 중… 남음 {step['remaining']}건")
+            st.rerun()
+
+        st.session_state.gap_sync_active = False
+        st.session_state.chroma_gap_sync_done = True
+        st.session_state._last_chroma_count = safe_count(collection)
+        _invalidate_patent_count_cache()
+
+        if synced_session > 0:
+            msg = (
+                f"✅ ChromaDB 누락분 **{synced_session}건** 복구 완료 "
+                f"(Chroma {safe_count(collection)}건)"
+            )
+            if step.get("snapshot_ok") is True:
+                msg += "\n\n☁️ GCS 벡터 스냅샷도 업데이트되었습니다."
+            elif step.get("snapshot_ok") is False and step.get("snapshot_msg"):
+                msg += f"\n\n⚠️ GCS 스냅샷: {step['snapshot_msg']}"
+            st.session_state.sync_feedback = {"level": "success", "message": msg}
+            status.update(label="누락분 복구 완료", state="complete")
+        else:
+            st.session_state.sync_feedback = {
+                "level": "info",
+                "message": "복구할 누락분이 없거나 이미 동기화되어 있습니다.",
+            }
+            status.update(label="동기화 완료", state="complete")
+        st.rerun()
+
+
+def sync_chroma_missing_from_master(
+    collection,
+    hyperlink_map: dict | None = None,
+    *,
+    max_items: int | None = None,
+    upload_snapshot: bool = True,
+) -> int:
     """
     마스터 엑셀에는 있으나 ChromaDB에 없는 출원번호만 upsert.
-    엑셀 저장 후 Chroma 타임아웃·부분 실패로 생긴 누락 복구용.
-    시작 시 마스터 엑셀 canonical 중복 행도 자동 정리.
+    max_items: None이면 전체(대량 시 Streamlit 타임아웃 위험). gap 복구 UI는 run_gap_sync_step 사용.
     """
     _compact_master_excel()
     if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
         return 0
     try:
-        df         = pd.read_excel(MASTER_EXCEL_PATH)
-        cols       = _detect_columns(df)
-        chroma_ids = _get_chroma_ids(collection)
-        hyperlink_map = hyperlink_map or {}
-
-        rows_by_id: dict = {}
-        for _, row in df.iterrows():
-            pat_id = _normalize_patent_id(row[cols["id"]])
-            if pat_id:
-                rows_by_id[pat_id] = row
-
-        ids, docs, metas = [], [], []
-        for pat_id, row in rows_by_id.items():
-            if pat_id in chroma_ids:
-                continue
-            patent_url = _patent_url_from_row(row, cols, pat_id, hyperlink_map)
-            ids.append(pat_id)
-            docs.append(_build_document(row, cols))
-            metas.append(_build_metadata(row, cols, patent_url=patent_url))
-
+        ids, docs, metas = _collect_missing_patents_from_master(
+            collection, hyperlink_map
+        )
         if not ids:
             return 0
+        total_missing = len(ids)
+        if max_items is not None:
+            ids, docs, metas = ids[:max_items], docs[:max_items], metas[:max_items]
         _upsert_patent_batches(collection, ids, docs, metas)
         _invalidate_patent_count_cache()
-        ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
-        if not ok_snap:
-            print(f"[gap 복구 후 스냅샷 업로드 스킵] {snap_msg}")
+        if upload_snapshot and (max_items is None or len(ids) >= total_missing):
+            ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
+            if not ok_snap:
+                print(f"[gap 복구 후 스냅샷 업로드 스킵] {snap_msg}")
         return len(ids)
     except Exception as e:
         print(f"[ChromaDB 누락분 동기화 오류] {e}")
@@ -2551,8 +2689,7 @@ def maybe_upload_vector_snapshot(collection) -> tuple[bool, str]:
     """Chroma 변경 후 스냅샷 export + 클라우드 업로드."""
     if not _vector_storage_configured():
         return False, (
-            "스냅샷 저장소 미설정 — Secrets에 GCS_BUCKET_NAME(권장) 또는 "
-            "GOOGLE_DRIVE_FOLDER_ID를 설정하세요."
+            "스냅샷 저장소 미설정 — Secrets에 GCS_BUCKET_NAME을 설정하세요."
         )
     if safe_count(collection) == 0:
         return False, "ChromaDB 비어 있음"
@@ -2690,7 +2827,9 @@ def process_and_update_db(uploaded_file, collection):
         _invalidate_patent_count_cache()
         master_added = len(master_needed)
 
-    synced = sync_chroma_missing_from_master(collection, hyperlink_map)
+    synced = sync_chroma_missing_from_master(
+        collection, hyperlink_map, upload_snapshot=False
+    )
     if chroma_ingested or master_added or synced:
         _invalidate_patent_count_cache()
         if chroma_ingested or synced:
@@ -2759,27 +2898,18 @@ def run_main_portal():
         except Exception as e:
             st.warning(f"벡터 DB 복원 오류: {e}")
 
-    elif (
+    _run_gap_sync_if_active(collection)
+
+    if (
         master_n
         and chroma_n > 0
         and unique_patent_n > 0
         and master_n > unique_patent_n
         and not st.session_state.chroma_gap_sync_done
+        and not st.session_state.get("gap_sync_active")
     ):
-        st.session_state.chroma_gap_sync_done = True
-        gap = master_n - unique_patent_n
-        try:
-            with st.spinner(
-                f"ChromaDB 누락분 자동 복구 중 "
-                f"(Chroma 고유 {unique_patent_n}→{master_n}, 약 {gap}건)..."
-            ):
-                synced = sync_chroma_missing_from_master(collection)
-            st.session_state._last_chroma_count = safe_count(collection)
-            _invalidate_patent_count_cache()
-            if synced > 0:
-                st.toast(f"✅ ChromaDB 누락분 {synced}건 복구 완료")
-        except Exception as e:
-            st.warning(f"ChromaDB 누락분 자동 복구 오류: {e}")
+        _start_gap_sync()
+        st.rerun()
 
     is_admin = st.session_state.get("is_admin", False)
 
@@ -2862,18 +2992,20 @@ def run_main_portal():
                         )
 
             st.divider()
-            st.subheader("☁️ 벡터 스냅샷 (클라우드)")
+            st.subheader("☁️ 벡터 스냅샷 (GCS)")
             storage_label = _vector_storage_label()
             if not _GOOGLE_DRIVE_AVAILABLE:
                 st.caption("GCP 패키지 미설치 — requirements.txt 확인 후 재배포하세요.")
-            elif not _vector_storage_configured():
+            elif not _gcs_configured():
                 st.caption(
-                    "**권장:** Secrets에 `GCS_BUCKET_NAME` + `[gcp_service_account]` 설정.\n\n"
-                    "또는 `GOOGLE_DRIVE_FOLDER_ID` (개인 Gmail은 서비스 계정 업로드가 "
-                    "storageQuotaExceeded로 실패할 수 있음)."
+                    "Secrets에 `GCS_BUCKET_NAME` + `[gcp_service_account]`를 설정하세요."
                 )
             else:
-                st.caption(f"활성 저장소: **{storage_label}**")
+                st.caption(
+                    f"저장소: **{storage_label}** · "
+                    f"파일 `vector_snapshot.parquet` + `vector_manifest.json` "
+                    f"**고정명 덮어쓰기** (버전 누적 없음, ~30MB)"
+                )
                 manifest = load_vector_manifest_summary()
                 if manifest:
                     st.caption(
@@ -2882,7 +3014,7 @@ def run_main_portal():
                         f"생성 `{manifest.get('created_at', '')}`"
                     )
                 else:
-                    st.caption("클라우드에 스냅샷 없음 — 아래 버튼으로 첫 스냅샷을 생성하세요.")
+                    st.caption("GCS에 스냅샷 없음 — 아래 버튼으로 첫 스냅샷을 생성하세요.")
 
             if _gcs_configured() and st.button("🔍 GCS 연결 진단", use_container_width=True):
                 with st.spinner("GCS 진단 중..."):
@@ -2915,60 +3047,11 @@ def run_main_portal():
                 else:
                     st.error(f"❌ GCS 연결 실패\n\n**원인:**\n{gd['error']}")
 
-            if _drive_configured() and st.button(
-                "🔍 Google Drive 연결 진단", use_container_width=True
-            ):
-                with st.spinner("Drive 진단 중..."):
-                    dd = diagnose_google_drive()
-                if dd["folder_accessible"]:
-                    write_line = (
-                        "✅ 쓰기 테스트 통과"
-                        if dd.get("write_test_ok")
-                        else "⚠️ 쓰기 테스트 실패"
-                    )
-                    role = dd.get("sa_permission_role", "unknown")
-                    add_ok = "✅" if dd.get("can_add_children") else "❌"
-                    st.success(
-                        f"✅ Drive 폴더 읽기 정상\n\n"
-                        f"- 폴더: `{dd.get('folder_name', '')}` (`{dd['folder_id']}`)\n"
-                        f"- 공유 드라이브: {'예' if dd.get('is_shared_drive') else '아니오 (내 Drive)'}\n"
-                        f"- 서비스 계정: `{dd.get('client_email', '')}`\n"
-                        f"- 공유 역할(permissions): **{role}** (writer/contentmanager 필요)\n"
-                        f"- 파일 추가 권한(canAddChildren): {add_ok}\n"
-                        f"- manifest: {'있음' if dd['manifest_on_drive'] else '없음'}\n"
-                        f"- snapshot: {'있음' if dd['snapshot_on_drive'] else '없음'}\n"
-                        f"- {write_line}"
-                    )
-                    if not dd.get("write_test_ok"):
-                        st.error(
-                            "**쓰기 실패 상세**\n\n"
-                            f"{dd.get('write_test_detail') or dd.get('error', '')}"
-                        )
-                        detail = dd.get("write_test_detail", "") or dd.get("error", "")
-                        if "storageQuotaExceeded" in detail:
-                            st.warning(
-                                "**개인 Gmail + 서비스 계정 한계:** 서비스 계정은 Drive 저장 용량이 "
-                                "0이라 폴더를 편집자로 공유해도 업로드가 거부됩니다.\n\n"
-                                "**권장 해결:** Secrets에 `GCS_BUCKET_NAME = \"버킷이름\"`을 추가하고 "
-                                "GCS 연결 진단을 실행하세요."
-                            )
-                        else:
-                            st.info(
-                                "**해결 체크리스트**\n"
-                                "1. Drive에서 폴더 → **공유** → 서비스 계정을 **편집자**로 추가\n"
-                                "2. (Workspace) **공유 드라이브**에 폴더 생성 + SA를 **콘텐츠 관리자**로 추가\n"
-                                "3. 또는 **GCS 버킷** 사용 (개인 Gmail에서 가장 안정적)"
-                            )
-                    elif dd.get("error"):
-                        st.warning(dd["error"])
-                else:
-                    st.error(f"❌ Drive 연결 실패\n\n**원인:**\n{dd['error']}")
-
             chroma_for_snap = safe_count(collection)
             if st.button(
                 f"💾 벡터 스냅샷 수동 생성 · 업로드 ({storage_label})",
                 use_container_width=True,
-                disabled=chroma_for_snap == 0 or not _vector_storage_configured(),
+                disabled=chroma_for_snap == 0 or not _gcs_configured(),
                 help="ChromaDB 현재 상태를 parquet로 내보내 클라우드에 저장합니다. "
                      "첫 마이그레이션·재배포 전 필수 1회 실행.",
             ):
@@ -2991,8 +3074,7 @@ def run_main_portal():
                         "message": (
                             f"❌ 스냅샷 생성·업로드 실패\n\n"
                             f"**상세:** {snap_detail}\n\n"
-                            f"👉 **GCS 연결 진단** 또는 **Drive 연결 진단**을 실행하세요. "
-                            f"개인 Gmail은 GCS 버킷 사용을 권장합니다."
+                            f"👉 **GCS 연결 진단**을 실행하세요."
                         ),
                     }
                 st.rerun()
@@ -3000,7 +3082,7 @@ def run_main_portal():
             if st.button(
                 f"📥 클라우드 스냅샷 → ChromaDB 수동 복원 ({storage_label})",
                 use_container_width=True,
-                disabled=not _vector_storage_configured(),
+                disabled=not _gcs_configured(),
                 help="재시작 없이 클라우드 스냅샷으로 Chroma를 덮어씁니다. manifest 검증 통과 시에만 실행.",
             ):
                 with st.spinner(f"{storage_label} 스냅샷 다운로드 및 Chroma 복원 중..."):
@@ -3181,32 +3263,7 @@ def run_main_portal():
             )
             if needs_gap_sync:
                 if st.button("🔧 ChromaDB 누락분 복구 (마스터 엑셀 기준)", use_container_width=True):
-                    gap = master_n - unique_patent_n
-                    with st.spinner(
-                        f"마스터 엑셀 → ChromaDB 누락분 복구 중 "
-                        f"(Chroma 고유 {unique_patent_n}→{master_n}, 약 {gap}건)..."
-                    ):
-                        synced = sync_chroma_missing_from_master(collection)
-                    st.session_state._last_chroma_count = safe_count(collection)
-                    _invalidate_patent_count_cache()
-                    if synced > 0:
-                        st.session_state.sync_feedback = {
-                            "level": "success",
-                            "message": (
-                                f"✅ ChromaDB 누락분 **{synced}건** 복구 완료 "
-                                f"(현재 {safe_count(collection)}건). GitHub·Drive 백업을 권장합니다."
-                            ),
-                        }
-                        ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
-                        if not ok_snap:
-                            st.session_state.sync_feedback["message"] += (
-                                f"\n\n⚠️ Drive 스냅샷: {snap_msg}"
-                            )
-                    else:
-                        st.session_state.sync_feedback = {
-                            "level": "info",
-                            "message": "복구할 누락분이 없거나 이미 동기화되어 있습니다.",
-                        }
+                    _start_gap_sync()
                     st.rerun()
 
             if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
