@@ -723,6 +723,15 @@ def load_user_registry() -> dict:
     return {}
 
 
+def refresh_user_registry_from_github() -> dict:
+    """GitHub 최신 user_registry.json → 로컬 후 반환 (로그인·승인 직후 동기화)."""
+    try:
+        download_user_registry_from_github()
+    except Exception as e:
+        print(f"[회원 레지스트리 GitHub 동기화 스킵] {e}")
+    return load_user_registry()
+
+
 def save_user_registry(registry: dict):
     os.makedirs(os.path.dirname(USER_REGISTRY_PATH), exist_ok=True)
     with open(USER_REGISTRY_PATH, "w", encoding="utf-8") as f:
@@ -781,6 +790,7 @@ def send_admin_signup_email(user_info: dict) -> bool:
   <tr><td><b>부서</b></td><td>{user_info.get('department','미입력')}</td></tr>
   <tr style="background:#f0f4ff;"><td><b>가입 일시</b></td><td>{user_info.get('registered_at','')}</td></tr>
 </table>
+<p><b>👉 관리자 포털</b> → 사이드바 <b>가입 회원 현황</b> → 해당 계정 <b>활성화</b> 버튼을 눌러 승인해 주세요.</p>
 <p style="color:#888;font-size:12px;">본 메일은 PatentRAG 시스템이 자동 발송한 알림입니다.</p>
 </body></html>"""
 
@@ -1412,7 +1422,7 @@ def check_authentication():
 
         if submitted:
             admin_creds = _get_admin_credentials()
-            registry    = load_user_registry()
+            registry    = refresh_user_registry_from_github()
 
             # 관리자 계정 확인 (Secrets 평문 또는 SHA-256 해시)
             if username in admin_creds:
@@ -1429,8 +1439,10 @@ def check_authentication():
             # 일반 사용자 확인 (레지스트리 해시 비교)
             elif username in registry:
                 user_rec = registry[username]
-                if not user_rec.get("active", True):
-                    st.error("⛔ 비활성화된 계정입니다. 관리자에게 문의하세요.")
+                if user_rec.get("active") is False:
+                    st.error(
+                        "⛔ 계정 승인 대기 중입니다. 관리자가 **활성화**한 뒤 로그인해 주세요."
+                    )
                 elif user_rec.get("password_hash") == _hash_pw(password):
                     st.session_state.logged_in = True
                     st.session_state.user_id   = username
@@ -1444,7 +1456,10 @@ def check_authentication():
     # ── 회원가입 탭 ──
     with tab_register:
         st.subheader("신규 연구원 계정 등록")
-        st.caption("가입 완료 시 관리자에게 이메일로 자동 통보됩니다.")
+        st.caption(
+            "가입 신청 후 **관리자 승인(활성화)** 이 완료되면 로그인할 수 있습니다. "
+            "신청 시 관리자에게 이메일로 알림이 발송됩니다."
+        )
         with st.form("register_form"):
             r_id   = st.text_input("사용자 ID (영문·숫자, 4자 이상)")
             r_name = st.text_input("이름 *")
@@ -1481,7 +1496,7 @@ def check_authentication():
                     "department":    r_dept,
                     "password_hash": _hash_pw(r_pw),
                     "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "active":        True,
+                    "active":        False,
                 }
                 registry[r_id] = user_info
                 save_user_registry(registry)
@@ -1491,7 +1506,10 @@ def check_authentication():
 
                 email_ok = send_admin_signup_email(user_info)
 
-                st.success(f"✅ '{r_id}' 계정 가입이 완료되었습니다! 로그인 탭에서 접속해 주세요.")
+                st.success(
+                    f"✅ '{r_id}' 가입 신청이 접수되었습니다. "
+                    f"관리자 승인 후 로그인 탭에서 접속해 주세요."
+                )
                 if email_ok:
                     st.info("📧 관리자에게 가입 알림 이메일이 발송되었습니다.")
                 else:
@@ -2193,16 +2211,23 @@ def _run_gap_sync_if_active(collection) -> None:
 
     master_n = _count_master_excel_patents()
     unique_n = (
-        _count_chroma_unique_patents(collection)
+        _count_chroma_unique_patents(collection, force=True)
         if safe_count(collection) > 0
         else 0
     )
     gap = max(0, (master_n or 0) - unique_n)
+    batches_left = (gap + _GAP_SYNC_CHUNK - 1) // _GAP_SYNC_CHUNK
 
     with st.status(
         f"ChromaDB 누락분 복구 중 (고유 {unique_n}→{master_n}, 남음 약 {gap}건)...",
         expanded=True,
     ) as status:
+        if gap > 500:
+            st.info(
+                f"남은 **{gap}건**은 15건×약 **{batches_left}회** 배치로 **수 시간** 걸릴 수 있습니다. "
+                "먼저 **⏹ 복구 중단** → 사이드바 **📥 클라우드 스냅샷 → ChromaDB 수동 복원** "
+                "(1~3분)을 시도하는 것이 훨씬 빠릅니다."
+            )
         if st.button("⏹ 복구 중단", key="gap_sync_cancel"):
             st.session_state.gap_sync_active = False
             st.session_state.sync_feedback = {
@@ -2240,10 +2265,14 @@ def _run_gap_sync_if_active(collection) -> None:
             total = step["total_missing"] or gap
             done_est = max(0, total - step["remaining"])
             pct = min(0.99, done_est / max(1, total))
-            st.progress(pct, text=f"남음 {step['remaining']}건")
+            batch_n = synced_session // max(1, step["synced_this_run"]) if synced_session else 1
+            st.progress(
+                pct,
+                text=f"남음 {step['remaining']}건 · 배치 ~{batch_n}/{batches_left}",
+            )
             st.caption(
-                "⚠️ **연결 끊김 방지**를 위해 15건씩 처리합니다. "
-                "창을 닫거나 새로고침하지 마세요 — 자동으로 이어집니다."
+                "배치마다 AI 임베딩으로 **1~3분** 걸릴 수 있습니다(화면이 잠시 멈춘 것처럼 보임). "
+                "창을 닫지 마세요 — 완료되면 자동으로 다음 배치가 이어집니다."
             )
             status.update(label=f"누락분 복구 중… 남음 {step['remaining']}건")
             st.rerun()
@@ -2670,7 +2699,7 @@ def restore_chroma_from_snapshot(collection, batch_size: int = 100) -> int:
 
 
 def download_vector_snapshot_from_storage() -> bool:
-    """GCS(우선) 또는 Drive → 로컬 manifest + parquet."""
+    """GCS → 로컬 manifest + parquet (고정 경로, zip 미사용 — 경로 이중 중첩 없음)."""
     if _gcs_configured():
         man = download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
         snap = download_file_from_gcs(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
@@ -3357,6 +3386,7 @@ def run_main_portal():
 
             st.divider()
             st.subheader("👥 가입 회원 현황")
+            st.caption("🔴 승인 대기 계정은 **활성화** 버튼으로 로그인을 허용합니다.")
             registry = load_user_registry()
             if not registry:
                 st.caption("등록된 일반 회원 없음")
@@ -3365,7 +3395,8 @@ def run_main_portal():
                 for uid, info in registry.items():
                     is_active   = info.get("active", True)
                     status_icon = "🟢" if is_active else "🔴"
-                    btn_label   = "비활성화" if is_active else "활성화"
+                    status_note = "" if is_active else " · **승인 대기**"
+                    btn_label   = "비활성화" if is_active else "활성화 (승인)"
                     btn_type    = "secondary" if is_active else "primary"
 
                     col_info, col_btn = st.columns([3, 1])
@@ -3374,7 +3405,7 @@ def run_main_portal():
                             f"{status_icon} **{uid}**  \n"
                             f"<span style='font-size:12px;color:gray'>"
                             f"{info.get('name','')} · {info.get('department','부서없음')} · "
-                            f"{info.get('registered_at','')[:10]}</span>",
+                            f"{info.get('registered_at','')[:10]}{status_note}</span>",
                             unsafe_allow_html=True,
                         )
                     with col_btn:
@@ -3382,7 +3413,8 @@ def run_main_portal():
                             updated_registry[uid]["active"] = not is_active
                             save_user_registry(updated_registry)
                             upload_user_registry_to_github()
-                            action = "활성화" if not is_active else "비활성화"
+                            refresh_user_registry_from_github()
+                            action = "활성화(승인)" if not is_active else "비활성화"
                             st.toast(f"✅ {uid} 계정을 {action}했습니다.")
                             st.rerun()
                     st.divider()
