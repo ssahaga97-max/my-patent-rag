@@ -18,10 +18,24 @@ from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+    _GOOGLE_DRIVE_AVAILABLE = True
+except ImportError:
+    _GOOGLE_DRIVE_AVAILABLE = False
+
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_EXCEL_PATH    = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
 USER_REGISTRY_PATH   = os.path.join(BASE_DIR, "my_patent_folder", "user_registry.json")
+VECTOR_SNAPSHOT_PATH = os.path.join(BASE_DIR, "my_patent_folder", "vector_snapshot.parquet")
+VECTOR_MANIFEST_PATH = os.path.join(BASE_DIR, "my_patent_folder", "vector_manifest.json")
+VECTOR_SNAPSHOT_FILENAME = "vector_snapshot.parquet"
+VECTOR_MANIFEST_FILENAME = "vector_manifest.json"
+VECTOR_SNAPSHOT_VERSION  = 1
+_EMBED_DIM = 768  # paraphrase-multilingual-mpnet-base-v2
 os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
 
 st.set_page_config(page_title="AI 경쟁사 특허 조사 분석", layout="wide", page_icon="🔬")
@@ -778,6 +792,178 @@ def download_master_excel_from_github():
     return _download_file_from_github(
         "my_patent_folder/master_patents.xlsx", MASTER_EXCEL_PATH
     )
+
+
+# ==========================================
+# Google Drive API (벡터 스냅샷 영속화)
+# ==========================================
+_DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive",)
+
+
+def _drive_configured() -> bool:
+    """Secrets에 Drive 폴더 ID + gcp_service_account가 설정되어 있는지."""
+    if not _GOOGLE_DRIVE_AVAILABLE:
+        return False
+    try:
+        folder_id = _get_google_drive_folder_id()
+        return bool(folder_id and "gcp_service_account" in st.secrets)
+    except Exception:
+        return False
+
+
+def _get_google_drive_folder_id() -> str | None:
+    try:
+        fid = _clean_ascii(str(st.secrets.get("GOOGLE_DRIVE_FOLDER_ID", "")))
+        return fid if fid else None
+    except Exception:
+        return None
+
+
+def _get_gcp_credentials():
+    if not _GOOGLE_DRIVE_AVAILABLE:
+        return None
+    try:
+        sa_info = dict(st.secrets["gcp_service_account"])
+        pk = sa_info.get("private_key", "")
+        if isinstance(pk, str) and "\\n" in pk and "-----BEGIN" in pk:
+            sa_info["private_key"] = pk.replace("\\n", "\n")
+        return service_account.Credentials.from_service_account_info(
+            sa_info, scopes=_DRIVE_SCOPES
+        )
+    except Exception as e:
+        print(f"[GCP credentials 오류] {e}")
+        return None
+
+
+@st.cache_resource
+def _get_drive_service():
+    creds = _get_gcp_credentials()
+    if not creds:
+        return None
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _find_drive_file_id(service, folder_id: str, filename: str) -> str | None:
+    safe_name = filename.replace("'", "\\'")
+    query = (
+        f"name='{safe_name}' and '{folder_id}' in parents and trashed=false"
+    )
+    resp = service.files().list(
+        q=query, fields="files(id,name)", pageSize=1, supportsAllDrives=True
+    ).execute()
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def upload_file_to_drive(local_file_path: str, drive_filename: str) -> bool:
+    """로컬 파일을 Drive 폴더에 업로드(동일 이름이면 갱신)."""
+    service = _get_drive_service()
+    folder_id = _get_google_drive_folder_id()
+    if not service or not folder_id or not os.path.exists(local_file_path):
+        return False
+    try:
+        file_id = _find_drive_file_id(service, folder_id, drive_filename)
+        media = MediaFileUpload(local_file_path, resumable=True)
+        if file_id:
+            service.files().update(
+                fileId=file_id, media_body=media, supportsAllDrives=True
+            ).execute()
+        else:
+            service.files().create(
+                body={"name": drive_filename, "parents": [folder_id]},
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+        return True
+    except Exception as e:
+        print(f"[Drive upload 오류] {drive_filename}: {e}")
+        return False
+
+
+def download_file_from_drive(drive_filename: str, local_path: str):
+    """
+    Drive 폴더에서 파일 다운로드.
+    반환: True=성공, None=파일 없음, False=오류
+    """
+    service = _get_drive_service()
+    folder_id = _get_google_drive_folder_id()
+    if not service or not folder_id:
+        return False
+    try:
+        file_id = _find_drive_file_id(service, folder_id, drive_filename)
+        if not file_id:
+            return None
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with open(local_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        return True
+    except Exception as e:
+        print(f"[Drive download 오류] {drive_filename}: {e}")
+        return False
+
+
+def diagnose_google_drive() -> dict:
+    """Google Drive 연결·스냅샷 파일 존재 여부 진단."""
+    result = {
+        "configured": False,
+        "library_ok": _GOOGLE_DRIVE_AVAILABLE,
+        "folder_id": "",
+        "client_email": "",
+        "service_ok": False,
+        "folder_accessible": False,
+        "manifest_on_drive": False,
+        "snapshot_on_drive": False,
+        "error": "",
+    }
+    if not _GOOGLE_DRIVE_AVAILABLE:
+        result["error"] = (
+            "google-api-python-client / google-auth 패키지가 설치되지 않았습니다."
+        )
+        return result
+    folder_id = _get_google_drive_folder_id()
+    if not folder_id:
+        result["error"] = (
+            "GOOGLE_DRIVE_FOLDER_ID가 Streamlit Secrets에 없습니다."
+        )
+        return result
+    result["configured"] = True
+    result["folder_id"] = folder_id[:8] + "..."
+
+    try:
+        sa_info = dict(st.secrets.get("gcp_service_account", {}))
+        result["client_email"] = sa_info.get("client_email", "")
+    except Exception:
+        pass
+
+    service = _get_drive_service()
+    if not service:
+        result["error"] = (
+            "[gcp_service_account] Secrets 구조 또는 private_key 형식을 확인하세요."
+        )
+        return result
+    result["service_ok"] = True
+
+    try:
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id,name)",
+            pageSize=20,
+            supportsAllDrives=True,
+        ).execute()
+        names = {f.get("name") for f in resp.get("files", [])}
+        result["folder_accessible"] = True
+        result["manifest_on_drive"] = VECTOR_MANIFEST_FILENAME in names
+        result["snapshot_on_drive"] = VECTOR_SNAPSHOT_FILENAME in names
+    except Exception as e:
+        result["error"] = (
+            f"Drive 폴더 접근 실패 — 서비스 계정을 폴더 '편집자'로 공유했는지 확인: {e}"
+        )
+    return result
 
 
 # ==========================================
@@ -1552,6 +1738,7 @@ def sync_chroma_missing_from_master(collection, hyperlink_map: dict | None = Non
             return 0
         _upsert_patent_batches(collection, ids, docs, metas)
         _invalidate_patent_count_cache()
+        maybe_upload_vector_snapshot(collection)
         return len(ids)
     except Exception as e:
         print(f"[ChromaDB 누락분 동기화 오류] {e}")
@@ -1750,10 +1937,219 @@ def reindex_from_master_excel(collection) -> int:
 
         _upsert_patent_batches(collection, ids, docs, metas)
         _invalidate_patent_count_cache()
+        maybe_upload_vector_snapshot(collection)
         return len(ids)
     except Exception as e:
         print(f"재인덱싱 실패: {e}")
         return 0
+
+
+# ==========================================
+# 벡터 스냅샷 (Google Drive 영속 복원)
+# ==========================================
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _upsert_embedding_batches(
+    collection,
+    ids: list,
+    embeddings: list,
+    docs: list,
+    metas: list,
+    batch_size: int = 100,
+) -> None:
+    for i in range(0, len(ids), batch_size):
+        collection.upsert(
+            ids=ids[i:i + batch_size],
+            embeddings=embeddings[i:i + batch_size],
+            documents=docs[i:i + batch_size],
+            metadatas=metas[i:i + batch_size],
+        )
+
+
+def _validate_local_vector_manifest() -> tuple[bool, str]:
+    """로컬 manifest·parquet 무결성 및 마스터 정합 검증."""
+    if not os.path.exists(VECTOR_MANIFEST_PATH):
+        return False, "manifest 파일 없음"
+    if not os.path.exists(VECTOR_SNAPSHOT_PATH):
+        return False, "snapshot parquet 없음"
+    try:
+        with open(VECTOR_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        if manifest.get("version", 0) != VECTOR_SNAPSHOT_VERSION:
+            return False, "스냅샷 버전 불일치"
+        if manifest.get("embed_model") != _EMBED_MODEL:
+            return False, "임베딩 모델 불일치"
+        if manifest.get("embed_dim") != _EMBED_DIM:
+            return False, "임베딩 차원 불일치"
+        master_n = _count_master_excel_patents(force=True)
+        if master_n is None:
+            return False, "마스터 엑셀 없음"
+        if manifest.get("master_unique_count") != master_n:
+            return False, (
+                f"마스터 건수 불일치 (manifest={manifest.get('master_unique_count')}, "
+                f"local={master_n})"
+            )
+        mtime = _master_excel_mtime()
+        if abs(float(manifest.get("master_mtime", -999)) - mtime) > 1.0:
+            return False, "마스터 mtime 불일치"
+        sha = _file_sha256(VECTOR_SNAPSHOT_PATH)
+        if manifest.get("snapshot_sha256") != sha:
+            return False, "snapshot SHA256 불일치"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def export_vector_snapshot(collection, batch_size: int = 500) -> bool:
+    """ChromaDB → 로컬 parquet + manifest 생성 (재임베딩 없음)."""
+    total = safe_count(collection)
+    if total == 0:
+        return False
+    try:
+        all_ids = collection.get(include=[])["ids"]
+        records: list[dict] = []
+        for i in range(0, len(all_ids), batch_size):
+            batch = collection.get(
+                ids=all_ids[i:i + batch_size],
+                include=["embeddings", "documents", "metadatas"],
+            )
+            for cid, emb, doc, meta in zip(
+                batch.get("ids", []),
+                batch.get("embeddings", []),
+                batch.get("documents", []),
+                batch.get("metadatas", []),
+            ):
+                if emb is None:
+                    continue
+                records.append({
+                    "chroma_id": cid,
+                    "document": doc or "",
+                    "embedding": [float(x) for x in emb],
+                    "metadata_json": json.dumps(meta or {}, ensure_ascii=False),
+                })
+        if not records:
+            return False
+
+        os.makedirs(os.path.dirname(VECTOR_SNAPSHOT_PATH), exist_ok=True)
+        pd.DataFrame(records).to_parquet(VECTOR_SNAPSHOT_PATH, index=False)
+
+        manifest = {
+            "version": VECTOR_SNAPSHOT_VERSION,
+            "embed_model": _EMBED_MODEL,
+            "embed_dim": _EMBED_DIM,
+            "master_unique_count": _count_master_excel_patents(force=True),
+            "master_mtime": _master_excel_mtime(),
+            "snapshot_record_count": len(records),
+            "chroma_document_count": total,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "snapshot_sha256": _file_sha256(VECTOR_SNAPSHOT_PATH),
+        }
+        with open(VECTOR_MANIFEST_PATH, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"[벡터 스냅샷 export 오류] {e}")
+        return False
+
+
+def restore_chroma_from_snapshot(collection, batch_size: int = 100) -> int:
+    """로컬 parquet → ChromaDB (embeddings 포함, 재임베딩 없음)."""
+    valid, reason = _validate_local_vector_manifest()
+    if not valid:
+        print(f"[스냅샷 복원 검증 실패] {reason}")
+        return 0
+    try:
+        df = pd.read_parquet(VECTOR_SNAPSHOT_PATH)
+        if df.empty:
+            return 0
+        restored = 0
+        for i in range(0, len(df), batch_size):
+            chunk = df.iloc[i:i + batch_size]
+            ids = chunk["chroma_id"].astype(str).tolist()
+            embeddings = [
+                [float(x) for x in row]
+                for row in chunk["embedding"].tolist()
+            ]
+            documents = chunk["document"].astype(str).tolist()
+            metadatas = [
+                json.loads(m) if isinstance(m, str) else (m or {})
+                for m in chunk["metadata_json"].tolist()
+            ]
+            _upsert_embedding_batches(
+                collection, ids, embeddings, documents, metadatas, batch_size=batch_size
+            )
+            restored += len(ids)
+        _invalidate_patent_count_cache()
+        return restored
+    except Exception as e:
+        print(f"[스냅샷 복원 오류] {e}")
+        return 0
+
+
+def download_vector_snapshot_from_drive() -> bool:
+    """Drive → 로컬 manifest + parquet 다운로드."""
+    if not _drive_configured():
+        return False
+    man = download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
+    snap = download_file_from_drive(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
+    return man is True and snap is True
+
+
+def upload_vector_snapshot_to_drive() -> bool:
+    """로컬 manifest + parquet → Drive 업로드."""
+    if not _drive_configured():
+        return False
+    if not os.path.exists(VECTOR_SNAPSHOT_PATH) or not os.path.exists(VECTOR_MANIFEST_PATH):
+        return False
+    ok1 = upload_file_to_drive(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
+    ok2 = upload_file_to_drive(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
+    return ok1 and ok2
+
+
+def maybe_upload_vector_snapshot(collection) -> bool:
+    """Chroma 변경 후 스냅샷 export + Drive 업로드."""
+    if not _drive_configured() or safe_count(collection) == 0:
+        return False
+    if not export_vector_snapshot(collection):
+        return False
+    return upload_vector_snapshot_to_drive()
+
+
+def try_restore_chroma_from_drive(collection) -> tuple[int, str]:
+    """
+    Drive 스냅샷 다운로드 → 검증 → Chroma 복원.
+    반환: (복원 건수, 메시지)
+    """
+    if not _drive_configured():
+        return 0, "Google Drive 미설정"
+    if not download_vector_snapshot_from_drive():
+        return 0, "Drive에 스냅샷 없거나 다운로드 실패"
+    valid, reason = _validate_local_vector_manifest()
+    if not valid:
+        return 0, f"검증 실패: {reason}"
+    restored = restore_chroma_from_snapshot(collection)
+    if restored > 0:
+        return restored, f"Drive 스냅샷 {restored}건 복원"
+    return 0, "복원 0건"
+
+
+def load_vector_manifest_summary() -> dict | None:
+    """로컬 또는 Drive manifest 요약."""
+    if not os.path.exists(VECTOR_MANIFEST_PATH) and _drive_configured():
+        download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
+    if not os.path.exists(VECTOR_MANIFEST_PATH):
+        return None
+    try:
+        with open(VECTOR_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def process_and_update_db(uploaded_file, collection):
@@ -1840,6 +2236,8 @@ def process_and_update_db(uploaded_file, collection):
     synced = sync_chroma_missing_from_master(collection, hyperlink_map)
     if chroma_ingested or master_added or synced:
         _invalidate_patent_count_cache()
+        if chroma_ingested or synced:
+            maybe_upload_vector_snapshot(collection)
     return chroma_ingested, master_added, dup_in_file + already_indexed, skipped_empty, synced
 
 
@@ -1878,14 +2276,29 @@ def run_main_portal():
         and not st.session_state.auto_reindex_attempted
     ):
         st.session_state.auto_reindex_attempted = True
+        restored = 0
+        snapshot_msg = ""
         try:
-            with st.spinner("📦 벡터 DB 자동 재인덱싱 중... (특허 수에 따라 1~3분 소요)"):
-                restored = reindex_from_master_excel(collection)
+            if _drive_configured():
+                with st.spinner(
+                    "⚡ Google Drive 벡터 스냅샷 복원 시도 중... (재임베딩 생략)"
+                ):
+                    restored, snapshot_msg = try_restore_chroma_from_drive(collection)
+            if restored <= 0:
+                with st.spinner(
+                    "📦 벡터 DB 자동 재인덱싱 중... (스냅샷 없음·검증 실패, 1~3분 소요)"
+                ):
+                    restored = reindex_from_master_excel(collection)
+                if restored > 0:
+                    st.toast(f"✅ Excel 재인덱싱 완료 ({restored}건)")
+                elif snapshot_msg:
+                    st.caption(f"스냅샷: {snapshot_msg}")
+            else:
+                st.toast(f"✅ {snapshot_msg}")
             st.session_state._last_chroma_count = safe_count(collection)
             _invalidate_patent_count_cache()
-            st.toast(f"✅ 벡터 DB 복원 완료 ({restored}건)")
         except Exception as e:
-            st.warning(f"자동 재인덱싱 오류: {e}")
+            st.warning(f"벡터 DB 복원 오류: {e}")
 
     elif (
         master_n
@@ -1988,6 +2401,93 @@ def run_main_portal():
                             'admin = "1234!"',
                             language="toml"
                         )
+
+            st.divider()
+            st.subheader("☁️ Google Drive 벡터 스냅샷")
+            if not _GOOGLE_DRIVE_AVAILABLE:
+                st.caption("Drive 패키지 미설치 — requirements.txt 확인 후 재배포하세요.")
+            elif not _drive_configured():
+                st.caption(
+                    "Drive 미설정 — Secrets에 `GOOGLE_DRIVE_FOLDER_ID`와 "
+                    "`[gcp_service_account]`를 추가하세요."
+                )
+            else:
+                manifest = load_vector_manifest_summary()
+                if manifest:
+                    st.caption(
+                        f"Drive manifest: **{manifest.get('snapshot_record_count', '?')}건** · "
+                        f"모델 `{manifest.get('embed_model', '')}` · "
+                        f"생성 `{manifest.get('created_at', '')}`"
+                    )
+                else:
+                    st.caption("Drive에 스냅샷 없음 — 아래 버튼으로 첫 스냅샷을 생성하세요.")
+
+            if st.button("🔍 Google Drive 연결 진단", use_container_width=True):
+                with st.spinner("Drive 진단 중..."):
+                    dd = diagnose_google_drive()
+                if dd["folder_accessible"]:
+                    st.success(
+                        f"✅ Drive 연결 정상\n\n"
+                        f"- 폴더 ID: `{dd['folder_id']}`\n"
+                        f"- 서비스 계정: `{dd.get('client_email', '')}`\n"
+                        f"- manifest: {'있음' if dd['manifest_on_drive'] else '없음'}\n"
+                        f"- snapshot: {'있음' if dd['snapshot_on_drive'] else '없음'}"
+                    )
+                else:
+                    st.error(f"❌ Drive 연결 실패\n\n**원인:**\n{dd['error']}")
+
+            chroma_for_snap = safe_count(collection)
+            if st.button(
+                "💾 벡터 스냅샷 수동 생성 · Drive 업로드",
+                use_container_width=True,
+                disabled=chroma_for_snap == 0 or not _drive_configured(),
+                help="ChromaDB 현재 상태를 parquet로 내보내 Drive에 저장합니다. "
+                     "첫 마이그레이션·재배포 전 필수 1회 실행.",
+            ):
+                with st.spinner(
+                    f"ChromaDB {chroma_for_snap}건 스냅샷 생성 및 Drive 업로드 중..."
+                ):
+                    ok = maybe_upload_vector_snapshot(collection)
+                if ok:
+                    st.session_state.sync_feedback = {
+                        "level": "success",
+                        "message": (
+                            f"✅ 벡터 스냅샷 Drive 업로드 완료 "
+                            f"({chroma_for_snap}건). 재시작 시 재임베딩 없이 복원됩니다."
+                        ),
+                    }
+                else:
+                    st.session_state.sync_feedback = {
+                        "level": "error",
+                        "message": (
+                            "❌ 스냅샷 생성·업로드 실패 — "
+                            "**🔍 Google Drive 연결 진단**으로 폴더 공유·Secrets를 확인하세요."
+                        ),
+                    }
+                st.rerun()
+
+            if st.button(
+                "📥 Drive 스냅샷 → ChromaDB 수동 복원",
+                use_container_width=True,
+                disabled=not _drive_configured(),
+                help="재시작 없이 Drive 스냅샷으로 Chroma를 덮어씁니다. manifest 검증 통과 시에만 실행.",
+            ):
+                with st.spinner("Drive 스냅샷 다운로드 및 Chroma 복원 중..."):
+                    restored, msg = try_restore_chroma_from_drive(collection)
+                st.session_state._last_chroma_count = safe_count(collection)
+                _invalidate_patent_count_cache()
+                if restored > 0:
+                    st.session_state.sync_feedback = {
+                        "level": "success",
+                        "message": f"✅ {msg} (Chroma {safe_count(collection)}건)",
+                    }
+                else:
+                    st.session_state.sync_feedback = {
+                        "level": "warning",
+                        "message": f"⚠️ {msg}",
+                    }
+                st.rerun()
+
             st.divider()
 
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
@@ -2030,15 +2530,25 @@ def run_main_portal():
                         summary += f" / 마스터→Chroma 추가복구 **{synced}건**"
 
                     github_ok = None
+                    drive_ok = None
                     if chroma_new > 0 or master_new > 0 or synced > 0:
                         with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중... (대용량 파일은 최대 2분 소요)"):
                             github_ok = commit_and_push_data()
+                        if chroma_new > 0 or synced > 0:
+                            with st.spinner("☁️ Google Drive 벡터 스냅샷 업로드 중..."):
+                                drive_ok = maybe_upload_vector_snapshot(collection)
+                        drive_note = ""
+                        if drive_ok is True:
+                            drive_note = " Drive 벡터 스냅샷도 업데이트되었습니다."
+                        elif drive_ok is False and _drive_configured():
+                            drive_note = " Drive 스냅샷 업로드 실패 — 수동 생성 버튼을 실행하세요."
                         if github_ok:
                             st.session_state.upload_feedback = {
                                 "level": "success",
                                 "message": (
                                     f"{summary}\n\n"
                                     f"✅ 인덱싱 및 GitHub 백업 성공 — 재시작 후에도 데이터가 보존됩니다."
+                                    f"{drive_note}"
                                 ),
                             }
                             st.toast(f"✅ 적재 완료 (ChromaDB {total_now}건)")
@@ -2147,9 +2657,10 @@ def run_main_portal():
                             "level": "success",
                             "message": (
                                 f"✅ ChromaDB 누락분 **{synced}건** 복구 완료 "
-                                f"(현재 {safe_count(collection)}건). GitHub 백업을 권장합니다."
+                                f"(현재 {safe_count(collection)}건). GitHub·Drive 백업을 권장합니다."
                             ),
                         }
+                        maybe_upload_vector_snapshot(collection)
                     else:
                         st.session_state.sync_feedback = {
                             "level": "info",
