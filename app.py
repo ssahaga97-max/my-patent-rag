@@ -2172,10 +2172,7 @@ def run_gap_sync_step(collection, chunk_size: int = _GAP_SYNC_CHUNK) -> dict:
         result["synced_this_run"] = n
         result["remaining"] = total - n
         result["done"] = n >= total
-        if result["done"]:
-            ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
-            result["snapshot_ok"] = ok_snap
-            result["snapshot_msg"] = snap_msg
+        # 스냅샷 export+GCS 업로드는 수 분 소요 → gap 배치 루프와 분리 (수동 버튼)
     except Exception as e:
         result["done"] = True
         result["snapshot_ok"] = False
@@ -2206,6 +2203,14 @@ def _run_gap_sync_if_active(collection) -> None:
         f"ChromaDB 누락분 복구 중 (고유 {unique_n}→{master_n}, 남음 약 {gap}건)...",
         expanded=True,
     ) as status:
+        if st.button("⏹ 복구 중단", key="gap_sync_cancel"):
+            st.session_state.gap_sync_active = False
+            st.session_state.sync_feedback = {
+                "level": "warning",
+                "message": "누락분 복구를 중단했습니다. 나중에 버튼으로 다시 시작할 수 있습니다.",
+            }
+            st.rerun()
+
         step = run_gap_sync_step(collection)
         synced_session = (
             st.session_state.get("gap_sync_synced_session", 0)
@@ -2220,6 +2225,18 @@ def _run_gap_sync_if_active(collection) -> None:
             )
 
         if not step["done"]:
+            if step["synced_this_run"] == 0 and step["remaining"] > 0:
+                st.session_state.gap_sync_active = False
+                st.session_state.sync_feedback = {
+                    "level": "error",
+                    "message": (
+                        "❌ 누락분 복구가 진행되지 않습니다. "
+                        "앱을 새로고침한 뒤 **클라우드 스냅샷 → ChromaDB 수동 복원**을 "
+                        "먼저 시도하거나, 잠시 후 복구 버튼을 다시 눌러 주세요."
+                    ),
+                }
+                status.update(label="복구 중단", state="error")
+                st.rerun()
             total = step["total_missing"] or gap
             done_est = max(0, total - step["remaining"])
             pct = min(0.99, done_est / max(1, total))
@@ -2245,6 +2262,11 @@ def _run_gap_sync_if_active(collection) -> None:
                 msg += "\n\n☁️ GCS 벡터 스냅샷도 업데이트되었습니다."
             elif step.get("snapshot_ok") is False and step.get("snapshot_msg"):
                 msg += f"\n\n⚠️ GCS 스냅샷: {step['snapshot_msg']}"
+            else:
+                msg += (
+                    "\n\n💡 **벡터 스냅샷 수동 생성 · 업로드**를 실행하면 "
+                    "재시작 시 빠르게 복원됩니다."
+                )
             st.session_state.sync_feedback = {"level": "success", "message": msg}
             status.update(label="누락분 복구 완료", state="complete")
         else:
@@ -2903,16 +2925,7 @@ def run_main_portal():
 
     _run_gap_sync_if_active(collection)
 
-    if (
-        master_n
-        and chroma_n > 0
-        and unique_patent_n > 0
-        and master_n > unique_patent_n
-        and not st.session_state.chroma_gap_sync_done
-        and not st.session_state.get("gap_sync_active")
-    ):
-        _start_gap_sync()
-        st.rerun()
+    # 누락분 자동 복구는 로그인 후 무한 rerun·타임아웃 유발 → 수동 버튼만 사용
 
     is_admin = st.session_state.get("is_admin", False)
 
