@@ -1274,8 +1274,9 @@ def upload_file_to_gcs(local_file_path: str, blob_name: str) -> tuple[bool, str]
         print(f"[GCS upload 오류] {blob_name}: {e}")
         return False, (
             f"GCS 업로드 실패: {e}\n"
-            "GCP Console → Cloud Storage → 버킷 → 권한 → "
-            "서비스 계정에 **Storage 객체 관리자** 역할을 부여하세요."
+            "GCP Console → Cloud Storage → 버킷 → **권한** → **액세스 권한 부여** →\n"
+            "주 구성원: 서비스 계정 이메일 → 역할: **Storage 관리자** "
+            "(또는 Storage 객체 관리자)"
         )
 
 
@@ -1324,11 +1325,7 @@ def diagnose_gcs() -> dict:
 
     try:
         bucket = client.bucket(result["bucket_name"])
-        bucket.reload()
-        result["bucket_accessible"] = True
-        result["manifest_on_gcs"] = bucket.blob(VECTOR_MANIFEST_FILENAME).exists()
-        result["snapshot_on_gcs"] = bucket.blob(VECTOR_SNAPSHOT_FILENAME).exists()
-
+        # bucket.reload()는 storage.buckets.get 권한 필요 → 쓰기 테스트로 대체
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
         ) as tf:
@@ -1338,7 +1335,11 @@ def diagnose_gcs() -> dict:
             ok, msg = upload_file_to_gcs(test_path, "_patentrag_gcs_write_test.txt")
             result["write_test_ok"] = ok
             result["write_test_detail"] = msg
-            if not ok:
+            result["bucket_accessible"] = ok
+            if ok:
+                result["manifest_on_gcs"] = bucket.blob(VECTOR_MANIFEST_FILENAME).exists()
+                result["snapshot_on_gcs"] = bucket.blob(VECTOR_SNAPSHOT_FILENAME).exists()
+            else:
                 result["error"] = msg
         finally:
             try:
@@ -1346,9 +1347,25 @@ def diagnose_gcs() -> dict:
             except OSError:
                 pass
     except Exception as e:
-        result["error"] = (
-            f"GCS 버킷 접근 실패 — 버킷 이름·서비스 계정 Storage 권한 확인: {e}"
-        )
+        err = str(e)
+        if "storage.buckets.get" in err or "does not have" in err:
+            sa = ""
+            try:
+                sa = st.secrets["gcp_service_account"].get("client_email", "")
+            except Exception:
+                pass
+            result["error"] = (
+                f"버킷 IAM 권한 부족 — `{sa or '서비스 계정'}`에 "
+                f"버킷 `{result['bucket_name']}` 권한이 없습니다.\n\n"
+                "GCP Console → Cloud Storage → 해당 버킷 → **권한** → "
+                "**액세스 권한 부여** → 역할 **Storage 관리자** "
+                "(roles/storage.admin) 또는 **Storage 객체 관리자** "
+                "(roles/storage.objectAdmin) 추가."
+            )
+        else:
+            result["error"] = (
+                f"GCS 버킷 접근 실패 — 버킷 이름·서비스 계정 Storage 권한 확인: {e}"
+            )
     return result
 
 
@@ -2886,8 +2903,14 @@ def run_main_portal():
                     if not gd.get("write_test_ok"):
                         st.error(gd.get("write_test_detail") or gd.get("error", ""))
                         st.info(
-                            "GCP Console → Cloud Storage → 버킷 → **권한** → "
-                            "서비스 계정에 **Storage 객체 관리자** 역할 부여"
+                            "**GCP Console 설정 (5분)**\n"
+                            "1. [Cloud Storage](https://console.cloud.google.com/storage/browser) "
+                            f"→ 버킷 `{gd['bucket_name']}` 클릭\n"
+                            "2. **권한** 탭 → **액세스 권한 부여**\n"
+                            "3. 새 주 구성원:\n"
+                            "   `patent-rag-drive@patentrag.iam.gserviceaccount.com`\n"
+                            "4. 역할: **Storage 관리자** (Storage Admin)\n"
+                            "5. 저장 후 1~2분 뒤 **GCS 연결 진단** 재실행"
                         )
                 else:
                     st.error(f"❌ GCS 연결 실패\n\n**원인:**\n{gd['error']}")
