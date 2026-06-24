@@ -1,0 +1,8 @@
+my_patent_vector_db/
+__pycache__/
+*.pyc
+.env
+.streamlit/
+patentrag-*.json
+my_patent_folder/vector_snapshot.parquet
+my_patent_folder/vector_manifest.json
