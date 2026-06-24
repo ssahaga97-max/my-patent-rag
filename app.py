@@ -24,9 +24,11 @@ try:
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
     from googleapiclient.errors import HttpError
+    from google.cloud import storage as gcs_storage
     _GOOGLE_DRIVE_AVAILABLE = True
 except ImportError:
     HttpError = Exception  # type: ignore
+    gcs_storage = None  # type: ignore
     _GOOGLE_DRIVE_AVAILABLE = False
 
 # --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
@@ -799,8 +801,12 @@ def download_master_excel_from_github():
 
 # ==========================================
 # Google Drive API (벡터 스냅샷 영속화)
+# 개인 Gmail + 서비스 계정은 storageQuotaExceeded(403)가 자주 발생 → GCS 버킷 권장
 # ==========================================
-_DRIVE_SCOPES = ("https://www.googleapis.com/auth/drive",)
+_GCP_SCOPES = (
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/devstorage.read_write",
+)
 
 
 def _drive_configured() -> bool:
@@ -849,7 +855,7 @@ def _get_gcp_credentials():
         if isinstance(pk, str) and "\\n" in pk and "-----BEGIN" in pk:
             sa_info["private_key"] = pk.replace("\\n", "\n")
         creds = service_account.Credentials.from_service_account_info(
-            sa_info, scopes=_DRIVE_SCOPES
+            sa_info, scopes=_GCP_SCOPES
         )
         # Workspace 도메인 위임(선택) — 개인 Gmail은 미지원
         delegate = _clean_ascii(str(st.secrets.get("GOOGLE_DRIVE_DELEGATE_EMAIL", "")))
@@ -908,6 +914,34 @@ def _drive_sa_permission_role(service, folder_id: str, client_email: str) -> str
     return "not_listed"
 
 
+def _drive_two_step_create(
+    service,
+    folder_id: str,
+    drive_filename: str,
+    local_file_path: str,
+    *,
+    shared_drive: bool,
+) -> None:
+    """메타데이터만 먼저 생성 후 본문 업로드 — storageQuotaExceeded 우회 시도."""
+    body = {"name": drive_filename, "parents": [folder_id]}
+    create_kw: dict = {"body": body, "fields": "id"}
+    if shared_drive:
+        create_kw["supportsAllDrives"] = True
+    created = service.files().create(**create_kw).execute()
+    file_id = created["id"]
+
+    size = os.path.getsize(local_file_path)
+    media = MediaFileUpload(
+        local_file_path,
+        mimetype="application/octet-stream",
+        resumable=size > 5 * 1024 * 1024,
+    )
+    update_kw: dict = {"fileId": file_id, "media_body": media}
+    if shared_drive:
+        update_kw["supportsAllDrives"] = True
+    service.files().update(**update_kw).execute()
+
+
 def _drive_create_or_update_file(
     service,
     folder_id: str,
@@ -946,6 +980,20 @@ def _drive_create_or_update_file(
             return
         except Exception as e:
             last_exc = e
+            err = _drive_format_error(e)
+            if (
+                not file_id
+                and ("storageQuota" in err or "storage quota" in err.lower())
+            ):
+                try:
+                    _drive_two_step_create(
+                        service, folder_id, drive_filename, local_file_path,
+                        shared_drive=use_shared_drive_flag,
+                    )
+                    return
+                except Exception as e2:
+                    last_exc = e2
+                    continue
             continue
     if last_exc:
         raise last_exc
@@ -1161,6 +1209,146 @@ def diagnose_google_drive() -> dict:
                 f"Drive 폴더 접근 실패 — 서비스 계정을 폴더 '편집자'로 공유했는지, "
                 f"GOOGLE_DRIVE_FOLDER_ID가 올바른지 확인: {e}"
             )
+    return result
+
+
+# ==========================================
+# Google Cloud Storage (벡터 스냅샷 — 서비스 계정 권장 저장소)
+# ==========================================
+def _get_gcs_bucket_name() -> str | None:
+    try:
+        name = _clean_ascii(str(st.secrets.get("GCS_BUCKET_NAME", "")))
+        return name if name else None
+    except Exception:
+        return None
+
+
+def _gcs_configured() -> bool:
+    if not _GOOGLE_DRIVE_AVAILABLE or gcs_storage is None:
+        return False
+    try:
+        return bool(_get_gcs_bucket_name() and "gcp_service_account" in st.secrets)
+    except Exception:
+        return False
+
+
+def _vector_storage_configured() -> bool:
+    return _gcs_configured() or _drive_configured()
+
+
+def _vector_storage_label() -> str:
+    if _gcs_configured():
+        return f"GCS (`{_get_gcs_bucket_name()}`)"
+    if _drive_configured():
+        return "Google Drive"
+    return "미설정"
+
+
+@st.cache_resource
+def _get_gcs_client():
+    creds = _get_gcp_credentials()
+    if not creds or gcs_storage is None:
+        return None
+    try:
+        project = st.secrets["gcp_service_account"].get("project_id", "")
+        return gcs_storage.Client(credentials=creds, project=project or None)
+    except Exception as e:
+        print(f"[GCS client 오류] {e}")
+        return None
+
+
+def upload_file_to_gcs(local_file_path: str, blob_name: str) -> tuple[bool, str]:
+    bucket_name = _get_gcs_bucket_name()
+    client = _get_gcs_client()
+    if not client or not bucket_name:
+        return False, "GCS 미설정 (GCS_BUCKET_NAME)"
+    if not os.path.exists(local_file_path):
+        return False, f"로컬 파일 없음: {local_file_path}"
+    try:
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(local_file_path)
+        size_kb = os.path.getsize(local_file_path) // 1024
+        return True, f"gs://{bucket_name}/{blob_name} ({size_kb} KB)"
+    except Exception as e:
+        print(f"[GCS upload 오류] {blob_name}: {e}")
+        return False, (
+            f"GCS 업로드 실패: {e}\n"
+            "GCP Console → Cloud Storage → 버킷 → 권한 → "
+            "서비스 계정에 **Storage 객체 관리자** 역할을 부여하세요."
+        )
+
+
+def download_file_from_gcs(blob_name: str, local_path: str):
+    """반환: True=성공, None=없음, False=오류"""
+    bucket_name = _get_gcs_bucket_name()
+    client = _get_gcs_client()
+    if not client or not bucket_name:
+        return False
+    try:
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return None
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        blob.download_to_filename(local_path)
+        return True
+    except Exception as e:
+        print(f"[GCS download 오류] {blob_name}: {e}")
+        return False
+
+
+def diagnose_gcs() -> dict:
+    result = {
+        "configured": False,
+        "bucket_name": "",
+        "client_ok": False,
+        "bucket_accessible": False,
+        "manifest_on_gcs": False,
+        "snapshot_on_gcs": False,
+        "write_test_ok": False,
+        "write_test_detail": "",
+        "error": "",
+    }
+    if not _gcs_configured():
+        result["error"] = "GCS_BUCKET_NAME 또는 gcp_service_account 미설정"
+        return result
+    result["configured"] = True
+    result["bucket_name"] = _get_gcs_bucket_name() or ""
+
+    client = _get_gcs_client()
+    if not client:
+        result["error"] = "GCS 클라이언트 초기화 실패"
+        return result
+    result["client_ok"] = True
+
+    try:
+        bucket = client.bucket(result["bucket_name"])
+        bucket.reload()
+        result["bucket_accessible"] = True
+        result["manifest_on_gcs"] = bucket.blob(VECTOR_MANIFEST_FILENAME).exists()
+        result["snapshot_on_gcs"] = bucket.blob(VECTOR_SNAPSHOT_FILENAME).exists()
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write("PatentRAG GCS write test")
+            test_path = tf.name
+        try:
+            ok, msg = upload_file_to_gcs(test_path, "_patentrag_gcs_write_test.txt")
+            result["write_test_ok"] = ok
+            result["write_test_detail"] = msg
+            if not ok:
+                result["error"] = msg
+        finally:
+            try:
+                os.remove(test_path)
+            except OSError:
+                pass
+    except Exception as e:
+        result["error"] = (
+            f"GCS 버킷 접근 실패 — 버킷 이름·서비스 계정 Storage 권한 확인: {e}"
+        )
     return result
 
 
@@ -2303,70 +2491,98 @@ def restore_chroma_from_snapshot(collection, batch_size: int = 100) -> int:
         return 0
 
 
-def download_vector_snapshot_from_drive() -> bool:
-    """Drive → 로컬 manifest + parquet 다운로드."""
-    if not _drive_configured():
-        return False
-    man = download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
-    snap = download_file_from_drive(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
-    return man is True and snap is True
+def download_vector_snapshot_from_storage() -> bool:
+    """GCS(우선) 또는 Drive → 로컬 manifest + parquet."""
+    if _gcs_configured():
+        man = download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
+        snap = download_file_from_gcs(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
+        return man is True and snap is True
+    if _drive_configured():
+        man = download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
+        snap = download_file_from_drive(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
+        return man is True and snap is True
+    return False
 
 
-def upload_vector_snapshot_to_drive() -> tuple[bool, str]:
-    """로컬 manifest + parquet → Drive 업로드."""
-    if not _drive_configured():
-        return False, "Drive 미설정"
+def upload_vector_snapshot_to_storage() -> tuple[bool, str]:
+    """로컬 manifest + parquet → GCS(우선) 또는 Drive."""
     if not os.path.exists(VECTOR_SNAPSHOT_PATH) or not os.path.exists(VECTOR_MANIFEST_PATH):
         return False, "로컬 스냅샷 파일 없음 — export 먼저 실행"
 
-    ok_m, msg_m = upload_file_to_drive(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
-    if not ok_m:
-        return False, msg_m
+    if _gcs_configured():
+        ok_m, msg_m = upload_file_to_gcs(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
+        if not ok_m:
+            return False, msg_m
+        ok_s, msg_s = upload_file_to_gcs(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
+        if not ok_s:
+            return False, f"manifest는 GCS 업로드됨. parquet 실패: {msg_s}"
+        return True, f"GCS 업로드 완료 — {msg_m}, {msg_s}"
 
-    ok_s, msg_s = upload_file_to_drive(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
-    if not ok_s:
-        return False, f"manifest는 업로드됨. parquet 실패: {msg_s}"
+    if _drive_configured():
+        ok_m, msg_m = upload_file_to_drive(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
+        if not ok_m:
+            return False, msg_m
+        ok_s, msg_s = upload_file_to_drive(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
+        if not ok_s:
+            return False, f"manifest는 업로드됨. parquet 실패: {msg_s}"
+        return True, f"Drive 업로드 완료 — {msg_m}, {msg_s}"
 
-    return True, f"Drive 업로드 완료 — {msg_m}, {msg_s}"
+    return False, "스냅샷 저장소 미설정 (GCS_BUCKET_NAME 또는 GOOGLE_DRIVE_FOLDER_ID)"
 
 
 def maybe_upload_vector_snapshot(collection) -> tuple[bool, str]:
-    """Chroma 변경 후 스냅샷 export + Drive 업로드."""
-    if not _drive_configured():
-        return False, "Drive 미설정 (GOOGLE_DRIVE_FOLDER_ID, gcp_service_account)"
+    """Chroma 변경 후 스냅샷 export + 클라우드 업로드."""
+    if not _vector_storage_configured():
+        return False, (
+            "스냅샷 저장소 미설정 — Secrets에 GCS_BUCKET_NAME(권장) 또는 "
+            "GOOGLE_DRIVE_FOLDER_ID를 설정하세요."
+        )
     if safe_count(collection) == 0:
         return False, "ChromaDB 비어 있음"
     ok, msg = export_vector_snapshot(collection)
     if not ok:
         return False, f"export 실패: {msg}"
-    ok2, msg2 = upload_vector_snapshot_to_drive()
+    ok2, msg2 = upload_vector_snapshot_to_storage()
     if not ok2:
         return False, f"upload 실패: {msg2}"
-    return True, f"{msg} | {msg2}"
+    return True, f"[{_vector_storage_label()}] {msg} | {msg2}"
 
 
-def try_restore_chroma_from_drive(collection) -> tuple[int, str]:
-    """
-    Drive 스냅샷 다운로드 → 검증 → Chroma 복원.
-    반환: (복원 건수, 메시지)
-    """
-    if not _drive_configured():
-        return 0, "Google Drive 미설정"
-    if not download_vector_snapshot_from_drive():
-        return 0, "Drive에 스냅샷 없거나 다운로드 실패"
+def try_restore_chroma_from_storage(collection) -> tuple[int, str]:
+    """GCS/Drive 스냅샷 다운로드 → 검증 → Chroma 복원."""
+    if not _vector_storage_configured():
+        return 0, "스냅샷 저장소 미설정"
+    if not download_vector_snapshot_from_storage():
+        return 0, f"{_vector_storage_label()}에 스냅샷 없거나 다운로드 실패"
     valid, reason = _validate_local_vector_manifest()
     if not valid:
         return 0, f"검증 실패: {reason}"
     restored = restore_chroma_from_snapshot(collection)
     if restored > 0:
-        return restored, f"Drive 스냅샷 {restored}건 복원"
+        return restored, f"{_vector_storage_label()} 스냅샷 {restored}건 복원"
     return 0, "복원 0건"
 
 
+# 하위 호환 별칭
+def download_vector_snapshot_from_drive() -> bool:
+    return download_vector_snapshot_from_storage()
+
+
+def upload_vector_snapshot_to_drive() -> tuple[bool, str]:
+    return upload_vector_snapshot_to_storage()
+
+
+def try_restore_chroma_from_drive(collection) -> tuple[int, str]:
+    return try_restore_chroma_from_storage(collection)
+
+
 def load_vector_manifest_summary() -> dict | None:
-    """로컬 또는 Drive manifest 요약."""
-    if not os.path.exists(VECTOR_MANIFEST_PATH) and _drive_configured():
-        download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
+    """로컬 또는 클라우드 manifest 요약."""
+    if not os.path.exists(VECTOR_MANIFEST_PATH) and _vector_storage_configured():
+        if _gcs_configured():
+            download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
+        elif _drive_configured():
+            download_file_from_drive(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
     if not os.path.exists(VECTOR_MANIFEST_PATH):
         return None
     try:
@@ -2505,11 +2721,11 @@ def run_main_portal():
         restored = 0
         snapshot_msg = ""
         try:
-            if _drive_configured():
+            if _vector_storage_configured():
                 with st.spinner(
-                    "⚡ Google Drive 벡터 스냅샷 복원 시도 중... (재임베딩 생략)"
+                    f"⚡ {_vector_storage_label()} 벡터 스냅샷 복원 시도 중... (재임베딩 생략)"
                 ):
-                    restored, snapshot_msg = try_restore_chroma_from_drive(collection)
+                    restored, snapshot_msg = try_restore_chroma_from_storage(collection)
             if restored <= 0:
                 with st.spinner(
                     "📦 벡터 DB 자동 재인덱싱 중... (스냅샷 없음·검증 실패, 1~3분 소요)"
@@ -2629,26 +2845,56 @@ def run_main_portal():
                         )
 
             st.divider()
-            st.subheader("☁️ Google Drive 벡터 스냅샷")
+            st.subheader("☁️ 벡터 스냅샷 (클라우드)")
+            storage_label = _vector_storage_label()
             if not _GOOGLE_DRIVE_AVAILABLE:
-                st.caption("Drive 패키지 미설치 — requirements.txt 확인 후 재배포하세요.")
-            elif not _drive_configured():
+                st.caption("GCP 패키지 미설치 — requirements.txt 확인 후 재배포하세요.")
+            elif not _vector_storage_configured():
                 st.caption(
-                    "Drive 미설정 — Secrets에 `GOOGLE_DRIVE_FOLDER_ID`와 "
-                    "`[gcp_service_account]`를 추가하세요."
+                    "**권장:** Secrets에 `GCS_BUCKET_NAME` + `[gcp_service_account]` 설정.\n\n"
+                    "또는 `GOOGLE_DRIVE_FOLDER_ID` (개인 Gmail은 서비스 계정 업로드가 "
+                    "storageQuotaExceeded로 실패할 수 있음)."
                 )
             else:
+                st.caption(f"활성 저장소: **{storage_label}**")
                 manifest = load_vector_manifest_summary()
                 if manifest:
                     st.caption(
-                        f"Drive manifest: **{manifest.get('snapshot_record_count', '?')}건** · "
+                        f"manifest: **{manifest.get('snapshot_record_count', '?')}건** · "
                         f"모델 `{manifest.get('embed_model', '')}` · "
                         f"생성 `{manifest.get('created_at', '')}`"
                     )
                 else:
-                    st.caption("Drive에 스냅샷 없음 — 아래 버튼으로 첫 스냅샷을 생성하세요.")
+                    st.caption("클라우드에 스냅샷 없음 — 아래 버튼으로 첫 스냅샷을 생성하세요.")
 
-            if st.button("🔍 Google Drive 연결 진단", use_container_width=True):
+            if _gcs_configured() and st.button("🔍 GCS 연결 진단", use_container_width=True):
+                with st.spinner("GCS 진단 중..."):
+                    gd = diagnose_gcs()
+                if gd["bucket_accessible"]:
+                    write_line = (
+                        "✅ 쓰기 테스트 통과"
+                        if gd.get("write_test_ok")
+                        else "⚠️ 쓰기 테스트 실패"
+                    )
+                    st.success(
+                        f"✅ GCS 버킷 접근 정상\n\n"
+                        f"- 버킷: `{gd['bucket_name']}`\n"
+                        f"- manifest: {'있음' if gd['manifest_on_gcs'] else '없음'}\n"
+                        f"- snapshot: {'있음' if gd['snapshot_on_gcs'] else '없음'}\n"
+                        f"- {write_line}"
+                    )
+                    if not gd.get("write_test_ok"):
+                        st.error(gd.get("write_test_detail") or gd.get("error", ""))
+                        st.info(
+                            "GCP Console → Cloud Storage → 버킷 → **권한** → "
+                            "서비스 계정에 **Storage 객체 관리자** 역할 부여"
+                        )
+                else:
+                    st.error(f"❌ GCS 연결 실패\n\n**원인:**\n{gd['error']}")
+
+            if _drive_configured() and st.button(
+                "🔍 Google Drive 연결 진단", use_container_width=True
+            ):
                 with st.spinner("Drive 진단 중..."):
                     dd = diagnose_google_drive()
                 if dd["folder_accessible"]:
@@ -2675,16 +2921,21 @@ def run_main_portal():
                             "**쓰기 실패 상세**\n\n"
                             f"{dd.get('write_test_detail') or dd.get('error', '')}"
                         )
-                        st.info(
-                            "**해결 체크리스트**\n"
-                            "1. Drive에서 `PatentRAG_VectorStore` 폴더 → **공유**\n"
-                            f"2. 위 **서비스 계정 이메일**을 **편집자**로 추가 (링크 공유만으로는 안 됨)\n"
-                            "3. 공유 후 1~2분 대기 후 진단 재실행\n"
-                            "4. (Google Workspace) **공유 드라이브**에 폴더를 만들고 "
-                            "서비스 계정을 **콘텐츠 관리자**로 추가하는 방법도 있습니다.\n"
-                            "5. (Workspace) 도메인 위임 사용 시 Secrets에 "
-                            "`GOOGLE_DRIVE_DELEGATE_EMAIL = \"본인@회사.com\"` 추가"
-                        )
+                        detail = dd.get("write_test_detail", "") or dd.get("error", "")
+                        if "storageQuotaExceeded" in detail:
+                            st.warning(
+                                "**개인 Gmail + 서비스 계정 한계:** 서비스 계정은 Drive 저장 용량이 "
+                                "0이라 폴더를 편집자로 공유해도 업로드가 거부됩니다.\n\n"
+                                "**권장 해결:** Secrets에 `GCS_BUCKET_NAME = \"버킷이름\"`을 추가하고 "
+                                "GCS 연결 진단을 실행하세요."
+                            )
+                        else:
+                            st.info(
+                                "**해결 체크리스트**\n"
+                                "1. Drive에서 폴더 → **공유** → 서비스 계정을 **편집자**로 추가\n"
+                                "2. (Workspace) **공유 드라이브**에 폴더 생성 + SA를 **콘텐츠 관리자**로 추가\n"
+                                "3. 또는 **GCS 버킷** 사용 (개인 Gmail에서 가장 안정적)"
+                            )
                     elif dd.get("error"):
                         st.warning(dd["error"])
                 else:
@@ -2692,21 +2943,21 @@ def run_main_portal():
 
             chroma_for_snap = safe_count(collection)
             if st.button(
-                "💾 벡터 스냅샷 수동 생성 · Drive 업로드",
+                f"💾 벡터 스냅샷 수동 생성 · 업로드 ({storage_label})",
                 use_container_width=True,
-                disabled=chroma_for_snap == 0 or not _drive_configured(),
-                help="ChromaDB 현재 상태를 parquet로 내보내 Drive에 저장합니다. "
+                disabled=chroma_for_snap == 0 or not _vector_storage_configured(),
+                help="ChromaDB 현재 상태를 parquet로 내보내 클라우드에 저장합니다. "
                      "첫 마이그레이션·재배포 전 필수 1회 실행.",
             ):
                 with st.spinner(
-                    f"ChromaDB {chroma_for_snap}건 스냅샷 생성 및 Drive 업로드 중..."
+                    f"ChromaDB {chroma_for_snap}건 스냅샷 생성 및 {storage_label} 업로드 중..."
                 ):
                     ok, snap_detail = maybe_upload_vector_snapshot(collection)
                 if ok:
                     st.session_state.sync_feedback = {
                         "level": "success",
                         "message": (
-                            f"✅ 벡터 스냅샷 Drive 업로드 완료 "
+                            f"✅ 벡터 스냅샷 업로드 완료 "
                             f"({chroma_for_snap}건). 재시작 시 재임베딩 없이 복원됩니다.\n\n"
                             f"{snap_detail}"
                         ),
@@ -2717,20 +2968,20 @@ def run_main_portal():
                         "message": (
                             f"❌ 스냅샷 생성·업로드 실패\n\n"
                             f"**상세:** {snap_detail}\n\n"
-                            f"👉 **🔍 Google Drive 연결 진단** 실행 후 "
-                            f"서비스 계정 편집자 공유·GOOGLE_DRIVE_FOLDER_ID를 확인하세요."
+                            f"👉 **GCS 연결 진단** 또는 **Drive 연결 진단**을 실행하세요. "
+                            f"개인 Gmail은 GCS 버킷 사용을 권장합니다."
                         ),
                     }
                 st.rerun()
 
             if st.button(
-                "📥 Drive 스냅샷 → ChromaDB 수동 복원",
+                f"📥 클라우드 스냅샷 → ChromaDB 수동 복원 ({storage_label})",
                 use_container_width=True,
-                disabled=not _drive_configured(),
-                help="재시작 없이 Drive 스냅샷으로 Chroma를 덮어씁니다. manifest 검증 통과 시에만 실행.",
+                disabled=not _vector_storage_configured(),
+                help="재시작 없이 클라우드 스냅샷으로 Chroma를 덮어씁니다. manifest 검증 통과 시에만 실행.",
             ):
-                with st.spinner("Drive 스냅샷 다운로드 및 Chroma 복원 중..."):
-                    restored, msg = try_restore_chroma_from_drive(collection)
+                with st.spinner(f"{storage_label} 스냅샷 다운로드 및 Chroma 복원 중..."):
+                    restored, msg = try_restore_chroma_from_storage(collection)
                 st.session_state._last_chroma_count = safe_count(collection)
                 _invalidate_patent_count_cache()
                 if restored > 0:
@@ -2793,14 +3044,16 @@ def run_main_portal():
                         with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중... (대용량 파일은 최대 2분 소요)"):
                             github_ok = commit_and_push_data()
                         if chroma_new > 0 or synced > 0:
-                            with st.spinner("☁️ Google Drive 벡터 스냅샷 업로드 중..."):
+                            with st.spinner(
+                                f"☁️ 벡터 스냅샷 업로드 중 ({_vector_storage_label()})..."
+                            ):
                                 drive_ok, drive_detail = maybe_upload_vector_snapshot(collection)
                         drive_note = ""
                         if drive_ok is True:
-                            drive_note = " Drive 벡터 스냅샷도 업데이트되었습니다."
-                        elif drive_ok is False and _drive_configured():
+                            drive_note = f" {_vector_storage_label()} 벡터 스냅샷도 업데이트되었습니다."
+                        elif drive_ok is False and _vector_storage_configured():
                             drive_note = (
-                                f" Drive 스냅샷 업로드 실패 — {drive_detail} "
+                                f" 스냅샷 업로드 실패 — {drive_detail} "
                                 f"수동 생성 버튼을 실행하세요."
                             )
                         if github_ok:
