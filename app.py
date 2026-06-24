@@ -2505,9 +2505,6 @@ def reindex_from_master_excel(collection) -> int:
 
         _upsert_patent_batches(collection, ids, docs, metas)
         _invalidate_patent_count_cache()
-        ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
-        if not ok_snap:
-            print(f"[재인덱싱 후 스냅샷 업로드 스킵] {snap_msg}")
         return len(ids)
     except Exception as e:
         print(f"재인덱싱 실패: {e}")
@@ -2542,8 +2539,8 @@ def _upsert_embedding_batches(
         )
 
 
-def _validate_local_vector_manifest() -> tuple[bool, str]:
-    """로컬 manifest·parquet 무결성 및 마스터 정합 검증."""
+def _validate_local_vector_manifest(*, for_restore: bool = False) -> tuple[bool, str]:
+    """로컬 manifest·parquet 무결성 검증. for_restore=True면 mtime·건수 불일치 허용."""
     if not os.path.exists(VECTOR_MANIFEST_PATH):
         return False, "manifest 파일 없음"
     if not os.path.exists(VECTOR_SNAPSHOT_PATH):
@@ -2557,20 +2554,21 @@ def _validate_local_vector_manifest() -> tuple[bool, str]:
             return False, "임베딩 모델 불일치"
         if manifest.get("embed_dim") != _EMBED_DIM:
             return False, "임베딩 차원 불일치"
-        master_n = _count_master_excel_patents(force=True)
-        if master_n is None:
-            return False, "마스터 엑셀 없음"
-        if manifest.get("master_unique_count") != master_n:
-            return False, (
-                f"마스터 건수 불일치 (manifest={manifest.get('master_unique_count')}, "
-                f"local={master_n})"
-            )
-        mtime = _master_excel_mtime()
-        if abs(float(manifest.get("master_mtime", -999)) - mtime) > 1.0:
-            return False, "마스터 mtime 불일치"
         sha = _file_sha256(VECTOR_SNAPSHOT_PATH)
         if manifest.get("snapshot_sha256") != sha:
             return False, "snapshot SHA256 불일치"
+        if not for_restore:
+            master_n = _count_master_excel_patents(force=True)
+            if master_n is None:
+                return False, "마스터 엑셀 없음"
+            if manifest.get("master_unique_count") != master_n:
+                return False, (
+                    f"마스터 건수 불일치 (manifest={manifest.get('master_unique_count')}, "
+                    f"local={master_n})"
+                )
+            mtime = _master_excel_mtime()
+            if abs(float(manifest.get("master_mtime", -999)) - mtime) > 1.0:
+                return False, "마스터 mtime 불일치"
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -2639,7 +2637,7 @@ def export_vector_snapshot(collection, batch_size: int = 500) -> tuple[bool, str
 
 def restore_chroma_from_snapshot(collection, batch_size: int = 100) -> int:
     """로컬 parquet → ChromaDB (embeddings 포함, 재임베딩 없음)."""
-    valid, reason = _validate_local_vector_manifest()
+    valid, reason = _validate_local_vector_manifest(for_restore=True)
     if not valid:
         print(f"[스냅샷 복원 검증 실패] {reason}")
         return 0
@@ -2733,7 +2731,7 @@ def try_restore_chroma_from_storage(collection) -> tuple[int, str]:
         return 0, "스냅샷 저장소 미설정"
     if not download_vector_snapshot_from_storage():
         return 0, f"{_vector_storage_label()}에 스냅샷 없거나 다운로드 실패"
-    valid, reason = _validate_local_vector_manifest()
+    valid, reason = _validate_local_vector_manifest(for_restore=True)
     if not valid:
         return 0, f"검증 실패: {reason}"
     restored = restore_chroma_from_snapshot(collection)
@@ -2908,14 +2906,16 @@ def run_main_portal():
                 ):
                     restored, snapshot_msg = try_restore_chroma_from_storage(collection)
             if restored <= 0:
-                with st.spinner(
-                    "📦 벡터 DB 자동 재인덱싱 중... (스냅샷 없음·검증 실패, 1~3분 소요)"
-                ):
-                    restored = reindex_from_master_excel(collection)
-                if restored > 0:
-                    st.toast(f"✅ Excel 재인덱싱 완료 ({restored}건)")
-                elif snapshot_msg:
-                    st.caption(f"스냅샷: {snapshot_msg}")
+                st.session_state.sync_feedback = {
+                    "level": "warning",
+                    "message": (
+                        f"⚡ ChromaDB가 비어 있습니다. GCS 스냅샷 자동 복원 실패"
+                        f"{f' — {snapshot_msg}' if snapshot_msg else ''}.\n\n"
+                        "**관리자:** 사이드바 → **📥 클라우드 스냅샷 → ChromaDB 수동 복원** "
+                        "을 실행하세요 (1~3분, 재임베딩 없음).\n\n"
+                        "전체 Excel 재인덱싱(20~40분)은 **누락분 복구**로 대체하는 것을 권장합니다."
+                    ),
+                }
             else:
                 st.toast(f"✅ {snapshot_msg}")
             st.session_state._last_chroma_count = safe_count(collection)
