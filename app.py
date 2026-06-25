@@ -6,84 +6,93 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 import io
 import re
-import chromadb
-from chromadb.api.client import SharedSystemClient
-from chromadb.utils import embedding_functions
-from langchain_groq import ChatGroq
-import openpyxl
 import json
+import time
 import base64
 import hashlib
 import hmac
+import shutil
+import tarfile
 import smtplib
-import tempfile
-import time
+import chromadb
+from chromadb.utils import embedding_functions
+from langchain_groq import ChatGroq
+import openpyxl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
 
+# boto3: Cloudflare R2 (S3 호환) 클라이언트
 try:
-    from google.oauth2 import service_account
-    from google.cloud import storage as gcs_storage
-    _GCP_AVAILABLE = True
+    import boto3
+    from botocore.config import Config as _BotoConfig
+    _BOTO_AVAILABLE = True
 except ImportError:
-    gcs_storage = None  # type: ignore
-    _GCP_AVAILABLE = False
+    boto3 = None  # type: ignore
+    _BOTO_AVAILABLE = False
 
-# --- 1. 클라우드 서버 전용 절대 경로 고정 및 초기화 ---
+# Google Gemini 임베딩
+try:
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
+except ImportError:
+    genai = None  # type: ignore
+    _GENAI_AVAILABLE = False
+
+
+# ==========================================
+# 1. 경로·상수
+# ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MASTER_EXCEL_PATH    = os.path.join(BASE_DIR, "my_patent_folder", "master_patents.xlsx")
-USER_REGISTRY_PATH   = os.path.join(BASE_DIR, "my_patent_folder", "user_registry.json")
-VECTOR_SNAPSHOT_PATH = os.path.join(BASE_DIR, "my_patent_folder", "vector_snapshot.parquet")
-VECTOR_MANIFEST_PATH = os.path.join(BASE_DIR, "my_patent_folder", "vector_manifest.json")
-VECTOR_SNAPSHOT_FILENAME = "vector_snapshot.parquet"  # GCS 고정명 — 업로드 시 덮어쓰기(용량 누수 방지)
-VECTOR_MANIFEST_FILENAME = "vector_manifest.json"
-VECTOR_SNAPSHOT_VERSION  = 1
-_EMBED_DIM = 768  # paraphrase-multilingual-mpnet-base-v2
-os.makedirs(os.path.join(BASE_DIR, "my_patent_folder"), exist_ok=True)
+DATA_DIR = os.path.join(BASE_DIR, "my_patent_folder")
+CHROMA_DIR = os.path.join(DATA_DIR, "chroma_db")          # PersistentClient 디렉토리
+USER_REGISTRY_PATH = os.path.join(DATA_DIR, "user_registry.json")
+LOGO_PATH = os.path.join(BASE_DIR, "atec_logo.png")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# R2 오브젝트 키 (버킷 내 고정 경로)
+R2_SNAPSHOT_KEY = "chroma_snapshot.tar.gz"
+R2_REGISTRY_KEY = "user_registry.json"
+R2_LOGO_KEY = "atec_logo.png"
+
+_EMBED_DIM = 768                      # Gemini text-embedding-004 = 768
+_COLLECTION_NAME = "competitor_patents"
+
+# ── Groq 무료 한도 (2026-06 기준: llama-3.3-70b-versatile = 12K TPM / 100K TPD) ──
+GROQ_TPM_LIMIT = 12000
+GROQ_MAX_OUTPUT_TOKENS = 1024
+GROQ_REQUEST_MARGIN = 800             # 추정 오차·API 오버헤드 여유
+GROQ_DAILY_TOKEN_LIMIT = 100000       # TPD — 일일 누적 추적용
 
 st.set_page_config(page_title="AI 경쟁사 특허 조사 분석", layout="wide", page_icon="🔬")
 
 
 # ==========================================
-# 0. 전역 스코프 세션 상태 격리 및 초기화
+# 2. 세션 상태 초기화
 # ==========================================
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user_id" not in st.session_state:
-    st.session_state.user_id = None
-if "is_admin" not in st.session_state:
-    st.session_state.is_admin = False
-# 프로세스 재시작 감지용 플래그 — @st.cache_resource가 초기화되면 항상 True
-if "github_synced" not in st.session_state:
-    st.session_state.github_synced = False
-if "upload_feedback" not in st.session_state:
-    st.session_state.upload_feedback = None
-if "sync_feedback" not in st.session_state:
-    st.session_state.sync_feedback = None
-if "auto_reindex_attempted" not in st.session_state:
-    st.session_state.auto_reindex_attempted = False
-if "_last_chroma_count" not in st.session_state:
-    st.session_state._last_chroma_count = 0
-if "chroma_gap_sync_done" not in st.session_state:
-    st.session_state.chroma_gap_sync_done = False
-if "gap_sync_active" not in st.session_state:
-    st.session_state.gap_sync_active = False
-if "gap_sync_synced_session" not in st.session_state:
-    st.session_state.gap_sync_synced_session = 0
+def _init_session():
+    defaults = {
+        "logged_in": False,
+        "user_id": None,
+        "is_admin": False,
+        "restored": False,            # R2 → 로컬 복원 1회 플래그
+        "upload_feedback": None,
+        "infra_initialized": False,
+        "_daily_token_date": "",
+        "_daily_token_used": 0,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-_PATENT_COUNT_CACHE_KEY = "_patent_count_cache"
-_STATS_METAS_CACHE_KEY = "_stats_metadatas_cache"
+
+_init_session()
+
 _REGISTRY_REFRESH_TTL_SEC = 30
-# Streamlit 연결 타임아웃 방지 — 누락분 복구 시 1회 실행당 임베딩 건수
-_GAP_SYNC_CHUNK = 15
-_GAP_SYNC_MAX_BATCHES = 200
 
 
 # ==========================================
-# 공통 유틸리티
+# 3. 공통 유틸리티
 # ==========================================
 def _clean_ascii(value: str) -> str:
     """비가시적 유니코드 문자(BOM, Zero-Width Space 등) 제거."""
@@ -110,16 +119,11 @@ def _verify_password(plain: str, stored_hash: str) -> bool:
 
 def _normalize_patent_id(value) -> str:
     """
-    출원번호 정규화(canonical ID) — 특허DB·Excel마다 다른 표기를 하나의 키로 통일.
-
-    처리 순서:
-      1) Excel float / 지수표기(1.02E+12) → 정수 문자열
+    출원번호 정규화(canonical ID) — 표기 차이를 하나의 키로 통일.
+      1) Excel float/지수표기 → 정수 문자열
       2) 구분자(하이픈·공백·슬래시·점) 제거
-      3) KR/kr 접두사만 선두에서 제거(국제출원 고유 문자열 보존)
-      4) 영숫자만 유지(대문자) — PCT/US 등 국제출원번호 대응
-
-    동일 특허의 서로 다른 표기(10-2020-0012345 / 1020200012345)는 같은 ID가 됨.
-    정규화 후에도 다른 ID면 별도 건으로 유지(누락 방지 우선).
+      3) KR/kr 선두 접두사 제거
+      4) 영숫자만 유지(대문자)
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
@@ -150,72 +154,72 @@ def _normalize_patent_id(value) -> str:
     return s
 
 
-# ── 통계 집계: 복수값 분리 · 경쟁사 대표명화 ─────────────────────────────
+# ==========================================
+# 4. 통계 집계: 복수값 분리 · 경쟁사 대표명화
+# ==========================================
 _MULTI_VALUE_SPLIT_RE = re.compile(r"\s*[|;/]\s*")
 
-# lookup key(대문자·기호 제거) → 화면용 대표명 (경쟁사 20사 내외 수동 매핑)
-_APPLICANT_CANONICAL_KEYS: dict[str, str] = {
-    "DIEBOLD":                         "DIEBOLD NIXDORF",
-    "DIEBOLDNIXDORF":                  "DIEBOLD NIXDORF",
-    "DIEBOLDNIXDORFINCORPORATED":      "DIEBOLD NIXDORF",
-    "DIEBOLDNIXDORFSYSTEMSGMBH":       "DIEBOLD NIXDORF",
-    "WINCORNIXDORF":                   "DIEBOLD NIXDORF",
-    "WINCORNIXDORFINTERNATIONALGMBH":"DIEBOLD NIXDORF",
-    "NCR":                             "NCR",
-    "NCRCORPORATION":                  "NCR",
-    "NAUTILUSHYOSUNG":                 "HYOSUNG NAUTILUS",
-    "HYOSUNG":                         "HYOSUNG NAUTILUS",
-    "HYOSUNGNAUTILUS":                 "HYOSUNG NAUTILUS",
-    "HOTS":                            "HOTS",
-    "GLORY":                           "GLORY",
-    "GLORYLTD":                        "GLORY",
-    "OKIELECTRIC":                     "OKI ELECTRIC",
-    "OKIELECTRICINDUSTRY":             "OKI ELECTRIC",
-    "OKIELECTRICINDUSTRYCOLTD":        "OKI ELECTRIC",
-    "FTEC":                            "FTEC",
-    "GRGBANKING":                      "GRG BANKING",
-    "GRGBANKINGEQUIPMENT":             "GRG BANKING",
-    "GRGBANKINGEQUIPMENTCOLTD":        "GRG BANKING",
-    "SHENZHENYIHUA":                   "SHENZHEN YIHUA",
-    "SHENZHENYIHUACOMPCOLTD":          "SHENZHEN YIHUA",
-    "SHENZHENYIHUATIMETECHNOLOGY":     "SHENZHEN YIHUA",
+_APPLICANT_CANONICAL_KEYS: dict = {
+    "DIEBOLD": "DIEBOLD NIXDORF",
+    "DIEBOLDNIXDORF": "DIEBOLD NIXDORF",
+    "DIEBOLDNIXDORFINCORPORATED": "DIEBOLD NIXDORF",
+    "DIEBOLDNIXDORFSYSTEMSGMBH": "DIEBOLD NIXDORF",
+    "WINCORNIXDORF": "DIEBOLD NIXDORF",
+    "WINCORNIXDORFINTERNATIONALGMBH": "DIEBOLD NIXDORF",
+    "NCR": "NCR",
+    "NCRCORPORATION": "NCR",
+    "NAUTILUSHYOSUNG": "HYOSUNG NAUTILUS",
+    "HYOSUNG": "HYOSUNG NAUTILUS",
+    "HYOSUNGNAUTILUS": "HYOSUNG NAUTILUS",
+    "HOTS": "HOTS",
+    "GLORY": "GLORY",
+    "GLORYLTD": "GLORY",
+    "OKIELECTRIC": "OKI ELECTRIC",
+    "OKIELECTRICINDUSTRY": "OKI ELECTRIC",
+    "OKIELECTRICINDUSTRYCOLTD": "OKI ELECTRIC",
+    "FTEC": "FTEC",
+    "GRGBANKING": "GRG BANKING",
+    "GRGBANKINGEQUIPMENT": "GRG BANKING",
+    "GRGBANKINGEQUIPMENTCOLTD": "GRG BANKING",
+    "SHENZHENYIHUA": "SHENZHEN YIHUA",
+    "SHENZHENYIHUACOMPCOLTD": "SHENZHEN YIHUA",
+    "SHENZHENYIHUATIMETECHNOLOGY": "SHENZHEN YIHUA",
     "SHENZHENYIHUAFINANCIALINTELLIGENTRESINST": "SHENZHEN YIHUA",
-    "CASHWAY":                         "CASHWAY",
-    "CASHWAYTECHNOLOGY":               "CASHWAY",
-    "GUARDIAN":                        "GUARDIAN",
-    "GUARDIANANALYTICS":               "GUARDIAN",
-    "FUJITSU":                         "FUJITSU",
-    "HITACHI":                         "HITACHI",
-    "TOSHIBA":                         "TOSHIBA",
-    "RICOH":                           "RICOH",
-    "CANON":                           "CANON",
-    "PANASONIC":                       "PANASONIC",
-    "CUMMINSALLISON":                  "CUMMINS ALLISON",
-    "DE LA RUE":                       "DE LA RUE",
-    "DELARUE":                         "DE LA RUE",
-    "GIESSECKE":                       "GIECKE+DEVRIENT",
-    "GIESECKE":                        "GIECKE+DEVRIENT",
-    "GIECKE":                          "GIECKE+DEVRIENT",
+    "CASHWAY": "CASHWAY",
+    "CASHWAYTECHNOLOGY": "CASHWAY",
+    "GUARDIAN": "GUARDIAN",
+    "GUARDIANANALYTICS": "GUARDIAN",
+    "FUJITSU": "FUJITSU",
+    "HITACHI": "HITACHI",
+    "TOSHIBA": "TOSHIBA",
+    "RICOH": "RICOH",
+    "CANON": "CANON",
+    "PANASONIC": "PANASONIC",
+    "CUMMINSALLISON": "CUMMINS ALLISON",
+    "DE LA RUE": "DE LA RUE",
+    "DELARUE": "DE LA RUE",
+    "GIESSECKE": "GIECKE+DEVRIENT",
+    "GIESECKE": "GIECKE+DEVRIENT",
+    "GIECKE": "GIECKE+DEVRIENT",
 }
 
-# lookup key 앞부분 일치 시 대표명 (매핑표에 없는 변형 포착)
-_APPLICANT_PREFIX_RULES: list[tuple[str, str]] = [
-    ("DIEBOLD",          "DIEBOLD NIXDORF"),
-    ("WINCOR",           "DIEBOLD NIXDORF"),
-    ("NCR",              "NCR"),
-    ("NAUTILUS",         "HYOSUNG NAUTILUS"),
-    ("HYOSUNG",          "HYOSUNG NAUTILUS"),
-    ("GLORY",            "GLORY"),
-    ("OKIELECTRIC",      "OKI ELECTRIC"),
-    ("GRGBANKING",       "GRG BANKING"),
-    ("SHENZHENYIHUA",    "SHENZHEN YIHUA"),
-    ("CASHWAY",          "CASHWAY"),
-    ("GUARDIAN",         "GUARDIAN"),
-    ("CUMMINSALLISON",   "CUMMINS ALLISON"),
-    ("GIESSECKE",        "GIECKE+DEVRIENT"),
-    ("GIESECKE",         "GIECKE+DEVRIENT"),
-    ("GIECKE",           "GIECKE+DEVRIENT"),
-    ("DELARUE",          "DE LA RUE"),
+_APPLICANT_PREFIX_RULES: list = [
+    ("DIEBOLD", "DIEBOLD NIXDORF"),
+    ("WINCOR", "DIEBOLD NIXDORF"),
+    ("NCR", "NCR"),
+    ("NAUTILUS", "HYOSUNG NAUTILUS"),
+    ("HYOSUNG", "HYOSUNG NAUTILUS"),
+    ("GLORY", "GLORY"),
+    ("OKIELECTRIC", "OKI ELECTRIC"),
+    ("GRGBANKING", "GRG BANKING"),
+    ("SHENZHENYIHUA", "SHENZHEN YIHUA"),
+    ("CASHWAY", "CASHWAY"),
+    ("GUARDIAN", "GUARDIAN"),
+    ("CUMMINSALLISON", "CUMMINS ALLISON"),
+    ("GIESSECKE", "GIECKE+DEVRIENT"),
+    ("GIESECKE", "GIECKE+DEVRIENT"),
+    ("GIECKE", "GIECKE+DEVRIENT"),
+    ("DELARUE", "DE LA RUE"),
 ]
 
 _CORP_SUFFIX_PATTERNS = (
@@ -226,6 +230,11 @@ _CORP_SUFFIX_PATTERNS = (
     r"technology", r"technologies", r"industry", r"industries", r"financial",
     r"intelligent", r"research", r"inst(?:itute)?", r"res", r"inst",
 )
+# 결합 정규식: 접미사를 1패스로 제거 (성능 개선)
+_CORP_SUFFIX_RE = re.compile(
+    r"\b(?:" + "|".join(_CORP_SUFFIX_PATTERNS) + r")\b", flags=re.IGNORECASE
+)
+_CORP_SEP_RE = re.compile(r"[\s\-_./\\()（）\[\]]+")
 
 
 def _applicant_lookup_key(name: str) -> str:
@@ -234,16 +243,15 @@ def _applicant_lookup_key(name: str) -> str:
     for _ in range(3):
         prev = s
         s = s.replace(",", " ")
-        for pat in _CORP_SUFFIX_PATTERNS:
-            s = re.sub(rf"\b{pat}\b", "", s, flags=re.IGNORECASE)
-        s = re.sub(r"[\s\-_./\\()（）\[\]]+", "", s)
+        s = _CORP_SUFFIX_RE.sub("", s)
+        s = _CORP_SEP_RE.sub("", s)
         if s == prev:
             break
     return s.upper()
 
 
 def _canonical_applicant_name(name: str) -> str:
-    """경쟁사 출원인 표기를 대표명으로 통합 (집계 전용, 메타데이터 원본은 유지)."""
+    """경쟁사 출원인 표기를 대표명으로 통합 (집계 전용, 메타데이터 원본 유지)."""
     raw = str(name).strip()
     if not raw or raw.lower() in ("nan", "none", "없음", "정보없음", "미기재"):
         return ""
@@ -259,7 +267,6 @@ def _canonical_applicant_name(name: str) -> str:
         if key.startswith(prefix):
             return canonical
 
-    # 한글 포함 시 공백·접미사만 정리한 표시명 반환
     if re.search(r"[가-힣]", raw):
         cleaned = re.sub(r"\s*(\(주\)|주식회사|㈜|유한회사|\(유\))\s*", "", raw).strip()
         return cleaned if cleaned else raw
@@ -267,7 +274,7 @@ def _canonical_applicant_name(name: str) -> str:
     return raw
 
 
-def _explode_multi_values(value, *, allow_comma: bool = False) -> list[str]:
+def _explode_multi_values(value, *, allow_comma: bool = False) -> list:
     """한 셀에 묶인 복수 값(출원인·발명자·IPC)을 개별 항목 리스트로 분리."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
@@ -285,15 +292,9 @@ def _explode_multi_values(value, *, allow_comma: bool = False) -> list[str]:
     ]
 
 
-def _flatten_for_counts(
-    series: pd.Series,
-    *,
-    normalizer=None,
-    explode: bool = False,
-    allow_comma: bool = False,
-) -> pd.Series:
+def _flatten_for_counts(series, *, normalizer=None, explode=False, allow_comma=False):
     """Series를 value_counts 가능한 flat Series로 변환."""
-    items: list[str] = []
+    items: list = []
     for val in series:
         if explode:
             parts = _explode_multi_values(val, allow_comma=allow_comma)
@@ -306,19 +307,11 @@ def _flatten_for_counts(
     return pd.Series(items, dtype=str)
 
 
-def _top_counts_table(
-    series: pd.Series,
-    n: int = 10,
-    *,
-    label: str = "항목",
-    normalizer=None,
-    explode: bool = False,
-    allow_comma: bool = False,
-) -> tuple[pd.DataFrame, str]:
+def _top_counts_table(series, n=10, *, label="항목", normalizer=None,
+                      explode=False, allow_comma=False):
     """상위 N건 집계표(DataFrame)와 LLM용 마크다운 표 문자열 반환."""
-    flat = _flatten_for_counts(
-        series, normalizer=normalizer, explode=explode, allow_comma=allow_comma
-    )
+    flat = _flatten_for_counts(series, normalizer=normalizer, explode=explode,
+                               allow_comma=allow_comma)
     if flat.empty:
         empty = pd.DataFrame(columns=[label, "건수"])
         return empty, f"| {label} | 건수 |\n| --- | ---: |\n| (데이터 없음) | 0 |"
@@ -332,13 +325,11 @@ def _top_counts_table(
     return df, "\n".join(lines)
 
 
-def _year_counts_table(series: pd.Series) -> tuple[pd.DataFrame, str]:
+def _year_counts_table(series):
     """출원 연도별 건수 집계표."""
     years = (
         series.astype(str).str[:4]
-        .replace("", pd.NA)
-        .replace("없음", pd.NA)
-        .dropna()
+        .replace("", pd.NA).replace("없음", pd.NA).dropna()
     )
     if years.empty:
         empty = pd.DataFrame(columns=["연도", "건수"])
@@ -353,8 +344,8 @@ def _year_counts_table(series: pd.Series) -> tuple[pd.DataFrame, str]:
     return df, "\n".join(lines)
 
 
-def _extract_year_filter_from_query(query: str) -> tuple[int | None, int | None]:
-    """질의문에서 출원연도 필터 추출. (min_year, max_year) — max_year None이면 상한 없음."""
+def _extract_year_filter_from_query(query: str):
+    """질의문에서 출원연도 필터 추출. (min_year, max_year)."""
     min_y, max_y = None, None
 
     m = re.search(r"(\d{4})\s*년?\s*[~\-–]\s*(\d{4})\s*년?", query)
@@ -391,9 +382,7 @@ def _wants_applicant_cohort(query: str) -> bool:
     return "각각" in query and "출원인" in query
 
 
-def _filter_metadata_df_by_year(
-    df: pd.DataFrame, min_year: int | None, max_year: int | None = None
-) -> pd.DataFrame:
+def _filter_metadata_df_by_year(df, min_year, max_year=None):
     """메타데이터 DataFrame을 출원연도 범위로 필터."""
     if min_year is None and max_year is None:
         return df
@@ -408,9 +397,9 @@ def _filter_metadata_df_by_year(
     return df[mask].copy()
 
 
-def _metadata_df_with_applicant_rows(df: pd.DataFrame) -> pd.DataFrame:
+def _metadata_df_with_applicant_rows(df):
     """복수 출원인(구분자) 행을 출원인 단위로 펼침."""
-    records: list[dict] = []
+    records: list = []
     for _, row in df.iterrows():
         apps = _explode_multi_values(row.get("출원인", ""), allow_comma=False)
         if not apps:
@@ -427,32 +416,21 @@ def _metadata_df_with_applicant_rows(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records) if records else pd.DataFrame()
 
 
-def _build_applicant_cohort_context(
-    df: pd.DataFrame,
-    max_applicants: int = 25,
-    titles_per: int = 15,
-    ipc_per: int = 8,
-) -> tuple[str, pd.DataFrame]:
-    """
-    필터된 메타데이터에서 출원인별 IPC·특허명 코호트 요약 생성.
-    RAG 10건 제한 없이 전체(필터 범위) 집계 데이터를 LLM에 전달.
-    """
+def _build_applicant_cohort_context(df, max_applicants=25, titles_per=15, ipc_per=8):
+    """필터된 메타데이터에서 출원인별 IPC·특허명 코호트 요약 생성."""
     exploded = _metadata_df_with_applicant_rows(df)
     if exploded.empty:
         return "(조건에 맞는 데이터 없음)", pd.DataFrame(columns=["출원인(대표명)", "특허건수"])
 
-    parts: list[str] = []
-    summary_rows: list[dict] = []
+    parts: list = []
+    summary_rows: list = []
     app_counts = exploded["_대표출원인"].value_counts()
 
     for app, cnt in app_counts.head(max_applicants).items():
         sub = exploded[exploded["_대표출원인"] == app]
         _, ipc_md = _top_counts_table(
             sub.get("IPC", pd.Series(dtype=str)),
-            n=ipc_per,
-            label="IPC",
-            explode=True,
-            allow_comma=True,
+            n=ipc_per, label="IPC", explode=True, allow_comma=True,
         )
         titles = [
             str(t).strip()
@@ -472,262 +450,131 @@ def _build_applicant_cohort_context(
 
 
 # ==========================================
-# GitHub API
+# 5. Cloudflare R2 스토리지 (S3 호환, egress 무료)
 # ==========================================
-def _get_github_secrets():
-    """
-    GITHUB_TOKEN / GITHUB_REPO_URL을 Streamlit Secrets에서 로드.
-    urllib은 HTTP 헤더를 latin-1로 인코딩하므로, Secrets에서 복사·붙여넣기 시
-    섞여 들어온 비가시적 유니코드 문자(BOM, Zero-Width Space 등)를 ASCII 필터로 제거.
-    """
+def _r2_configured() -> bool:
+    if not _BOTO_AVAILABLE:
+        return False
+    need = ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
+    return all(st.secrets.get(k) for k in need)
+
+
+@st.cache_resource
+def _get_r2_client():
+    """R2 S3 호환 클라이언트 (프로세스당 1회)."""
+    account_id = _clean_ascii(st.secrets.get("R2_ACCOUNT_ID", ""))
+    access_key = _clean_ascii(st.secrets.get("R2_ACCESS_KEY_ID", ""))
+    secret_key = _clean_ascii(st.secrets.get("R2_SECRET_ACCESS_KEY", ""))
+    endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=_BotoConfig(signature_version="s3v4", retries={"max_attempts": 3}),
+        region_name="auto",
+    )
+
+
+def _r2_bucket() -> str:
+    return _clean_ascii(st.secrets.get("R2_BUCKET", ""))
+
+
+def r2_upload_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+    if not _r2_configured():
+        return False
     try:
-        token    = st.secrets["GITHUB_TOKEN"]
-        repo_url = st.secrets["GITHUB_REPO_URL"]
-        if not token or token.startswith("ghp_본인의"):
-            return None, None
-
-        token    = _clean_ascii(token)
-        repo_url = _clean_ascii(repo_url)
-
-        if not token:
-            return None, None
-        if not repo_url.startswith("https://"):
-            repo_url = "https://" + repo_url.lstrip("http://")
-        return token, repo_url
-    except Exception:
-        return None, None
-
-
-def _get_github_repo_path() -> tuple[str | None, str | None, str | None]:
-    """(token, repo_url, repo_path) 반환. 실패 시 (None, None, None)."""
-    token, repo_url = _get_github_secrets()
-    if not token:
-        return None, None, None
-    repo_path = repo_url.replace(".git", "").split("github.com/")[-1]
-    return token, repo_url, repo_path
-
-
-def diagnose_github() -> dict:
-    """
-    GitHub 연결 상태를 단계별로 진단하여 dict로 반환.
-    keys: secret_ok, token_prefix, repo_url, api_reachable, repo_accessible, error
-    """
-    result = {
-        "secret_ok": False, "token_prefix": "", "repo_url": "",
-        "api_reachable": False, "repo_accessible": False, "error": ""
-    }
-    token, repo_url, repo_path = _get_github_repo_path()
-    if not token:
-        result["error"] = (
-            "GITHUB_TOKEN 또는 GITHUB_REPO_URL을 Streamlit Secrets에서 찾을 수 없습니다.\n"
-            "TOML 구조에서 두 키가 [USER_CREDENTIALS] 섹션 헤더보다 위에 있는지 확인하세요."
+        _get_r2_client().put_object(
+            Bucket=_r2_bucket(), Key=key, Body=data, ContentType=content_type
         )
-        return result
-    result["secret_ok"]    = True
-    result["token_prefix"] = token[:12] + "..."
-    result["repo_url"]     = repo_url
-
-    # 토큰 원본에 비가시적 유니코드 문자가 있었는지 체크 (진단 정보용)
-    raw_token = str(st.secrets.get("GITHUB_TOKEN", ""))
-    if raw_token != _clean_ascii(raw_token):
-        result["error"] = (
-            "⚠️ GITHUB_TOKEN에 비가시적 유니코드 문자(복사·붙여넣기 오염)가 감지되었습니다. "
-            "Streamlit Secrets 편집기에서 토큰 값을 지우고 직접 다시 입력하세요."
-        )
-        return result
-
-    # 2단계: GitHub API 서버 도달 여부
-    try:
-        ping = Request("https://api.github.com", headers={"Accept": "application/vnd.github.v3+json"})
-        with urlopen(ping, timeout=5):
-            result["api_reachable"] = True
+        return True
     except Exception as e:
-        result["error"] = f"GitHub API 서버에 접근할 수 없습니다: {e}"
-        return result
+        print(f"[R2 업로드 실패] {key}: {e}")
+        return False
 
-    # 3단계: 레포지토리 접근 권한 (토큰 유효성)
+
+def r2_download_bytes(key: str):
+    """R2에서 오브젝트 바이트 반환. 없거나 오류 시 None."""
+    if not _r2_configured():
+        return None
     try:
-        req = Request(
-            f"https://api.github.com/repos/{repo_path}",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-        )
-        with urlopen(req, timeout=8) as resp:
-            repo_info = json.loads(resp.read().decode())
-            result["repo_accessible"] = True
-            result["repo_name"]       = repo_info.get("full_name", "")
-    except HTTPError as e:
-        if e.code == 401:
-            result["error"] = "토큰 인증 실패(401) — 토큰이 만료되었거나 잘못되었습니다. 새 토큰을 발급하세요."
-        elif e.code == 404:
-            result["error"] = f"레포지토리를 찾을 수 없습니다(404) — GITHUB_REPO_URL을 확인하세요: {repo_url}"
-        else:
-            result["error"] = f"GitHub API 오류 ({e.code}): {e.reason}"
+        obj = _get_r2_client().get_object(Bucket=_r2_bucket(), Key=key)
+        return obj["Body"].read()
     except Exception as e:
-        result["error"] = f"레포지토리 접근 중 오류: {e}"
+        msg = str(e)
+        if "NoSuchKey" not in msg and "Not Found" not in msg and "404" not in msg:
+            print(f"[R2 다운로드 실패] {key}: {e}")
+        return None
 
+
+def r2_delete(key: str) -> bool:
+    if not _r2_configured():
+        return False
+    try:
+        _get_r2_client().delete_object(Bucket=_r2_bucket(), Key=key)
+        return True
+    except Exception as e:
+        print(f"[R2 삭제 실패] {key}: {e}")
+        return False
+
+
+def diagnose_r2() -> dict:
+    """R2 연결 진단."""
+    result = {"configured": False, "reachable": False, "bucket": "", "error": ""}
+    if not _BOTO_AVAILABLE:
+        result["error"] = "boto3 미설치 — requirements.txt에 boto3 추가 필요"
+        return result
+    if not _r2_configured():
+        result["error"] = (
+            "R2 Secrets 누락 — R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, "
+            "R2_SECRET_ACCESS_KEY, R2_BUCKET을 설정하세요."
+        )
+        return result
+    result["configured"] = True
+    result["bucket"] = _r2_bucket()
+    try:
+        _get_r2_client().head_bucket(Bucket=_r2_bucket())
+        result["reachable"] = True
+    except Exception as e:
+        result["error"] = f"R2 버킷 접근 실패: {e}"
     return result
 
 
-def upload_file_to_github_api(local_file_path, github_target_path):
-    token, _, repo_path = _get_github_repo_path()
-    if not token or not os.path.exists(local_file_path):
-        return False
-
-    try:
-        with open(local_file_path, "rb") as f:
-            content = base64.b64encode(f.read()).decode("utf-8")
-
-        api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
-        
-        sha = None
-        req_get = Request(api_url, headers={
-            "Authorization": f"Bearer {token}", 
-            "Accept": "application/vnd.github.v3+json"
-        })
-        try:
-            with urlopen(req_get, timeout=15) as response:
-                res_data = json.loads(response.read().decode())
-                sha = res_data.get("sha")
-        except HTTPError as e:
-            if e.code != 404:
-                print(f"[API Warning] SHA 획득 실패: HTTP {e.code}")
-
-        payload = {
-            "message": f"[Automated Sync] {github_target_path}",
-            "content": content,
-            "branch": "main"
-        }
-        if sha:
-            payload["sha"] = sha
-            
-        req_put = Request(
-            api_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/vnd.github.v3+json"
-            },
-            method="PUT"
-        )
-        
-        try:
-            with urlopen(req_put, timeout=120) as response:
-                if response.status in [200, 201]:
-                    return True
-                print(f"GitHub PUT 예상 외 응답: HTTP {response.status}")
-                return False
-        except HTTPError as e:
-            print(f"GitHub PUT 실패: HTTP {e.code} {e.reason} — {e.read().decode(errors='ignore')[:200]}")
-            return False
-    except Exception as e:
-        print(f"GitHub API 통신 중 예외 제어: {e}")
-    return False
-
-def commit_and_push_data() -> bool:
-    """마스터 엑셀을 GitHub에 업로드하여 컨테이너 재시작 후에도 데이터가 복원될 수 있도록 보존.
-    반환값: True=GitHub 업로드 성공, False=실패.
-    """
-    excel_status = upload_file_to_github_api(MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx")
-    if excel_status:
-        st.toast("💾 GitHub 백업 완료 — 재시작 후에도 데이터가 자동 복원됩니다!")
-    else:
-        st.error(
-            "❌ **GitHub 백업 실패!**  \n"
-            "특허 데이터가 현재 세션 ChromaDB에는 적재되었지만 GitHub에 저장되지 않았습니다.  \n"
-            "**컨테이너 재시작 시 데이터가 소실됩니다.**  \n\n"
-            "👉 좌측 사이드바 **'🔍 GitHub 연결 진단'** 버튼으로 원인 파악 후,  \n"
-            "**'💾 GitHub 마스터 백업 재시도'** 버튼으로 재업로드하세요."
-        )
-    return excel_status
-
-
-def delete_file_from_github_api(github_target_path: str) -> bool:
-    """GitHub Contents API로 파일 삭제. 성공 또는 404(이미 없음) 시 True."""
-    token, _, repo_path = _get_github_repo_path()
-    if not token:
-        return False
-
-    api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_target_path}"
-    try:
-        req_get = Request(api_url, headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
-        })
-        with urlopen(req_get, timeout=15) as r:
-            sha = json.loads(r.read().decode()).get("sha", "")
-
-        if not sha:
-            return False
-
-        del_payload = json.dumps({
-            "message": f"[Format] Delete {github_target_path}",
-            "sha": sha,
-            "branch": "main"
-        }).encode("utf-8")
-        req_del = Request(api_url, data=del_payload, headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/vnd.github.v3+json"
-        }, method="DELETE")
-        with urlopen(req_del, timeout=30):
-            return True
-    except HTTPError as e:
-        if e.code == 404:
-            return True
-        print(f"GitHub 삭제 실패: HTTP {e.code} {e.reason}")
-        return False
-    except Exception as e:
-        print(f"GitHub 삭제 중 오류: {e}")
-        return False
-
-
-def _download_file_from_github(github_path: str, local_path: str):
-    """
-    GitHub에서 단일 파일을 내려받아 local_path에 저장.
-    반환값: True=성공, None=404(파일 없음), False=오류
-    """
-    token, _, repo_path = _get_github_repo_path()
-    if not token:
+# ── ChromaDB 디렉토리 ↔ R2 (tar.gz 통째 백업/복원) ──
+def backup_chroma_to_r2() -> bool:
+    """CHROMA_DIR 전체를 tar.gz로 압축해 R2에 업로드."""
+    if not os.path.isdir(CHROMA_DIR):
         return False
     try:
-        api_url = f"https://api.github.com/repos/{repo_path}/contents/{github_path}"
-        req = Request(api_url, headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
-        })
-        with urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-
-        if data.get("content"):
-            raw = base64.b64decode(data["content"])
-        elif data.get("download_url"):
-            with urlopen(Request(
-                data["download_url"],
-                headers={"Authorization": f"Bearer {token}"}
-            )) as r:
-                raw = r.read()
-        else:
-            return False
-
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        with open(local_path, "wb") as f:
-            f.write(raw)
-        return True
-    except HTTPError as e:
-        if e.code == 404:
-            return None
-        print(f"GitHub 파일 다운로드 실패 ({github_path}): HTTP {e.code} {e.reason}")
-        return False
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(CHROMA_DIR, arcname="chroma_db")
+        buf.seek(0)
+        return r2_upload_bytes(R2_SNAPSHOT_KEY, buf.getvalue(), "application/gzip")
     except Exception as e:
-        print(f"GitHub 파일 다운로드 실패 ({github_path}): {e}")
+        print(f"[Chroma 백업 실패] {e}")
+        return False
+
+
+def restore_chroma_from_r2() -> bool:
+    """R2의 tar.gz를 받아 CHROMA_DIR로 복원. 성공 시 True."""
+    data = r2_download_bytes(R2_SNAPSHOT_KEY)
+    if not data:
+        return False
+    try:
+        if os.path.isdir(CHROMA_DIR):
+            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            tar.extractall(path=DATA_DIR)
+        return os.path.isdir(CHROMA_DIR)
+    except Exception as e:
+        print(f"[Chroma 복원 실패] {e}")
         return False
 
 
 # ==========================================
-# [회원 관리] 사용자 레지스트리
+# 6. 회원 레지스트리 (R2 백업)
 # ==========================================
-
 def load_user_registry() -> dict:
     if os.path.exists(USER_REGISTRY_PATH):
         try:
@@ -738,66 +585,72 @@ def load_user_registry() -> dict:
     return {}
 
 
-def refresh_user_registry_from_github(*, force: bool = False) -> dict:
-    """GitHub 최신 user_registry.json → 로컬 후 반환. TTL 내 재호출 시 로컬 캐시."""
-    now = time.time()
-    last = st.session_state.get("_registry_refresh_ts", 0.0)
-    if not force and (now - last) < _REGISTRY_REFRESH_TTL_SEC:
-        return load_user_registry()
-    try:
-        download_user_registry_from_github()
-    except Exception as e:
-        print(f"[회원 레지스트리 GitHub 동기화 스킵] {e}")
-    st.session_state["_registry_refresh_ts"] = now
-    return load_user_registry()
-
-
 def save_user_registry(registry: dict):
     os.makedirs(os.path.dirname(USER_REGISTRY_PATH), exist_ok=True)
     with open(USER_REGISTRY_PATH, "w", encoding="utf-8") as f:
         json.dump(registry, f, ensure_ascii=False, indent=2)
 
 
-def download_user_registry_from_github():
-    return _download_file_from_github(
-        "my_patent_folder/user_registry.json", USER_REGISTRY_PATH
-    )
+def upload_user_registry_to_r2() -> bool:
+    try:
+        with open(USER_REGISTRY_PATH, "rb") as f:
+            return r2_upload_bytes(R2_REGISTRY_KEY, f.read(), "application/json")
+    except Exception:
+        return False
 
 
-def upload_user_registry_to_github() -> bool:
-    return upload_file_to_github_api(USER_REGISTRY_PATH, "my_patent_folder/user_registry.json")
+def download_user_registry_from_r2() -> bool:
+    data = r2_download_bytes(R2_REGISTRY_KEY)
+    if data is None:
+        return False
+    try:
+        os.makedirs(os.path.dirname(USER_REGISTRY_PATH), exist_ok=True)
+        with open(USER_REGISTRY_PATH, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
 
 
-def sync_all_from_github():
-    """
-    세션 최초 진입 시(프로세스 재시작 감지) GitHub에서 모든 영구 데이터를 무조건 동기화.
-    반환값: (excel_result, registry_result)
-      각 값: True=다운로드 성공, None=GitHub에 파일 없음(정상), False=실제 오류
-    """
-    excel_ok    = download_master_excel_from_github()
-    registry_ok = download_user_registry_from_github()
-    return excel_ok, registry_ok
+def refresh_user_registry_from_r2(*, force: bool = False) -> dict:
+    """짧은 TTL 캐시로 R2 레지스트리 갱신."""
+    now = time.time()
+    last = st.session_state.get("_registry_refresh_ts", 0)
+    if force or (now - last) > _REGISTRY_REFRESH_TTL_SEC:
+        download_user_registry_from_r2()
+        st.session_state["_registry_refresh_ts"] = now
+    return load_user_registry()
+
+
+def download_logo_from_r2() -> bool:
+    if os.path.exists(LOGO_PATH):
+        return True
+    data = r2_download_bytes(R2_LOGO_KEY)
+    if not data:
+        return False
+    try:
+        with open(LOGO_PATH, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
 
 
 # ==========================================
-# [관리자 알림] 가입 이메일 발송 엔진
+# 7. 관리자 알림 이메일
 # ==========================================
 def send_admin_signup_email(user_info: dict) -> bool:
-    """
-    신규 회원 가입 시 관리자 이메일로 알림 발송.
-    Streamlit Secrets에 SMTP_EMAIL, SMTP_PASSWORD, ADMIN_EMAIL 설정 필요.
-    Gmail 사용 시 앱 비밀번호(App Password) 사용 권장.
-    """
+    """신규 회원 가입 시 관리자 이메일로 알림. Secrets: SMTP_EMAIL/SMTP_PASSWORD/ADMIN_EMAIL."""
     try:
-        smtp_email    = st.secrets.get("SMTP_EMAIL", "")
+        smtp_email = st.secrets.get("SMTP_EMAIL", "")
         smtp_password = st.secrets.get("SMTP_PASSWORD", "")
-        admin_email   = st.secrets.get("ADMIN_EMAIL", "")
+        admin_email = st.secrets.get("ADMIN_EMAIL", "")
         if not smtp_email or not smtp_password or not admin_email:
             return False
 
         msg = MIMEMultipart("alternative")
-        msg["From"]    = smtp_email
-        msg["To"]      = admin_email
+        msg["From"] = smtp_email
+        msg["To"] = admin_email
         msg["Subject"] = f"[PatentRAG] 신규 연구원 가입 알림 — {user_info['username']}"
 
         html_body = f"""
@@ -824,203 +677,11 @@ def send_admin_signup_email(user_info: dict) -> bool:
         return False
 
 
-def download_logo_from_github():
-    """컨테이너 재시작 시 로고 파일이 없으면 GitHub에서 복원."""
-    logo_path = os.path.join(BASE_DIR, "atec_logo.png")
-    if os.path.exists(logo_path):
-        return True
-    return _download_file_from_github("atec_logo.png", logo_path) is True
-
-
-def download_master_excel_from_github():
-    return _download_file_from_github(
-        "my_patent_folder/master_patents.xlsx", MASTER_EXCEL_PATH
-    )
-
-
 # ==========================================
-# Google Cloud (GCS 벡터 스냅샷)
-# ==========================================
-_GCP_SCOPES = ("https://www.googleapis.com/auth/devstorage.read_write",)
-
-
-def _get_gcp_credentials():
-    if not _GCP_AVAILABLE:
-        return None
-    try:
-        sa_info = dict(st.secrets["gcp_service_account"])
-        pk = sa_info.get("private_key", "")
-        if isinstance(pk, str) and "\\n" in pk and "-----BEGIN" in pk:
-            sa_info["private_key"] = pk.replace("\\n", "\n")
-        return service_account.Credentials.from_service_account_info(
-            sa_info, scopes=_GCP_SCOPES
-        )
-    except Exception as e:
-        print(f"[GCP credentials 오류] {e}")
-        return None
-
-
-# ==========================================
-# Google Cloud Storage (벡터 스냅샷 — 서비스 계정 권장 저장소)
-# ==========================================
-def _get_gcs_bucket_name() -> str | None:
-    try:
-        name = _clean_ascii(str(st.secrets.get("GCS_BUCKET_NAME", "")))
-        return name if name else None
-    except Exception:
-        return None
-
-
-def _gcs_configured() -> bool:
-    if not _GCP_AVAILABLE or gcs_storage is None:
-        return False
-    try:
-        return bool(_get_gcs_bucket_name() and "gcp_service_account" in st.secrets)
-    except Exception:
-        return False
-
-
-def _vector_storage_configured() -> bool:
-    return _gcs_configured()
-
-
-def _vector_storage_label() -> str:
-    if _gcs_configured():
-        return f"GCS (`{_get_gcs_bucket_name()}`)"
-    return "미설정"
-
-
-@st.cache_resource
-def _get_gcs_client():
-    creds = _get_gcp_credentials()
-    if not creds or gcs_storage is None:
-        return None
-    try:
-        project = st.secrets["gcp_service_account"].get("project_id", "")
-        return gcs_storage.Client(credentials=creds, project=project or None)
-    except Exception as e:
-        print(f"[GCS client 오류] {e}")
-        return None
-
-
-def upload_file_to_gcs(local_file_path: str, blob_name: str) -> tuple[bool, str]:
-    bucket_name = _get_gcs_bucket_name()
-    client = _get_gcs_client()
-    if not client or not bucket_name:
-        return False, "GCS 미설정 (GCS_BUCKET_NAME)"
-    if not os.path.exists(local_file_path):
-        return False, f"로컬 파일 없음: {local_file_path}"
-    try:
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        # 동일 blob 이름 → 덮어쓰기. 날짜별 누적 없음 (GCS 5GB 무료 한도 보호).
-        blob.upload_from_filename(local_file_path)
-        size_kb = os.path.getsize(local_file_path) // 1024
-        return True, f"gs://{bucket_name}/{blob_name} ({size_kb} KB)"
-    except Exception as e:
-        print(f"[GCS upload 오류] {blob_name}: {e}")
-        return False, (
-            f"GCS 업로드 실패: {e}\n"
-            "GCP Console → Cloud Storage → 버킷 → **권한** → **액세스 권한 부여** →\n"
-            "주 구성원: 서비스 계정 이메일 → 역할: **Storage 관리자** "
-            "(또는 Storage 객체 관리자)"
-        )
-
-
-def download_file_from_gcs(blob_name: str, local_path: str):
-    """반환: True=성공, None=없음, False=오류"""
-    bucket_name = _get_gcs_bucket_name()
-    client = _get_gcs_client()
-    if not client or not bucket_name:
-        return False
-    try:
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        if not blob.exists():
-            return None
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        blob.download_to_filename(local_path)
-        return True
-    except Exception as e:
-        print(f"[GCS download 오류] {blob_name}: {e}")
-        return False
-
-
-def diagnose_gcs() -> dict:
-    result = {
-        "configured": False,
-        "bucket_name": "",
-        "client_ok": False,
-        "bucket_accessible": False,
-        "manifest_on_gcs": False,
-        "snapshot_on_gcs": False,
-        "write_test_ok": False,
-        "write_test_detail": "",
-        "error": "",
-    }
-    if not _gcs_configured():
-        result["error"] = "GCS_BUCKET_NAME 또는 gcp_service_account 미설정"
-        return result
-    result["configured"] = True
-    result["bucket_name"] = _get_gcs_bucket_name() or ""
-
-    client = _get_gcs_client()
-    if not client:
-        result["error"] = "GCS 클라이언트 초기화 실패"
-        return result
-    result["client_ok"] = True
-
-    try:
-        bucket = client.bucket(result["bucket_name"])
-        # bucket.reload()는 storage.buckets.get 권한 필요 → 쓰기 테스트로 대체
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write("PatentRAG GCS write test")
-            test_path = tf.name
-        try:
-            ok, msg = upload_file_to_gcs(test_path, "_patentrag_gcs_write_test.txt")
-            result["write_test_ok"] = ok
-            result["write_test_detail"] = msg
-            result["bucket_accessible"] = ok
-            if ok:
-                result["manifest_on_gcs"] = bucket.blob(VECTOR_MANIFEST_FILENAME).exists()
-                result["snapshot_on_gcs"] = bucket.blob(VECTOR_SNAPSHOT_FILENAME).exists()
-            else:
-                result["error"] = msg
-        finally:
-            try:
-                os.remove(test_path)
-            except OSError:
-                pass
-    except Exception as e:
-        err = str(e)
-        if "storage.buckets.get" in err or "does not have" in err:
-            sa = ""
-            try:
-                sa = st.secrets["gcp_service_account"].get("client_email", "")
-            except Exception:
-                pass
-            result["error"] = (
-                f"버킷 IAM 권한 부족 — `{sa or '서비스 계정'}`에 "
-                f"버킷 `{result['bucket_name']}` 권한이 없습니다.\n\n"
-                "GCP Console → Cloud Storage → 해당 버킷 → **권한** → "
-                "**액세스 권한 부여** → 역할 **Storage 관리자** "
-                "(roles/storage.admin) 또는 **Storage 객체 관리자** "
-                "(roles/storage.objectAdmin) 추가."
-            )
-        else:
-            result["error"] = (
-                f"GCS 버킷 접근 실패 — 버킷 이름·서비스 계정 Storage 권한 확인: {e}"
-            )
-    return result
-
-
-# ==========================================
-# 1. 인증 시스템 — 관리자/사용자 이원화
+# 8. 인증 시스템
 # ==========================================
 def _get_admin_credentials() -> dict:
-    """Streamlit Secrets의 [USER_CREDENTIALS] 에서 관리자 자격증명 반환."""
+    """Streamlit Secrets의 [USER_CREDENTIALS]에서 관리자 자격증명 반환."""
     if "USER_CREDENTIALS" in st.secrets:
         return dict(st.secrets["USER_CREDENTIALS"])
     return {}
@@ -1030,18 +691,15 @@ def check_authentication():
     if st.session_state.logged_in:
         return True
 
-    # 앱 시작 시 사용자 레지스트리가 없으면 GitHub에서 복원
     if not os.path.exists(USER_REGISTRY_PATH):
-        download_user_registry_from_github()
+        download_user_registry_from_r2()
 
-    logo_path = os.path.join(BASE_DIR, "atec_logo.png")
-    if os.path.exists(logo_path):
-        st.image(logo_path, width=160)
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=160)
     st.title("AI 경쟁사 특허 조사 분석")
 
     tab_login, tab_register = st.tabs(["🔑 로그인", "📝 신규 회원 가입"])
 
-    # ── 로그인 탭 ──
     with tab_login:
         st.subheader("사내 연구원 로그인")
         with st.form("login_form"):
@@ -1051,41 +709,36 @@ def check_authentication():
 
         if submitted:
             admin_creds = _get_admin_credentials()
-            registry    = refresh_user_registry_from_github(force=True)
+            registry = refresh_user_registry_from_r2(force=True)
 
-            # 관리자 계정 확인 (Secrets SHA-256 해시만 허용)
             if username in admin_creds:
                 stored = admin_creds[username]
                 if not _is_sha256_hex(stored):
                     st.error(
-                        "⛔ 관리자 비밀번호는 Streamlit Secrets에 SHA-256 해시(64자)로만 설정하세요. "
-                        "평문 비밀번호는 허용되지 않습니다."
+                        "⛔ 관리자 비밀번호는 Streamlit Secrets에 SHA-256 해시(64자)로만 "
+                        "설정하세요. 평문 비밀번호는 허용되지 않습니다."
                     )
                 elif _verify_password(password, stored):
                     st.session_state.logged_in = True
-                    st.session_state.user_id   = username
-                    st.session_state.is_admin  = True
+                    st.session_state.user_id = username
+                    st.session_state.is_admin = True
                     st.rerun()
                 else:
                     st.error("❌ 비밀번호가 올바르지 않습니다.")
-            # 일반 사용자 확인 (레지스트리 해시 비교)
             elif username in registry:
                 user_rec = registry[username]
                 if user_rec.get("active") is False:
-                    st.error(
-                        "⛔ 계정 승인 대기 중입니다. 관리자가 **활성화**한 뒤 로그인해 주세요."
-                    )
+                    st.error("⛔ 계정 승인 대기 중입니다. 관리자가 **활성화**한 뒤 로그인해 주세요.")
                 elif _verify_password(password, user_rec.get("password_hash", "")):
                     st.session_state.logged_in = True
-                    st.session_state.user_id   = username
-                    st.session_state.is_admin  = False
+                    st.session_state.user_id = username
+                    st.session_state.is_admin = False
                     st.rerun()
                 else:
                     st.error("❌ 비밀번호가 올바르지 않습니다.")
             else:
                 st.error("❌ 등록되지 않은 계정입니다. '신규 회원 가입' 탭을 이용해 주세요.")
 
-    # ── 회원가입 탭 ──
     with tab_register:
         st.subheader("신규 연구원 계정 등록")
         st.caption(
@@ -1093,17 +746,17 @@ def check_authentication():
             "신청 시 관리자에게 이메일로 알림이 발송됩니다."
         )
         with st.form("register_form"):
-            r_id   = st.text_input("사용자 ID (영문·숫자, 4자 이상)")
+            r_id = st.text_input("사용자 ID (영문·숫자, 4자 이상)")
             r_name = st.text_input("이름 *")
-            r_email= st.text_input("이메일 *")
+            r_email = st.text_input("이메일 *")
             r_dept = st.text_input("부서 (선택)")
-            r_pw   = st.text_input("비밀번호 (6자 이상)", type="password")
-            r_pw2  = st.text_input("비밀번호 확인", type="password")
+            r_pw = st.text_input("비밀번호 (6자 이상)", type="password")
+            r_pw2 = st.text_input("비밀번호 확인", type="password")
             reg_submitted = st.form_submit_button("가입 신청")
 
         if reg_submitted:
             admin_creds = _get_admin_credentials()
-            registry    = load_user_registry()
+            registry = load_user_registry()
             errors = []
 
             if len(r_id) < 4:
@@ -1122,19 +775,19 @@ def check_authentication():
                     st.error(e)
             else:
                 user_info = {
-                    "username":      r_id,
-                    "name":          r_name,
-                    "email":         r_email,
-                    "department":    r_dept,
+                    "username": r_id,
+                    "name": r_name,
+                    "email": r_email,
+                    "department": r_dept,
                     "password_hash": _hash_pw(r_pw),
                     "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "active":        False,
+                    "active": False,
                 }
                 registry[r_id] = user_info
                 save_user_registry(registry)
 
                 with st.spinner("💾 계정 정보를 저장하는 중..."):
-                    upload_user_registry_to_github()
+                    upload_user_registry_to_r2()
 
                 email_ok = send_admin_signup_email(user_info)
 
@@ -1151,42 +804,66 @@ def check_authentication():
 
 
 # ==========================================
-# 2. [프로세스 레벨 싱글톤] @st.cache_resource 기반 인프라 팩토리
+# 9. Gemini 임베딩 함수 (ChromaDB EmbeddingFunction 인터페이스)
 # ==========================================
+class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
+    """
+    Google Gemini text-embedding-004 (768차원, 2048토큰 컨텍스트).
+    무료 티어로 호출 (rate limit 내). 로컬 모델 미로딩 → Streamlit RAM 절약.
+    """
 
-# ── ChromaDB / LLM 인프라 (@st.cache_resource) ───────────────────────────────
-# Streamlit은 스크립트를 매 리런마다 처음부터 재실행하므로 모듈 전역 변수는 매번 None으로
-# 초기화된다. chromadb SharedSystemClient 레지스트리는 프로세스 수준에서 유지되므로,
-# 모듈 전역 싱글톤 + EphemeralClient() 재호출 조합은 "An instance already exists"를 유발한다.
-_EMBED_MODEL      = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-_COLLECTION_NAME  = "competitor_patents"
+    def __init__(self, api_key: str, model: str = "models/text-embedding-004"):
+        if not _GENAI_AVAILABLE:
+            raise RuntimeError("google-generativeai 미설치 — requirements.txt에 추가 필요")
+        genai.configure(api_key=api_key)
+        self._model = model
 
-# Groq on_demand 무료 티어: 단일 요청 = 입력 토큰 + max_tokens(출력 예약) ≤ 6,000 TPM
-GROQ_TPM_LIMIT = 6000
-GROQ_MAX_OUTPUT_TOKENS = 1024
-GROQ_REQUEST_MARGIN = 700  # 추정 오차·API 오버헤드 여유
+    def __call__(self, input):
+        if isinstance(input, str):
+            input = [input]
+        out = []
+        for text in input:
+            text = (text or "").strip() or " "
+            # 안전: 너무 긴 입력은 임베딩 컨텍스트(2048토큰≈수천자) 내로 자름
+            if len(text) > 8000:
+                text = text[:8000]
+            try:
+                resp = genai.embed_content(
+                    model=self._model,
+                    content=text,
+                    task_type="retrieval_document",
+                )
+                out.append(resp["embedding"])
+            except Exception as e:
+                print(f"[Gemini 임베딩 오류] {e}")
+                out.append([0.0] * _EMBED_DIM)
+        return out
+
+
+# ==========================================
+# 10. ChromaDB (PersistentClient) / LLM 인프라
+# ==========================================
+@st.cache_resource
+def _get_embedding_fn():
+    """
+    임베딩 함수 선택:
+      · GEMINI_API_KEY가 있으면 Gemini API (권장 — RAM 절약 + 긴 컨텍스트)
+      · 없으면 로컬 SentenceTransformer로 폴백
+    """
+    gemini_key = _clean_ascii(st.secrets.get("GEMINI_API_KEY", ""))
+    if gemini_key and _GENAI_AVAILABLE:
+        return GeminiEmbeddingFunction(gemini_key)
+    # 폴백: 로컬 모델 (RAM 수백 MB 사용)
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    )
 
 
 @st.cache_resource
 def _get_chroma_client():
-    """
-    EphemeralClient를 Streamlit cache_resource로 프로세스당 1회만 생성.
-    chromadb 레지스트리 잔존 시 SharedSystemClient.clear_system_cache() 후 재시도.
-    """
-    for attempt in range(2):
-        try:
-            return chromadb.EphemeralClient()
-        except ValueError:
-            SharedSystemClient.clear_system_cache()
-            if attempt == 1:
-                raise
-
-
-@st.cache_resource
-def _get_embedding_fn():
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=_EMBED_MODEL
-    )
+    """PersistentClient — CHROMA_DIR 디스크 영속. 프로세스당 1회."""
+    os.makedirs(CHROMA_DIR, exist_ok=True)
+    return chromadb.PersistentClient(path=CHROMA_DIR)
 
 
 @st.cache_resource
@@ -1203,19 +880,15 @@ def _get_llm():
 
 
 def _get_collection():
-    """캐시된 EphemeralClient에서 컬렉션 참조. 포맷 후 reset_collection()이 재생성."""
-    client = _get_chroma_client()
-    return client.get_or_create_collection(
+    return _get_chroma_client().get_or_create_collection(
         name=_COLLECTION_NAME,
-        embedding_function=_get_embedding_fn()
+        embedding_function=_get_embedding_fn(),
+        metadata={"hnsw:space": "cosine"},
     )
 
 
 def reset_collection():
-    """
-    포맷 버튼 전용: 기존 컬렉션을 삭제하고 빈 컬렉션을 재생성.
-    EphemeralClient는 @st.cache_resource로 유지 — 재생성하지 않음.
-    """
+    """포맷 전용: 컬렉션 삭제 후 빈 컬렉션 재생성."""
     client = _get_chroma_client()
     try:
         client.delete_collection(_COLLECTION_NAME)
@@ -1223,14 +896,15 @@ def reset_collection():
         pass
     return client.get_or_create_collection(
         name=_COLLECTION_NAME,
-        embedding_function=_get_embedding_fn()
+        embedding_function=_get_embedding_fn(),
+        metadata={"hnsw:space": "cosine"},
     )
 
 
 def load_permanent_infra_singleton():
-    """캐시된 chroma_client, collection, llm을 반환."""
-    if "infra_initialized" not in st.session_state:
-        with st.spinner("📦 가상 특허 가동 커널 및 AI 전문 임베딩 엔진 초기화 중..."):
+    """캐시된 client, collection, llm 반환. 최초 1회 초기화 spinner 표시."""
+    if not st.session_state.infra_initialized:
+        with st.spinner("📦 AI 임베딩 엔진 및 벡터 커널 초기화 중..."):
             _get_chroma_client()
             _get_llm()
         st.session_state.infra_initialized = True
@@ -1238,35 +912,51 @@ def load_permanent_infra_singleton():
 
 
 def chroma_count(collection) -> int:
-    """Chroma collection.count() — 세션 상태 없이 순수 호출."""
+    """collection.count() — 순수 호출."""
     return collection.count()
 
 
 def safe_count(collection) -> int:
-    """
-    collection.count()를 안전하게 호출.
-    일시 오류 시 0 대신 마지막 정상 값을 반환 — 0이면 자동 재인덱싱이 오작동함.
-    """
+    """collection.count() 안전 호출. 일시 오류 시 마지막 정상값 반환."""
     try:
         n = chroma_count(collection)
-        st.session_state._last_chroma_count = n
+        st.session_state["_last_chroma_count"] = n
         return n
     except Exception as e:
         print(f"[ChromaDB safe_count 오류] {e}")
         return st.session_state.get("_last_chroma_count", 0)
 
 
+# ==========================================
+# 11. Groq 토큰 예산 + 일일 한도(TPD) 추적
+# ==========================================
 def _estimate_tokens(text: str) -> int:
     """한국어 특허 텍스트 보수적 토큰 추정 (과소 추정 방지)."""
     if not text:
         return 0
-    # 한국어 혼합: 약 1.2~1.7자/토큰 → 1.25자/토큰 가정
-    return max(1, int(len(text) / 1.25) + 5)
+    # 한국어는 실제로 1자당 1토큰 이상인 경우가 많음 → 1.1자/토큰으로 보수적 추정
+    return max(1, int(len(text) / 1.1) + 5)
 
 
 def _chars_for_token_budget(tokens: int) -> int:
-    """토큰 예산에 대응하는 최대 문자 수."""
-    return max(100, int(tokens * 1.25))
+    return max(100, int(tokens * 1.1))
+
+
+def _today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _daily_tokens_used() -> int:
+    """오늘 누적 사용 토큰. 날짜 바뀌면 리셋."""
+    if st.session_state.get("_daily_token_date") != _today_key():
+        st.session_state["_daily_token_date"] = _today_key()
+        st.session_state["_daily_token_used"] = 0
+    return st.session_state.get("_daily_token_used", 0)
+
+
+def _add_daily_tokens(n: int):
+    _daily_tokens_used()  # 날짜 갱신 보장
+    st.session_state["_daily_token_used"] = st.session_state.get("_daily_token_used", 0) + max(0, n)
 
 
 def _max_prompt_input_tokens(system_prompt: str, user_query: str) -> int:
@@ -1291,21 +981,21 @@ def _truncate_text(text: str, max_chars: int, suffix: str = "\n…(분량 제한
     return text[:max_chars].rstrip() + suffix
 
 
-def _format_patent_meta_line(i: int, m: dict) -> tuple[str, str, str]:
-    app_num    = m.get("출원번호", "번호없음")
-    p_name     = m.get("명칭", "제목없음")
-    applicant  = m.get("출원인", "미기재")
-    inventor   = m.get("발명자", "미기재")
-    ipc        = m.get("IPC", "없음")
-    cpc        = m.get("CPC", "없음")
-    app_date   = m.get("출원일", "없음")
+def _format_patent_meta_line(i: int, m: dict):
+    app_num = m.get("출원번호", "번호없음")
+    p_name = m.get("명칭", "제목없음")
+    applicant = m.get("출원인", "미기재")
+    inventor = m.get("발명자", "미기재")
+    ipc = m.get("IPC", "없음")
+    cpc = m.get("CPC", "없음")
+    app_date = m.get("출원일", "없음")
     patent_url = m.get("URL", "")
 
     if patent_url and patent_url.startswith("http"):
-        display_num  = f"[{app_num}]({patent_url})"
+        display_num = f"[{app_num}]({patent_url})"
         display_name = f"[{p_name}]({patent_url})"
     else:
-        display_num  = app_num
+        display_num = app_num
         display_name = p_name
 
     header = (
@@ -1320,7 +1010,6 @@ def _parse_patent_doc(doc: str) -> dict:
     """ChromaDB 문서 문자열을 명칭·요약·청구항으로 분리."""
     doc = doc.strip()
     title, abstract, claims = "", "", ""
-
     if "특허요약:" in doc:
         before, rest = doc.split("특허요약:", 1)
         title = before.strip()
@@ -1331,22 +1020,21 @@ def _parse_patent_doc(doc: str) -> dict:
             abstract = rest.strip()
     else:
         abstract = doc
-
     return {"title": title, "abstract": abstract, "claims": claims}
 
 
-def _compress_patent_doc_for_llm(doc: str, max_chars: int, *, claims_first: bool = False) -> tuple[str, bool]:
+def _compress_patent_doc_for_llm(doc: str, max_chars: int, *, claims_first: bool = False):
     """
     토큰 예산 내로 특허 본문 축약.
-    claims_first=False: 요약 우선 — 청구항을 먼저 생략·축소, 요약을 최대한 유지.
-    claims_first=True : 침해 분석용 — 청구항 우선, 요약을 먼저 축소.
+    claims_first=False: 요약 우선 — 청구항 먼저 생략·축소.
+    claims_first=True : 침해 분석용 — 청구항 우선, 요약 먼저 축소.
     """
     parsed = _parse_patent_doc(doc)
     title = parsed["title"] or "특허명칭: (미기재)"
     abstract = parsed["abstract"]
     claims = parsed["claims"]
 
-    def _join(title_line: str, abs_text: str, claims_text: str | None) -> str:
+    def _join(title_line, abs_text, claims_text):
         parts = [title_line, f"특허요약: {abs_text}"]
         if claims_text is not None:
             parts.append(f"특허청구항: {claims_text}")
@@ -1362,12 +1050,9 @@ def _compress_patent_doc_for_llm(doc: str, max_chars: int, *, claims_first: bool
     truncated = True
 
     if not claims_first:
-        # 1) 요약 전체 + 청구항 생략
         abstract_only = _join(title, abstract, omitted_claims if claims else None)
         if len(abstract_only) <= max_chars:
             return abstract_only, truncated
-
-        # 2) 요약 일부 + 청구항 생략
         prefix = f"{title}\n특허요약: "
         suffix = f"\n특허청구항: {omitted_claims}" if claims else ""
         abs_budget = max_chars - len(prefix) - len(suffix)
@@ -1376,21 +1061,16 @@ def _compress_patent_doc_for_llm(doc: str, max_chars: int, *, claims_first: bool
             if len(compressed) <= max_chars:
                 return compressed, truncated
     else:
-        # 1) 청구항 전체 + 요약 생략
         if claims:
             claims_only = _join(title, omitted_abstract, claims)
             if len(claims_only) <= max_chars:
                 return claims_only, truncated
-
-            # 2) 청구항 일부 + 요약 생략
             prefix = f"{title}\n특허요약: {omitted_abstract}\n특허청구항: "
             claims_budget = max_chars - len(prefix)
             if claims_budget >= 80:
                 compressed = prefix + _truncate_text(claims, claims_budget, suffix="…")
                 if len(compressed) <= max_chars:
                     return compressed, truncated
-
-        # 청구항 없으면 요약 우선으로 폴백
         abstract_only = _join(title, abstract, None)
         if len(abstract_only) <= max_chars:
             return abstract_only, truncated
@@ -1398,13 +1078,8 @@ def _compress_patent_doc_for_llm(doc: str, max_chars: int, *, claims_first: bool
     return _truncate_text(full, max_chars), truncated
 
 
-def _build_rag_context_for_llm(
-    docs: list, metas: list, token_budget: int, *, claims_first: bool = False
-) -> tuple[str, bool]:
-    """
-    검색된 특허 문서를 Groq 입력 토큰 예산 내로 축소.
-    건별로 요약/청구항 우선순위에 따라 축약한 뒤, 여전히 초과하면 건당 한도를 낮춘다.
-    """
+def _build_rag_context_for_llm(docs, metas, token_budget, *, claims_first=False):
+    """검색된 특허 문서를 Groq 입력 토큰 예산 내로 축소."""
     n = len(docs)
     if n == 0:
         return "", False
@@ -1433,7 +1108,7 @@ def _build_rag_context_for_llm(
         per_doc_chars = int(per_doc_chars * 0.75)
 
 
-def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str) -> tuple[str, bool, str]:
+def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str):
     instruction = "답변 시 참고한 특허 번호·명칭은 [번호](URL) 마크다운 링크 형식을 그대로 유지하세요."
     context_budget = _max_prompt_input_tokens(system_prompt, user_query)
     truncated = False
@@ -1446,21 +1121,18 @@ def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str)
 
     for _ in range(8):
         prompt = (
-            f"[SYSTEM] {system_prompt}\n"
-            f"{instruction}\n\n"
+            f"[SYSTEM] {system_prompt}\n{instruction}\n\n"
             f"[참고 데이터]\n{context_text}\n\n"
             f"[사용자 요청]\n{user_query}\n\n"
             "보고서는 마크다운 양식으로 한국어로 작성하세요."
         )
         if _estimate_tokens(prompt) <= max_input:
             return prompt, truncated, context_text
-
         truncated = True
         context_text = _truncate_text(context_text, max(200, int(len(context_text) * 0.82)))
 
     prompt = (
-        f"[SYSTEM] {system_prompt}\n"
-        f"{instruction}\n\n"
+        f"[SYSTEM] {system_prompt}\n{instruction}\n\n"
         f"[참고 데이터]\n{context_text}\n\n"
         f"[사용자 요청]\n{user_query}\n\n"
         "보고서는 마크다운 양식으로 한국어로 작성하세요."
@@ -1468,9 +1140,10 @@ def _assemble_llm_prompt(system_prompt: str, context_text: str, user_query: str)
     return prompt, truncated, context_text
 
 
-# --- 3. 엑셀 파싱 및 무결성 메타데이터 적재 로직 ---
-def _find_column(col_map: dict, *keywords: str) -> str | None:
-    """col_map(대문자 키)에서 keywords 순서대로 첫 매칭 컬럼명 반환."""
+# ==========================================
+# 12. 엑셀 파싱 · 메타데이터 빌드
+# ==========================================
+def _find_column(col_map: dict, *keywords: str):
     for kw in keywords:
         for k, v in col_map.items():
             if kw in k:
@@ -1482,7 +1155,6 @@ def _detect_columns(df: pd.DataFrame) -> dict:
     """DataFrame 컬럼명을 분석해 각 필드에 해당하는 실제 컬럼명 반환."""
     col_map = {str(c).strip().replace(" ", "").upper(): c for c in df.columns}
 
-    # 출원번호: '공개번호'/'등록번호' 등 '번호'만 포함된 열을 먼저 잡지 않도록 우선순위 지정
     id_col = (
         _find_column(col_map, "출원번호", "APPLICATIONNO", "APPNO", "APPLNO")
         or _find_column(col_map, "특허번호", "PATENTNO")
@@ -1496,21 +1168,20 @@ def _detect_columns(df: pd.DataFrame) -> dict:
         id_col = df.columns[0]
 
     return {
-        "id":        id_col,
-        "title":     _find_column(col_map, "명칭", "제목", "특허명", "INVENTIONTITLE") or None,
-        "abstract":  _find_column(col_map, "요약", "초록", "ABSTRACT") or None,
-        "claims":    _find_column(col_map, "청구항", "청구", "범위", "CLAIM") or None,
-        "app_date":  _find_column(col_map, "출원일", "출원일자", "APPDATE", "FILINGDATE") or None,
-        "reg_date":  _find_column(col_map, "등록일", "등록일자", "REGDATE") or None,
-        "ipc":       _find_column(col_map, "IPC") or None,
-        "cpc":       _find_column(col_map, "CPC") or None,
-        "inventor":  _find_column(col_map, "발명자", "발명인", "INVENTOR") or None,
+        "id": id_col,
+        "title": _find_column(col_map, "명칭", "제목", "특허명", "INVENTIONTITLE") or None,
+        "abstract": _find_column(col_map, "요약", "초록", "ABSTRACT") or None,
+        "claims": _find_column(col_map, "청구항", "청구", "범위", "CLAIM") or None,
+        "app_date": _find_column(col_map, "출원일", "출원일자", "APPDATE", "FILINGDATE") or None,
+        "reg_date": _find_column(col_map, "등록일", "등록일자", "REGDATE") or None,
+        "ipc": _find_column(col_map, "IPC") or None,
+        "cpc": _find_column(col_map, "CPC") or None,
+        "inventor": _find_column(col_map, "발명자", "발명인", "INVENTOR") or None,
         "applicant": _find_column(col_map, "출원인", "권리자", "APPLICANT", "ASSIGNEE") or None,
     }
 
 
 def _get_cell(row, col, default: str = "없음") -> str:
-    """컬럼이 존재하고 값이 있으면 str 반환."""
     if col and pd.notna(row.get(col)):
         val = str(row[col]).strip()
         return val if val else default
@@ -1518,145 +1189,51 @@ def _get_cell(row, col, default: str = "없음") -> str:
 
 
 def _get_info_cell(row, col) -> str:
-    """임베딩용 — 빈 값은 '정보없음'."""
     return _get_cell(row, col, default="정보없음")
 
 
 def _build_metadata(row, cols: dict, patent_url: str = "") -> dict:
-    """ChromaDB 메타데이터 딕셔너리 생성."""
     title = _get_info_cell(row, cols["title"]) if cols["title"] else "정보없음"
     return {
         "출원번호": str(row[cols["id"]]),
-        "명칭":     title,
-        "출원일":   _get_cell(row, cols["app_date"]),
-        "등록일":   _get_cell(row, cols["reg_date"]),
-        "IPC":      _get_cell(row, cols["ipc"]),
-        "CPC":      _get_cell(row, cols["cpc"]),
-        "발명자":   _get_cell(row, cols["inventor"]),
-        "출원인":   _get_cell(row, cols["applicant"]),
-        "URL":      patent_url,
+        "명칭": title,
+        "출원일": _get_cell(row, cols["app_date"]),
+        "등록일": _get_cell(row, cols["reg_date"]),
+        "IPC": _get_cell(row, cols["ipc"]),
+        "CPC": _get_cell(row, cols["cpc"]),
+        "발명자": _get_cell(row, cols["inventor"]),
+        "출원인": _get_cell(row, cols["applicant"]),
+        "URL": patent_url,
     }
 
 
 def _build_document(row, cols: dict) -> str:
-    """ChromaDB 임베딩용 문서 텍스트 생성."""
-    title    = _get_info_cell(row, cols["title"])
+    title = _get_info_cell(row, cols["title"])
     abstract = _get_info_cell(row, cols["abstract"])
-    claims   = _get_info_cell(row, cols["claims"])
+    claims = _get_info_cell(row, cols["claims"])
     return f"특허명칭: {title}\n특허요약: {abstract}\n특허청구항: {claims}"
 
 
-def _patent_url_from_row(
-    row,
-    cols: dict,
-    patent_id: str,
-    hyperlink_map: dict | None = None,
-) -> str:
-    """마스터 행·하이퍼링크 맵에서 특허 URL 추출 (유효한 http URL만)."""
+def _patent_url_from_row(row, cols: dict, patent_id: str, hyperlink_map=None) -> str:
     hyperlink_map = hyperlink_map or {}
-
     if "URL" in getattr(row, "index", []):
         raw_url = row.get("URL")
         if pd.notna(raw_url):
             url = str(raw_url).strip()
             if url.startswith("http"):
                 return url
-
     url = hyperlink_map.get(patent_id, "")
     if url and str(url).startswith("http"):
         return str(url)
-
     if cols.get("title"):
         clean_title = str(row[cols["title"]]).strip().replace("-", "")
         url = hyperlink_map.get(clean_title, "")
         if url and str(url).startswith("http"):
             return str(url)
-
     return ""
 
 
-def _master_excel_mtime() -> float:
-    """마스터 엑셀 mtime. 없거나 비어 있으면 -1."""
-    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
-        return os.path.getmtime(MASTER_EXCEL_PATH)
-    return -1.0
-
-
-def _invalidate_patent_count_cache() -> None:
-    """마스터·Chroma 건수·통계 메타 캐시 무효화 (데이터 변경 직후 호출)."""
-    st.session_state.pop(_PATENT_COUNT_CACHE_KEY, None)
-    st.session_state.pop(_STATS_METAS_CACHE_KEY, None)
-
-
-@st.cache_data(show_spinner=False)
-def _load_master_excel_cached(mtime: float) -> bytes | None:
-    if mtime < 0:
-        return None
-    with open(MASTER_EXCEL_PATH, "rb") as f:
-        return f.read()
-
-
-def _read_master_excel_df() -> pd.DataFrame | None:
-    """마스터 엑셀 DataFrame (mtime 기준 @st.cache_data)."""
-    mtime = _master_excel_mtime()
-    raw = _load_master_excel_cached(mtime)
-    if raw is None:
-        return None
-    return pd.read_excel(io.BytesIO(raw))
-
-
-def _get_all_metadatas_cached(collection) -> list:
-    """통계 모드용 전체 metadatas — chroma_n 기준 세션 캐시."""
-    chroma_n = safe_count(collection)
-    cache = st.session_state.get(_STATS_METAS_CACHE_KEY)
-    if cache and cache.get("chroma_n") == chroma_n:
-        return cache["metadatas"]
-    all_data = collection.get(include=["metadatas"])
-    metas = all_data.get("metadatas", [])
-    st.session_state[_STATS_METAS_CACHE_KEY] = {"chroma_n": chroma_n, "metadatas": metas}
-    return metas
-
-
-def _get_patent_count_cache() -> dict:
-    if _PATENT_COUNT_CACHE_KEY not in st.session_state:
-        st.session_state[_PATENT_COUNT_CACHE_KEY] = {}
-    return st.session_state[_PATENT_COUNT_CACHE_KEY]
-
-
-def _count_master_excel_patents(force: bool = False) -> int | None:
-    """마스터 엑셀의 고유 출원번호 건수. 파일 없으면 None."""
-    mtime = _master_excel_mtime()
-    cache = _get_patent_count_cache()
-    if not force and cache.get("master_mtime") == mtime and "master_n" in cache:
-        return cache["master_n"]
-
-    if mtime < 0:
-        cache["master_mtime"] = mtime
-        cache["master_n"] = None
-        return None
-
-    try:
-        df = _read_master_excel_df()
-        if df is None:
-            result = None
-        else:
-            cols = _detect_columns(df)
-            ids = {
-                _normalize_patent_id(v)
-                for v in df[cols["id"]]
-                if _normalize_patent_id(v)
-            }
-            result = len(ids)
-    except Exception as e:
-        print(f"[마스터 엑셀 건수 조회 오류] {e}")
-        result = None
-
-    cache["master_mtime"] = mtime
-    cache["master_n"] = result
-    return result
-
-
-def extract_excel_hyperlinks(uploaded_file):
+def extract_excel_hyperlinks(uploaded_file) -> dict:
     link_dict = {}
     try:
         wb = openpyxl.load_workbook(uploaded_file, data_only=False)
@@ -1671,8 +1248,10 @@ def extract_excel_hyperlinks(uploaded_file):
     return link_dict
 
 
+# ==========================================
+# 13. ChromaDB 적재
+# ==========================================
 def _get_chroma_ids(collection) -> set:
-    """ChromaDB에 이미 적재된 id 집합."""
     try:
         if collection.count() == 0:
             return set()
@@ -1682,121 +1261,7 @@ def _get_chroma_ids(collection) -> set:
         return set()
 
 
-def _unique_patents_from_ids(collection) -> int:
-    """Chroma document id만으로 고유 출원번호 수 (빠른 경로)."""
-    try:
-        all_ids = collection.get(include=[])["ids"]
-        return len({
-            _normalize_patent_id(i)
-            for i in all_ids
-            if _normalize_patent_id(i)
-        })
-    except Exception as e:
-        print(f"[ChromaDB ID 고유 출원번호 오류] {e}")
-        return 0
-
-
-def _unique_patents_from_metadatas(collection, batch_size: int = 500) -> int:
-    """메타데이터 배치 스캔으로 고유 출원번호 수 (정밀 경로)."""
-    try:
-        all_ids = collection.get(include=[])["ids"]
-        canonical: set[str] = set()
-        for i in range(0, len(all_ids), batch_size):
-            batch = collection.get(
-                ids=all_ids[i:i + batch_size],
-                include=["metadatas"],
-            )
-            for chroma_id, meta in zip(
-                batch.get("ids", []),
-                batch.get("metadatas", []),
-            ):
-                meta = meta or {}
-                cid = (
-                    _normalize_patent_id(meta.get("출원번호", ""))
-                    or _normalize_patent_id(chroma_id)
-                )
-                if cid:
-                    canonical.add(cid)
-        return len(canonical)
-    except Exception as e:
-        print(f"[ChromaDB 메타 고유 출원번호 오류] {e}")
-        return 0
-
-
-def _count_chroma_unique_patents(
-    collection, batch_size: int = 500, force: bool = False, *, full_scan: bool = False
-) -> int:
-    """
-    ChromaDB 내 고유 출원번호(canonical) 수.
-    기본은 ID 기반 빠른 경로, full_scan=True 시 메타데이터 정밀 스캔.
-    """
-    chroma_n = safe_count(collection)
-    cache = _get_patent_count_cache()
-    cache_key = (chroma_n, _master_excel_mtime())
-    if not force and not full_scan and cache.get("chroma_key") == cache_key and "chroma_unique_n" in cache:
-        return cache["chroma_unique_n"]
-
-    if chroma_n == 0:
-        result = 0
-    elif full_scan:
-        result = _unique_patents_from_metadatas(collection, batch_size)
-    else:
-        result = _unique_patents_from_ids(collection)
-
-    cache["chroma_key"] = cache_key
-    cache["chroma_unique_n"] = result
-    return result
-
-
-def _render_feedback_box(feedback: dict | None) -> None:
-    """session_state 피드백 메시지 렌더."""
-    if not feedback:
-        return
-    level = feedback.get("level", "info")
-    message = feedback.get("message", "")
-    if level == "success":
-        st.success(message)
-    elif level == "warning":
-        st.warning(message)
-    elif level == "error":
-        st.error(message)
-    else:
-        st.info(message)
-
-
-def _build_db_count_status(chroma_n: int, master_n: int | None, unique_patent_n: int) -> str:
-    """Chroma·마스터 건수 표시. 정상 동기화 시 건수만, 불일치 시에만 안내 문구."""
-    count_md = f"📊 **누적 적재 데이터 (ChromaDB):** `{chroma_n}` 건"
-    if master_n is None:
-        return count_md
-
-    count_md += f"  \n📄 **마스터 엑셀 (고유 출원번호):** `{master_n}` 건"
-
-    # 고유 출원번호 일치 = 정상 — 추가 경고·안내 없이 건수만 표시
-    if master_n == unique_patent_n:
-        return count_md
-
-    # 불일치 시에만 상세·안내 (고유 출원번호 기준 비교)
-    if unique_patent_n:
-        count_md += f"  \n🔑 **ChromaDB 고유 출원번호:** `{unique_patent_n}` 건"
-
-    if master_n < unique_patent_n:
-        gap = unique_patent_n - master_n
-        count_md += (
-            f"  \n⚠️ 마스터가 Chroma 고유 출원번호보다 **{gap}건** 부족합니다. "
-            f"**ChromaDB → 마스터 엑셀 역동기화** 후 GitHub 백업하세요."
-        )
-    elif master_n > unique_patent_n:
-        gap = master_n - unique_patent_n
-        count_md += (
-            f"  \n⚠️ 마스터가 Chroma 고유 출원번호보다 **{gap}건** 많습니다. "
-            f"**ChromaDB 누락분 복구** 버튼을 실행하세요."
-        )
-    return count_md
-
-
-def _upsert_patent_batches(collection, ids: list, docs: list, metas: list, batch_size: int = 100) -> None:
-    """배치 upsert. 실패 시 예외 전파."""
+def _upsert_patent_batches(collection, ids, docs, metas, batch_size: int = 100):
     for i in range(0, len(ids), batch_size):
         collection.upsert(
             ids=ids[i:i + batch_size],
@@ -1805,434 +1270,7 @@ def _upsert_patent_batches(collection, ids: list, docs: list, metas: list, batch
         )
 
 
-def _compact_master_excel() -> int:
-    """canonical 출원번호 기준 마스터 엑셀 중복 행 제거(마지막 행 유지). 제거된 행 수 반환."""
-    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
-        return 0
-    try:
-        df = _read_master_excel_df()
-        if df is None:
-            return 0
-        before = len(df)
-        cols   = _detect_columns(df)
-        deduped = _dedupe_dataframe_by_patent_id(df, cols)
-        after  = len(deduped)
-        if after < before:
-            deduped.to_excel(MASTER_EXCEL_PATH, index=False)
-            _invalidate_patent_count_cache()
-            return before - after
-    except Exception as e:
-        print(f"[마스터 compact 오류] {e}")
-    return 0
-
-
-def _collect_missing_patents_from_master(
-    collection, hyperlink_map: dict | None = None
-) -> tuple[list, list, list]:
-    """마스터 엑셀에만 있고 Chroma에 없는 출원번호 → (ids, docs, metas)."""
-    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
-        return [], [], []
-    df = _read_master_excel_df()
-    if df is None:
-        return [], [], []
-    cols = _detect_columns(df)
-    chroma_ids = _get_chroma_ids(collection)
-    hyperlink_map = hyperlink_map or {}
-
-    rows_by_id: dict = {}
-    for _, row in df.iterrows():
-        pat_id = _normalize_patent_id(row[cols["id"]])
-        if pat_id:
-            rows_by_id[pat_id] = row
-
-    ids, docs, metas = [], [], []
-    for pat_id, row in rows_by_id.items():
-        if pat_id in chroma_ids:
-            continue
-        patent_url = _patent_url_from_row(row, cols, pat_id, hyperlink_map)
-        ids.append(pat_id)
-        docs.append(_build_document(row, cols))
-        metas.append(_build_metadata(row, cols, patent_url=patent_url))
-    return ids, docs, metas
-
-
-def run_gap_sync_step(collection, chunk_size: int = _GAP_SYNC_CHUNK) -> dict:
-    """
-    누락분 복구 1스텝(배치). Streamlit rerun 루프와 함께 사용.
-    완료 시 GCS 스냅샷 업로드 시도.
-    """
-    result = {
-        "synced_this_run": 0,
-        "remaining": 0,
-        "total_missing": 0,
-        "done": True,
-        "snapshot_ok": None,
-        "snapshot_msg": "",
-    }
-    _compact_master_excel()
-    try:
-        ids, docs, metas = _collect_missing_patents_from_master(collection)
-        total = len(ids)
-        result["total_missing"] = total
-        if total == 0:
-            return result
-
-        n = min(chunk_size, total)
-        _upsert_patent_batches(
-            collection, ids[:n], docs[:n], metas[:n], batch_size=10
-        )
-        _invalidate_patent_count_cache()
-        result["synced_this_run"] = n
-        result["remaining"] = total - n
-        result["done"] = n >= total
-        # 스냅샷 export+GCS 업로드는 수 분 소요 → gap 배치 루프와 분리 (수동 버튼)
-    except Exception as e:
-        result["done"] = True
-        result["snapshot_ok"] = False
-        result["snapshot_msg"] = str(e)
-        print(f"[ChromaDB 누락분 배치 오류] {e}")
-    return result
-
-
-def _start_gap_sync() -> None:
-    st.session_state.gap_sync_active = True
-    st.session_state.gap_sync_synced_session = 0
-    st.session_state.gap_sync_batch_n = 0
-    st.session_state.gap_sync_last_remaining = None
-    st.session_state.gap_sync_stall_n = 0
-
-
-def _run_gap_sync_if_active(collection) -> None:
-    """gap_sync_active이면 배치 복구 1스텝 실행 후 rerun."""
-    if not st.session_state.get("gap_sync_active"):
-        return
-
-    master_n = _count_master_excel_patents()
-    unique_n = _count_chroma_unique_patents(collection) if safe_count(collection) > 0 else 0
-    gap = max(0, (master_n or 0) - unique_n)
-    batches_left = min(
-        (gap + _GAP_SYNC_CHUNK - 1) // _GAP_SYNC_CHUNK,
-        _GAP_SYNC_MAX_BATCHES,
-    )
-
-    with st.status(
-        f"ChromaDB 누락분 복구 중 (고유 {unique_n}→{master_n}, 남음 약 {gap}건)...",
-        expanded=True,
-    ) as status:
-        if gap > 500:
-            st.info(
-                f"남은 **{gap}건**은 15건×약 **{batches_left}회** 배치로 **수 시간** 걸릴 수 있습니다. "
-                "먼저 **⏹ 복구 중단** → 사이드바 **📥 클라우드 스냅샷 → ChromaDB 수동 복원** "
-                "(1~3분)을 시도하는 것이 훨씬 빠릅니다."
-            )
-        if st.button("⏹ 복구 중단", key="gap_sync_cancel"):
-            st.session_state.gap_sync_active = False
-            st.session_state.sync_feedback = {
-                "level": "warning",
-                "message": "누락분 복구를 중단했습니다. 나중에 버튼으로 다시 시작할 수 있습니다.",
-            }
-            st.rerun()
-
-        batch_n = st.session_state.get("gap_sync_batch_n", 0) + 1
-        if batch_n > _GAP_SYNC_MAX_BATCHES:
-            st.session_state.gap_sync_active = False
-            st.session_state.sync_feedback = {
-                "level": "warning",
-                "message": (
-                    f"⚠️ 누락분 복구가 배치 상한({_GAP_SYNC_MAX_BATCHES}회)에 도달해 중단했습니다. "
-                    "**클라우드 스냅샷 → ChromaDB 수동 복원**을 먼저 시도하거나, "
-                    "잠시 후 복구 버튼을 다시 눌러 주세요."
-                ),
-            }
-            status.update(label="복구 중단 (배치 상한)", state="error")
-            st.rerun()
-        st.session_state.gap_sync_batch_n = batch_n
-
-        step = run_gap_sync_step(collection)
-        synced_session = (
-            st.session_state.get("gap_sync_synced_session", 0)
-            + step["synced_this_run"]
-        )
-        st.session_state.gap_sync_synced_session = synced_session
-
-        if step["synced_this_run"]:
-            st.write(
-                f"✓ 이번 배치 **+{step['synced_this_run']}건** "
-                f"(이번 세션 누적 {synced_session}건)"
-            )
-
-        if not step["done"]:
-            prev_remaining = st.session_state.get("gap_sync_last_remaining")
-            if (
-                prev_remaining is not None
-                and step["remaining"] >= prev_remaining
-                and step["synced_this_run"] == 0
-            ):
-                st.session_state.gap_sync_stall_n = (
-                    st.session_state.get("gap_sync_stall_n", 0) + 1
-                )
-            elif step["synced_this_run"] > 0:
-                st.session_state.gap_sync_stall_n = 0
-            st.session_state.gap_sync_last_remaining = step["remaining"]
-
-            if step["synced_this_run"] == 0 and step["remaining"] > 0:
-                st.session_state.gap_sync_active = False
-                st.session_state.sync_feedback = {
-                    "level": "error",
-                    "message": (
-                        "❌ 누락분 복구가 진행되지 않습니다. "
-                        "앱을 새로고침한 뒤 **클라우드 스냅샷 → ChromaDB 수동 복원**을 "
-                        "먼저 시도하거나, 잠시 후 복구 버튼을 다시 눌러 주세요."
-                    ),
-                }
-                status.update(label="복구 중단", state="error")
-                st.rerun()
-            if st.session_state.get("gap_sync_stall_n", 0) >= 3 and step["remaining"] > 0:
-                st.session_state.gap_sync_active = False
-                st.session_state.sync_feedback = {
-                    "level": "error",
-                    "message": (
-                        "❌ 누락분 복구가 연속으로 진행되지 않습니다. "
-                        "**클라우드 스냅샷 → ChromaDB 수동 복원**을 먼저 시도해 주세요."
-                    ),
-                }
-                status.update(label="복구 중단 (정체)", state="error")
-                st.rerun()
-            total = step["total_missing"] or gap
-            done_est = max(0, total - step["remaining"])
-            pct = min(0.99, done_est / max(1, total))
-            batch_n = synced_session // max(1, step["synced_this_run"]) if synced_session else 1
-            st.progress(
-                pct,
-                text=f"남음 {step['remaining']}건 · 배치 ~{batch_n}/{batches_left}",
-            )
-            st.caption(
-                "배치마다 AI 임베딩으로 **1~3분** 걸릴 수 있습니다(화면이 잠시 멈춘 것처럼 보임). "
-                "창을 닫지 마세요 — 완료되면 자동으로 다음 배치가 이어집니다."
-            )
-            status.update(label=f"누락분 복구 중… 남음 {step['remaining']}건")
-            st.rerun()
-
-        st.session_state.gap_sync_active = False
-        st.session_state.chroma_gap_sync_done = True
-        st.session_state._last_chroma_count = safe_count(collection)
-        _invalidate_patent_count_cache()
-        _count_chroma_unique_patents(collection, full_scan=True, force=True)
-
-        if synced_session > 0:
-            msg = (
-                f"✅ ChromaDB 누락분 **{synced_session}건** 복구 완료 "
-                f"(Chroma {safe_count(collection)}건)"
-            )
-            if step.get("snapshot_ok") is True:
-                msg += "\n\n☁️ GCS 벡터 스냅샷도 업데이트되었습니다."
-            elif step.get("snapshot_ok") is False and step.get("snapshot_msg"):
-                msg += f"\n\n⚠️ GCS 스냅샷: {step['snapshot_msg']}"
-            else:
-                msg += (
-                    "\n\n💡 **벡터 스냅샷 수동 생성 · 업로드**를 실행하면 "
-                    "재시작 시 빠르게 복원됩니다."
-                )
-            st.session_state.sync_feedback = {"level": "success", "message": msg}
-            status.update(label="누락분 복구 완료", state="complete")
-        else:
-            st.session_state.sync_feedback = {
-                "level": "info",
-                "message": "복구할 누락분이 없거나 이미 동기화되어 있습니다.",
-            }
-            status.update(label="동기화 완료", state="complete")
-        st.rerun()
-
-
-def sync_chroma_missing_from_master(
-    collection,
-    hyperlink_map: dict | None = None,
-    *,
-    max_items: int | None = None,
-    upload_snapshot: bool = True,
-) -> int:
-    """
-    마스터 엑셀에는 있으나 ChromaDB에 없는 출원번호만 upsert.
-    max_items: None이면 전체(대량 시 Streamlit 타임아웃 위험). gap 복구 UI는 run_gap_sync_step 사용.
-    """
-    _compact_master_excel()
-    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
-        return 0
-    try:
-        ids, docs, metas = _collect_missing_patents_from_master(
-            collection, hyperlink_map
-        )
-        if not ids:
-            return 0
-        total_missing = len(ids)
-        if max_items is not None:
-            ids, docs, metas = ids[:max_items], docs[:max_items], metas[:max_items]
-        _upsert_patent_batches(collection, ids, docs, metas)
-        _invalidate_patent_count_cache()
-        if upload_snapshot and (max_items is None or len(ids) >= total_missing):
-            ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
-            if not ok_snap:
-                print(f"[gap 복구 후 스냅샷 업로드 스킵] {snap_msg}")
-        return len(ids)
-    except Exception as e:
-        print(f"[ChromaDB 누락분 동기화 오류] {e}")
-        return 0
-
-
-def _excel_display_value(value) -> str:
-    """Chroma/엑셀 공통 표시값 정리."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return "없음"
-    v = str(value).strip()
-    if not v or v.lower() in ("nan", "none", "정보없음"):
-        return "없음"
-    return v
-
-
-def _master_row_to_standard_dict(row, cols: dict) -> dict:
-    """마스터 엑셀 행 → 표준 컬럼 dict."""
-    url = ""
-    if "URL" in row.index and pd.notna(row.get("URL")):
-        url = str(row["URL"]).strip()
-    return {
-        "출원번호": str(row[cols["id"]]),
-        "명칭":     _get_cell(row, cols["title"]) if cols["title"] else "없음",
-        "요약":     _get_cell(row, cols["abstract"]) if cols["abstract"] else "없음",
-        "청구항":   _get_cell(row, cols["claims"]) if cols["claims"] else "없음",
-        "출원일":   _get_cell(row, cols["app_date"]),
-        "등록일":   _get_cell(row, cols["reg_date"]),
-        "IPC":      _get_cell(row, cols["ipc"]),
-        "CPC":      _get_cell(row, cols["cpc"]),
-        "발명자":   _get_cell(row, cols["inventor"]),
-        "출원인":   _get_cell(row, cols["applicant"]),
-        "URL":      url,
-    }
-
-
-def _chroma_record_to_row(chroma_id: str, meta: dict, doc: str) -> dict:
-    """ChromaDB id·메타데이터·문서 → 마스터 엑셀 표준 행."""
-    parsed = _parse_patent_doc(doc or "")
-
-    title = _excel_display_value(meta.get("명칭", ""))
-    if title == "없음":
-        raw_title = parsed.get("title", "")
-        if raw_title.startswith("특허명칭:"):
-            raw_title = raw_title.split("특허명칭:", 1)[1].strip()
-        title = _excel_display_value(raw_title)
-
-    abstract = parsed.get("abstract", "").strip()
-    claims   = parsed.get("claims", "").strip()
-    if abstract in ("", "정보없음"):
-        abstract = "없음"
-    if claims in ("", "정보없음"):
-        claims = "없음"
-
-    app_num = meta.get("출원번호", chroma_id)
-    if not str(app_num).strip() or str(app_num).strip() in ("없음", "nan"):
-        app_num = chroma_id
-
-    return {
-        "출원번호": str(app_num),
-        "명칭":     title,
-        "요약":     abstract,
-        "청구항":   claims,
-        "출원일":   _excel_display_value(meta.get("출원일", "")),
-        "등록일":   _excel_display_value(meta.get("등록일", "")),
-        "IPC":      _excel_display_value(meta.get("IPC", "")),
-        "CPC":      _excel_display_value(meta.get("CPC", "")),
-        "발명자":   _excel_display_value(meta.get("발명자", "")),
-        "출원인":   _excel_display_value(meta.get("출원인", "")),
-        "URL":      str(meta.get("URL", "") or "").strip(),
-    }
-
-
-_MASTER_EXCEL_COLUMNS = (
-    "출원번호", "명칭", "요약", "청구항", "출원일", "등록일",
-    "IPC", "CPC", "발명자", "출원인", "URL",
-)
-
-
-def sync_master_from_chroma(collection, batch_size: int = 500) -> tuple[int, int, int]:
-    """
-    ChromaDB → 마스터 엑셀 역동기화 (재임베딩·재파싱 없음, 메타데이터+문서만 읽음).
-    동일 canonical 출원번호는 Chroma 데이터가 우선(last-wins).
-    마스터에만 있던 행은 유지(합집합).
-    반환: (chroma보낸 건수, 동기화 전 마스터 고유 건수, 동기화 후 마스터 고유 건수)
-    """
-    master_before = _count_master_excel_patents() or 0
-    chroma_total  = safe_count(collection)
-    if chroma_total == 0:
-        return 0, master_before, master_before
-
-    rows_by_id: dict[str, dict] = {}
-
-    # 기존 마스터 행 선적재 (Chroma에 없는 행 보존)
-    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
-        try:
-            master_df = _read_master_excel_df()
-            if master_df is not None:
-                master_cols = _detect_columns(master_df)
-                for _, row in master_df.iterrows():
-                    cid = _normalize_patent_id(row[master_cols["id"]])
-                    if cid:
-                        rows_by_id[cid] = _master_row_to_standard_dict(row, master_cols)
-        except Exception as e:
-            print(f"[마스터 선적재 오류] {e}")
-
-    # ChromaDB 배치 읽기 → 덮어쓰기 (재임베딩 없음)
-    exported = 0
-    try:
-        all_ids = collection.get(include=[])["ids"]
-    except Exception as e:
-        print(f"[ChromaDB id 목록 조회 오류] {e}")
-        return 0, master_before, master_before
-
-    for i in range(0, len(all_ids), batch_size):
-        batch_ids = all_ids[i:i + batch_size]
-        try:
-            batch = collection.get(ids=batch_ids, include=["metadatas", "documents"])
-        except Exception as e:
-            print(f"[ChromaDB 배치 조회 오류] {e}")
-            continue
-        for chroma_id, meta, doc in zip(
-            batch.get("ids", []),
-            batch.get("metadatas", []),
-            batch.get("documents", []),
-        ):
-            cid = _normalize_patent_id(chroma_id) or _normalize_patent_id(meta.get("출원번호", ""))
-            if not cid:
-                continue
-            rows_by_id[cid] = _chroma_record_to_row(chroma_id, meta or {}, doc or "")
-            exported += 1
-
-    if not rows_by_id:
-        return 0, master_before, master_before
-
-    df_out = pd.DataFrame(list(rows_by_id.values()), columns=list(_MASTER_EXCEL_COLUMNS))
-    os.makedirs(os.path.dirname(MASTER_EXCEL_PATH), exist_ok=True)
-    df_out.to_excel(MASTER_EXCEL_PATH, index=False)
-    _invalidate_patent_count_cache()
-
-    master_after = len(rows_by_id)
-    return exported, master_before, master_after
-
-
-def _dedupe_dataframe_by_patent_id(df: pd.DataFrame, cols: dict) -> pd.DataFrame:
-    """마스터 엑셀 저장 전 canonical 출원번호 기준 중복 행 제거(마지막 행 유지)."""
-    if df.empty:
-        return df
-    keep_idx: dict[str, int] = {}
-    for idx, row in df.iterrows():
-        cid = _normalize_patent_id(row[cols["id"]])
-        if cid:
-            keep_idx[cid] = idx
-    if not keep_idx:
-        return df
-    return df.loc[sorted(keep_idx.values())].reset_index(drop=True)
-
-
 def _build_chroma_batches(rows_by_id: dict, cols: dict, hyperlink_map: dict):
-    """canonical id → row dict에서 ChromaDB upsert 배치 생성."""
     batch_ids, batch_docs, batch_metas = [], [], []
     for doc_id, row in rows_by_id.items():
         patent_url = _patent_url_from_row(row, cols, doc_id, hyperlink_map)
@@ -2242,334 +1280,28 @@ def _build_chroma_batches(rows_by_id: dict, cols: dict, hyperlink_map: dict):
     return batch_ids, batch_docs, batch_metas
 
 
-def reindex_from_master_excel(collection) -> int:
-    """
-    재시작 후 ChromaDB 재구성 전용 함수.
-    process_and_update_db는 uploaded_file을 MASTER_EXCEL_PATH와 비교해
-    전부 중복으로 처리하는 문제가 있어, 재인덱싱은 이 함수를 사용한다.
-    """
-    if not os.path.exists(MASTER_EXCEL_PATH) or os.path.getsize(MASTER_EXCEL_PATH) == 0:
-        return 0
-    try:
-        df = _read_master_excel_df()
-        if df is None:
-            return 0
-        cols = _detect_columns(df)
-
-        rows_by_id: dict = {}
-        for _, row in df.iterrows():
-            pat_id = _normalize_patent_id(row[cols["id"]])
-            if pat_id:
-                rows_by_id[pat_id] = row
-
-        if not rows_by_id:
-            return 0
-
-        ids, docs, metas = [], [], []
-        for pat_id, row in rows_by_id.items():
-            ids.append(pat_id)
-            docs.append(_build_document(row, cols))
-            patent_url = _patent_url_from_row(row, cols, pat_id)
-            metas.append(_build_metadata(row, cols, patent_url=patent_url))
-
-        _upsert_patent_batches(collection, ids, docs, metas)
-        _invalidate_patent_count_cache()
-        return len(ids)
-    except Exception as e:
-        print(f"재인덱싱 실패: {e}")
-        return 0
-
-
-# ==========================================
-# 벡터 스냅샷 (GCS 영속 복원)
-# ==========================================
-def _file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _upsert_embedding_batches(
-    collection,
-    ids: list,
-    embeddings: list,
-    docs: list,
-    metas: list,
-    batch_size: int = 100,
-) -> None:
-    for i in range(0, len(ids), batch_size):
-        collection.upsert(
-            ids=ids[i:i + batch_size],
-            embeddings=embeddings[i:i + batch_size],
-            documents=docs[i:i + batch_size],
-            metadatas=metas[i:i + batch_size],
-        )
-
-
-def _validate_local_vector_manifest(*, for_restore: bool = False) -> tuple[bool, str]:
-    """로컬 manifest·parquet 무결성 검증. for_restore=True면 mtime·건수 불일치 허용."""
-    if not os.path.exists(VECTOR_MANIFEST_PATH):
-        return False, "manifest 파일 없음"
-    if not os.path.exists(VECTOR_SNAPSHOT_PATH):
-        return False, "snapshot parquet 없음"
-    try:
-        with open(VECTOR_MANIFEST_PATH, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-        if manifest.get("version", 0) != VECTOR_SNAPSHOT_VERSION:
-            return False, "스냅샷 버전 불일치"
-        if manifest.get("embed_model") != _EMBED_MODEL:
-            return False, "임베딩 모델 불일치"
-        if manifest.get("embed_dim") != _EMBED_DIM:
-            return False, "임베딩 차원 불일치"
-        sha = _file_sha256(VECTOR_SNAPSHOT_PATH)
-        if manifest.get("snapshot_sha256") != sha:
-            return False, "snapshot SHA256 불일치"
-        if not for_restore:
-            master_n = _count_master_excel_patents(force=True)
-            if master_n is None:
-                return False, "마스터 엑셀 없음"
-            if manifest.get("master_unique_count") != master_n:
-                return False, (
-                    f"마스터 건수 불일치 (manifest={manifest.get('master_unique_count')}, "
-                    f"local={master_n})"
-                )
-            mtime = _master_excel_mtime()
-            if abs(float(manifest.get("master_mtime", -999)) - mtime) > 1.0:
-                return False, "마스터 mtime 불일치"
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-
-def export_vector_snapshot(collection, batch_size: int = 500) -> tuple[bool, str]:
-    """ChromaDB → 로컬 parquet + manifest 생성 (재임베딩 없음)."""
-    total = safe_count(collection)
-    if total == 0:
-        return False, "ChromaDB가 비어 있습니다."
-    try:
-        all_ids = collection.get(include=[])["ids"]
-        records: list[dict] = []
-        skipped_no_emb = 0
-        for i in range(0, len(all_ids), batch_size):
-            batch = collection.get(
-                ids=all_ids[i:i + batch_size],
-                include=["embeddings", "documents", "metadatas"],
-            )
-            for cid, emb, doc, meta in zip(
-                batch.get("ids", []),
-                batch.get("embeddings", []),
-                batch.get("documents", []),
-                batch.get("metadatas", []),
-            ):
-                if emb is None:
-                    skipped_no_emb += 1
-                    continue
-                records.append({
-                    "chroma_id": cid,
-                    "document": doc or "",
-                    "embedding": [float(x) for x in emb],
-                    "metadata_json": json.dumps(meta or {}, ensure_ascii=False),
-                })
-        if not records:
-            return False, (
-                f"임베딩 추출 0건 (Chroma 문서 {total}건, 임베딩 없음 {skipped_no_emb}건). "
-                f"재인덱싱 완료 후 다시 시도하세요."
-            )
-
-        os.makedirs(os.path.dirname(VECTOR_SNAPSHOT_PATH), exist_ok=True)
-        pd.DataFrame(records).to_parquet(VECTOR_SNAPSHOT_PATH, index=False)
-
-        manifest = {
-            "version": VECTOR_SNAPSHOT_VERSION,
-            "embed_model": _EMBED_MODEL,
-            "embed_dim": _EMBED_DIM,
-            "master_unique_count": _count_master_excel_patents(force=True),
-            "master_mtime": _master_excel_mtime(),
-            "snapshot_record_count": len(records),
-            "chroma_document_count": total,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "snapshot_sha256": _file_sha256(VECTOR_SNAPSHOT_PATH),
-        }
-        with open(VECTOR_MANIFEST_PATH, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-        size_mb = os.path.getsize(VECTOR_SNAPSHOT_PATH) / (1024 * 1024)
-        note = ""
-        if skipped_no_emb:
-            note = f" (임베딩 없음 스킵 {skipped_no_emb}건)"
-        return True, f"로컬 생성 완료: {len(records)}건, {size_mb:.1f} MB{note}"
-    except Exception as e:
-        print(f"[벡터 스냅샷 export 오류] {e}")
-        return False, f"parquet 생성 오류: {e}"
-
-
-def restore_chroma_from_snapshot(collection, batch_size: int = 100) -> int:
-    """로컬 parquet → ChromaDB (embeddings 포함, 재임베딩 없음)."""
-    valid, reason = _validate_local_vector_manifest(for_restore=True)
-    if not valid:
-        print(f"[스냅샷 복원 검증 실패] {reason}")
-        return 0
-    try:
-        df = pd.read_parquet(VECTOR_SNAPSHOT_PATH)
-        if df.empty:
-            return 0
-        restored = 0
-        for i in range(0, len(df), batch_size):
-            chunk = df.iloc[i:i + batch_size]
-            ids = chunk["chroma_id"].astype(str).tolist()
-            embeddings = [
-                [float(x) for x in row]
-                for row in chunk["embedding"].tolist()
-            ]
-            documents = chunk["document"].astype(str).tolist()
-            metadatas = [
-                json.loads(m) if isinstance(m, str) else (m or {})
-                for m in chunk["metadata_json"].tolist()
-            ]
-            _upsert_embedding_batches(
-                collection, ids, embeddings, documents, metadatas, batch_size=batch_size
-            )
-            restored += len(ids)
-        _invalidate_patent_count_cache()
-        return restored
-    except Exception as e:
-        print(f"[스냅샷 복원 오류] {e}")
-        return 0
-
-
-def download_vector_snapshot_from_storage() -> bool:
-    """GCS → 로컬 manifest + parquet (고정 경로, zip 미사용 — 경로 이중 중첩 없음)."""
-    if not _gcs_configured():
-        return False
-    man = download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
-    snap = download_file_from_gcs(VECTOR_SNAPSHOT_FILENAME, VECTOR_SNAPSHOT_PATH)
-    return man is True and snap is True
-
-
-def upload_vector_snapshot_to_storage() -> tuple[bool, str]:
-    """로컬 manifest + parquet → GCS."""
-    if not os.path.exists(VECTOR_SNAPSHOT_PATH) or not os.path.exists(VECTOR_MANIFEST_PATH):
-        return False, "로컬 스냅샷 파일 없음 — export 먼저 실행"
-
-    if not _gcs_configured():
-        return False, "스냅샷 저장소 미설정 — Secrets에 GCS_BUCKET_NAME을 설정하세요."
-
-    ok_m, msg_m = upload_file_to_gcs(VECTOR_MANIFEST_PATH, VECTOR_MANIFEST_FILENAME)
-    if not ok_m:
-        return False, msg_m
-    ok_s, msg_s = upload_file_to_gcs(VECTOR_SNAPSHOT_PATH, VECTOR_SNAPSHOT_FILENAME)
-    if not ok_s:
-        return False, f"manifest는 GCS 업로드됨. parquet 실패: {msg_s}"
-    return True, f"GCS 업로드 완료 — {msg_m}, {msg_s}"
-
-
-def maybe_upload_vector_snapshot(collection) -> tuple[bool, str]:
-    """Chroma 변경 후 스냅샷 export + 클라우드 업로드."""
-    if not _vector_storage_configured():
-        return False, (
-            "스냅샷 저장소 미설정 — Secrets에 GCS_BUCKET_NAME을 설정하세요."
-        )
-    if safe_count(collection) == 0:
-        return False, "ChromaDB 비어 있음"
-    ok, msg = export_vector_snapshot(collection)
-    if not ok:
-        return False, f"export 실패: {msg}"
-    ok2, msg2 = upload_vector_snapshot_to_storage()
-    if not ok2:
-        return False, f"upload 실패: {msg2}"
-    return True, f"[{_vector_storage_label()}] {msg} | {msg2}"
-
-
-def try_restore_chroma_from_storage(collection) -> tuple[int, str]:
-    """GCS 스냅샷 다운로드 → 검증 → Chroma 복원."""
-    if not _vector_storage_configured():
-        return 0, "스냅샷 저장소 미설정"
-    if not download_vector_snapshot_from_storage():
-        return 0, f"{_vector_storage_label()}에 스냅샷 없거나 다운로드 실패"
-    valid, reason = _validate_local_vector_manifest(for_restore=True)
-    if not valid:
-        return 0, f"검증 실패: {reason}"
-    restored = restore_chroma_from_snapshot(collection)
-    if restored > 0:
-        return restored, f"{_vector_storage_label()} 스냅샷 {restored}건 복원"
-    return 0, "복원 0건"
-
-
-# 하위 호환 별칭
-def download_vector_snapshot_from_drive() -> bool:
-    return download_vector_snapshot_from_storage()
-
-
-def upload_vector_snapshot_to_drive() -> tuple[bool, str]:
-    return upload_vector_snapshot_to_storage()
-
-
-def try_restore_chroma_from_drive(collection) -> tuple[int, str]:
-    return try_restore_chroma_from_storage(collection)
-
-
-def load_vector_manifest_summary() -> dict | None:
-    """로컬 또는 클라우드 manifest 요약."""
-    if not os.path.exists(VECTOR_MANIFEST_PATH) and _vector_storage_configured():
-        if _gcs_configured():
-            download_file_from_gcs(VECTOR_MANIFEST_FILENAME, VECTOR_MANIFEST_PATH)
-    if not os.path.exists(VECTOR_MANIFEST_PATH):
-        return None
-    try:
-        with open(VECTOR_MANIFEST_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
 def process_and_update_db(uploaded_file, collection):
     """
-    업로드 파일 기준 누락 없는 적재 (canonical 출원번호 스키마).
+    업로드 엑셀 기준 누락 없는 적재 (canonical 출원번호 스키마).
+    ChromaDB가 유일한 진실 — 마스터 엑셀 비교/저장 단계 제거.
+    적재 성공 후 R2 백업까지 한 번에.
 
-    원칙:
-      · 동일 canonical ID = 중복 1건 (표기 차이는 _normalize_patent_id로 통합)
-      · 업로드 파일의 모든 고유 ID는 ChromaDB에 반드시 존재해야 함
-        (마스터에만 있고 Chroma에 없으면 스킵하지 않고 upsert)
-      · ChromaDB 적재 성공 후 마스터 엑셀 저장 + canonical 기준 dedupe
-
-    반환: (chroma_신규적재, master_신규행, 파일내중복, 출원번호없음, gap추가복구)
+    반환: (신규적재, 파일내중복, 이미존재, 출원번호없음, 백업성공bool)
     """
-    file_bytes    = uploaded_file.read()
+    file_bytes = uploaded_file.read()
     hyperlink_map = extract_excel_hyperlinks(io.BytesIO(file_bytes))
 
     try:
         new_df = pd.read_excel(io.BytesIO(file_bytes))
     except Exception as e:
         st.error(f"엑셀 파일 로드 실패: {e}")
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, False
 
     cols = _detect_columns(new_df)
-
-    if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
-        try:
-            master_df = _read_master_excel_df()
-            if master_df is not None:
-                master_cols = _detect_columns(master_df)
-                master_ids = {
-                    _normalize_patent_id(v)
-                    for v in master_df[master_cols["id"]]
-                    if _normalize_patent_id(v)
-                }
-            else:
-                master_df = pd.DataFrame(columns=new_df.columns)
-                master_ids = set()
-        except Exception:
-            master_df  = pd.DataFrame(columns=new_df.columns)
-            master_ids = set()
-    else:
-        master_df  = pd.DataFrame(columns=new_df.columns)
-        master_ids = set()
-
     chroma_ids = _get_chroma_ids(collection)
 
     file_rows: dict = {}
-    dup_in_file   = 0
+    dup_in_file = 0
     skipped_empty = 0
 
     for _, row in new_df.iterrows():
@@ -2581,537 +1313,227 @@ def process_and_update_db(uploaded_file, collection):
             dup_in_file += 1
         file_rows[cid] = row
 
-    chroma_needed = {cid: row for cid, row in file_rows.items() if cid not in chroma_ids}
-    master_needed = {cid: row for cid, row in file_rows.items() if cid not in master_ids}
-    already_indexed = len(file_rows) - len(chroma_needed)
+    needed = {cid: row for cid, row in file_rows.items() if cid not in chroma_ids}
+    already_indexed = len(file_rows) - len(needed)
 
-    chroma_ingested = 0
-    if chroma_needed:
-        batch_ids, batch_docs, batch_metas = _build_chroma_batches(chroma_needed, cols, hyperlink_map)
+    ingested = 0
+    if needed:
+        ids, docs, metas = _build_chroma_batches(needed, cols, hyperlink_map)
         try:
-            _upsert_patent_batches(collection, batch_ids, batch_docs, batch_metas)
-            chroma_ingested = len(batch_ids)
+            _upsert_patent_batches(collection, ids, docs, metas)
+            ingested = len(ids)
         except Exception as e:
-            st.error(f"ChromaDB 적재 실패 — 마스터 엑셀은 갱신하지 않았습니다: {e}")
-            return 0, 0, dup_in_file + already_indexed, skipped_empty, 0
+            st.error(f"ChromaDB 적재 실패 — 백업하지 않았습니다: {e}")
+            return 0, dup_in_file, already_indexed, skipped_empty, False
 
-    master_added = 0
-    if master_needed:
-        added_df = pd.DataFrame(list(master_needed.values()))
-        if master_df.empty:
-            updated_master_df = added_df
-        else:
-            updated_master_df = pd.concat([master_df, added_df], ignore_index=True)
-        master_cols = _detect_columns(updated_master_df)
-        updated_master_df = _dedupe_dataframe_by_patent_id(updated_master_df, master_cols)
-        updated_master_df.to_excel(MASTER_EXCEL_PATH, index=False)
-        _invalidate_patent_count_cache()
-        master_added = len(master_needed)
+    # 적재 → 즉시 R2 백업 (트랜잭션처럼 묶음)
+    backup_ok = False
+    if ingested:
+        with st.spinner("💾 R2에 벡터 DB 백업 중... (재시작 후에도 데이터 보존)"):
+            backup_ok = backup_chroma_to_r2()
 
-    synced = sync_chroma_missing_from_master(
-        collection, hyperlink_map, upload_snapshot=False
-    )
-    if chroma_ingested or master_added or synced:
-        _invalidate_patent_count_cache()
-        if chroma_ingested or synced:
-            ok_snap, snap_msg = maybe_upload_vector_snapshot(collection)
-            if not ok_snap:
-                print(f"[적재 후 스냅샷 업로드 스킵] {snap_msg}")
-    return chroma_ingested, master_added, dup_in_file + already_indexed, skipped_empty, synced
+    return ingested, dup_in_file, already_indexed, skipped_empty, backup_ok
 
 
-# --- 4. 메인 어플리케이션 인터페이스 구동 런타임 ---
+def export_collection_to_excel_bytes(collection) -> bytes:
+    """ChromaDB 전체를 엑셀 바이트로 내보내기 (원본 재생성용)."""
+    try:
+        if collection.count() == 0:
+            return b""
+        data = collection.get(include=["metadatas", "documents"])
+        rows = []
+        for meta in data.get("metadatas", []):
+            meta = meta or {}
+            rows.append({
+                "출원번호": meta.get("출원번호", ""),
+                "명칭": meta.get("명칭", ""),
+                "출원인": meta.get("출원인", ""),
+                "발명자": meta.get("발명자", ""),
+                "IPC": meta.get("IPC", ""),
+                "CPC": meta.get("CPC", ""),
+                "출원일": meta.get("출원일", ""),
+                "등록일": meta.get("등록일", ""),
+                "URL": meta.get("URL", ""),
+            })
+        df = pd.DataFrame(rows)
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"[엑셀 내보내기 오류] {e}")
+        return b""
+
+
+# ==========================================
+# 14. 메인 포털
+# ==========================================
 def run_main_portal():
-    _, collection, llm = load_permanent_infra_singleton()
+    client, collection, llm = load_permanent_infra_singleton()
 
-    # ── 세션 최초 진입 시: GitHub → 로컬 전체 동기화 ──
-    # github_synced는 세션 단위 플래그. 프로세스 재시작(컨테이너 재생성) 시 항상 False로 초기화됨.
-    if not st.session_state.github_synced:
-        download_logo_from_github()
-        with st.spinner("🔄 GitHub 데이터 웨어하우스 동기화 중..."):
-            excel_ok, registry_ok = sync_all_from_github()
+    # ── 세션 최초 진입: R2 → 로컬 복원 (매일 슬립 대비, egress 무료) ──
+    if not st.session_state.restored:
+        download_logo_from_r2()
+        if safe_count(collection) == 0:
+            with st.spinner("🔄 R2에서 벡터 DB 복원 중... (egress 무료)"):
+                if restore_chroma_from_r2():
+                    # 복원 후 캐시된 client 무효화하여 새 디렉토리 인식
+                    _get_chroma_client.clear()
+                    client = _get_chroma_client()
+                    collection = client.get_or_create_collection(
+                        name=_COLLECTION_NAME,
+                        embedding_function=_get_embedding_fn(),
+                        metadata={"hnsw:space": "cosine"},
+                    )
+                    n = safe_count(collection)
+                    if n > 0:
+                        st.toast(f"✅ R2에서 벡터 DB 복원 완료 ({n}건)")
+        st.session_state.restored = True
 
-        if excel_ok is True:
-            _invalidate_patent_count_cache()
-            st.toast("✅ GitHub에서 마스터 특허 데이터 복원 완료")
-        if registry_ok is True:
-            st.toast("✅ GitHub에서 회원 정보 복원 완료")
-        if excel_ok is False or registry_ok is False:
-            # 실제 오류 (토큰/네트워크 문제) — None(파일 없음)은 오류 아님
-            st.toast("⚠️ GitHub 동기화 중 오류 발생 — 사이드바 'GitHub 연결 진단' 확인 권장")
-        elif excel_ok is None and registry_ok is None:
-            st.toast("ℹ️ GitHub에 저장된 데이터 없음 (포맷 후 초기 상태 또는 최초 배포)")
+    is_admin = st.session_state.is_admin
 
-        st.session_state.github_synced = True
-        # 엑셀 복원 여부와 무관하게 재인덱싱은 아래 조건에서 처리
-
-    # ChromaDB가 비어 있으면(재시작) 엑셀 기반 자동 재인덱싱 — 세션당 1회만
-    chroma_n = safe_count(collection)
-    master_n = _count_master_excel_patents()
-    unique_patent_n = _count_chroma_unique_patents(collection) if chroma_n > 0 else 0
-    if (
-        master_n
-        and chroma_n == 0
-        and not st.session_state.auto_reindex_attempted
-    ):
-        st.session_state.auto_reindex_attempted = True
-        restored = 0
-        snapshot_msg = ""
-        try:
-            if _vector_storage_configured():
-                with st.spinner(
-                    f"⚡ {_vector_storage_label()} 벡터 스냅샷 복원 시도 중... (재임베딩 생략)"
-                ):
-                    restored, snapshot_msg = try_restore_chroma_from_storage(collection)
-            if restored <= 0:
-                st.session_state.sync_feedback = {
-                    "level": "warning",
-                    "message": (
-                        f"⚡ ChromaDB가 비어 있습니다. GCS 스냅샷 자동 복원 실패"
-                        f"{f' — {snapshot_msg}' if snapshot_msg else ''}.\n\n"
-                        "**관리자:** 사이드바 → **📥 클라우드 스냅샷 → ChromaDB 수동 복원** "
-                        "을 실행하세요 (1~3분, 재임베딩 없음).\n\n"
-                        "전체 Excel 재인덱싱(20~40분)은 **누락분 복구**로 대체하는 것을 권장합니다."
-                    ),
-                }
-            else:
-                st.toast(f"✅ {snapshot_msg}")
-            st.session_state._last_chroma_count = safe_count(collection)
-            _invalidate_patent_count_cache()
-        except Exception as e:
-            st.warning(f"벡터 DB 복원 오류: {e}")
-
-    _run_gap_sync_if_active(collection)
-
-    # 누락분 자동 복구는 로그인 후 무한 rerun·타임아웃 유발 → 수동 버튼만 사용
-
-    is_admin = st.session_state.get("is_admin", False)
-
+    # ── 헤더 ──
     col_logo, col_title, col_logout = st.columns([1, 7, 2])
     with col_logo:
-        logo_path = os.path.join(BASE_DIR, "atec_logo.png")
-        if os.path.exists(logo_path):
-            st.image(logo_path, width=110)
+        if os.path.exists(LOGO_PATH):
+            st.image(LOGO_PATH, width=110)
     with col_title:
         st.title("AI 경쟁사 특허 조사 분석")
         mode_label = "🔧 관리자" if is_admin else "👤 사용자"
-        master_n = _count_master_excel_patents()
-        count_line = f"적재 특허(ChromaDB): {safe_count(collection)}건"
-        if master_n is not None:
-            count_line += f" | 마스터 엑셀: {master_n}건"
-        st.caption(f"{mode_label} | 접속 계정: {st.session_state.user_id} | {count_line}")
+        used = _daily_tokens_used()
+        st.caption(
+            f"{mode_label} | 접속: {st.session_state.user_id} | "
+            f"적재 특허: {safe_count(collection)}건 | "
+            f"오늘 토큰: {used:,}/{GROQ_DAILY_TOKEN_LIMIT:,}"
+        )
     with col_logout:
         if st.button("🔒 로그아웃"):
-            st.session_state.logged_in   = False
-            st.session_state.user_id     = None
-            st.session_state.is_admin    = False
+            st.session_state.logged_in = False
+            st.session_state.user_id = None
+            st.session_state.is_admin = False
             st.rerun()
 
-    # ── 사이드바: 관리자 전용 데이터 관리 센터 ──
+    # ── 사이드바: 관리자 데이터 관리 ──
     with st.sidebar:
         if is_admin:
             st.header("📂 데이터 관리 센터")
 
-            st.checkbox(
-                "⚠️ 로컬 마스터·회원 데이터를 GitHub 버전으로 덮어쓰기 (확인)",
-                value=False,
-                key="confirm_github_overwrite",
-                help="체크하지 않으면 강제 재동기화를 실행할 수 없습니다. "
-                     "로컬에만 있는 미백업 데이터는 사라질 수 있습니다.",
-            )
-            if st.button(
-                "🔄 GitHub 데이터 강제 재동기화",
-                use_container_width=True,
-                disabled=not st.session_state.get("confirm_github_overwrite", False),
-            ):
-                with st.spinner("GitHub → 로컬 전체 동기화 중..."):
-                    excel_ok, reg_ok = sync_all_from_github()
-                if excel_ok is True or reg_ok is True:
-                    _invalidate_patent_count_cache()
-                    st.session_state.github_synced = True
-                    st.session_state.confirm_github_overwrite = False
-                    st.toast("✅ 동기화 완료 — 최신 GitHub 데이터가 로컬에 반영되었습니다.")
-                    st.rerun()
-                elif excel_ok is False or reg_ok is False:
-                    # 실제 연결/인증 오류
-                    st.warning("⚠️ GitHub 동기화 실패 — 아래 '🔍 GitHub 연결 진단' 버튼으로 원인을 확인하세요.")
-                else:
-                    # 둘 다 None → GitHub 연결은 정상이나 파일이 없는 상태 (포맷 후 등)
-                    st.info("ℹ️ GitHub에 저장된 데이터가 없습니다. "
-                            "Excel 파일을 업로드하면 자동으로 GitHub에 백업됩니다.")
-
-            # GitHub 연결 진단 버튼
-            if st.button("🔍 GitHub 연결 진단", use_container_width=True):
+            # R2 연결 진단
+            if st.button("🔍 R2 연결 진단", use_container_width=True):
                 with st.spinner("진단 중..."):
-                    diag = diagnose_github()
-
-                if diag["repo_accessible"]:
-                    st.success(f"✅ GitHub 연결 정상\n\n"
-                               f"- 레포: `{diag.get('repo_name','')}`\n"
-                               f"- 토큰: `{diag['token_prefix']}`")
+                    diag = diagnose_r2()
+                if diag["reachable"]:
+                    st.success(f"✅ R2 연결 정상\n\n- 버킷: `{diag['bucket']}`")
                 else:
-                    st.error(f"❌ 연결 실패\n\n**원인:**\n{diag['error']}")
-                    if diag["secret_ok"] and not diag["api_reachable"]:
-                        st.info("💡 Streamlit Cloud 네트워크 문제일 수 있습니다. 잠시 후 재시도해 주세요.")
-                    elif diag["secret_ok"]:
-                        st.info("💡 Streamlit Cloud → **Manage app → Secrets**에서 토큰을 새로 발급한 값으로 교체해 주세요.")
-                    else:
-                        st.code(
-                            "# Secrets 올바른 구조 (섹션 헤더 위에 위치)\n"
-                            'GITHUB_TOKEN = "ghp_새토큰값"\n'
-                            'GITHUB_REPO_URL = "https://github.com/ssahaga97-max/my-patent-rag.git"\n\n'
-                            "[USER_CREDENTIALS]\n"
-                            'admin = "64자_SHA256_해시_예: echo -n 비밀번호 | sha256sum"',
-                            language="toml"
-                        )
+                    st.error(f"❌ 연결 실패\n\n{diag['error']}")
 
-            st.divider()
-            st.subheader("☁️ 벡터 스냅샷 (GCS)")
-            storage_label = _vector_storage_label()
-            if not _GCP_AVAILABLE:
-                st.caption("GCP 패키지 미설치 — requirements.txt 확인 후 재배포하세요.")
-            elif not _gcs_configured():
-                st.caption(
-                    "Secrets에 `GCS_BUCKET_NAME` + `[gcp_service_account]`를 설정하세요."
-                )
-            else:
-                st.caption(
-                    f"저장소: **{storage_label}** · "
-                    f"파일 `vector_snapshot.parquet` + `vector_manifest.json` "
-                    f"**고정명 덮어쓰기** (버전 누적 없음, ~30MB)"
-                )
-                manifest = load_vector_manifest_summary()
-                if manifest:
-                    st.caption(
-                        f"manifest: **{manifest.get('snapshot_record_count', '?')}건** · "
-                        f"모델 `{manifest.get('embed_model', '')}` · "
-                        f"생성 `{manifest.get('created_at', '')}`"
-                    )
-                else:
-                    st.caption("GCS에 스냅샷 없음 — 아래 버튼으로 첫 스냅샷을 생성하세요.")
-
-            if _gcs_configured() and st.button("🔍 GCS 연결 진단", use_container_width=True):
-                with st.spinner("GCS 진단 중..."):
-                    gd = diagnose_gcs()
-                if gd["bucket_accessible"]:
-                    write_line = (
-                        "✅ 쓰기 테스트 통과"
-                        if gd.get("write_test_ok")
-                        else "⚠️ 쓰기 테스트 실패"
-                    )
-                    st.success(
-                        f"✅ GCS 버킷 접근 정상\n\n"
-                        f"- 버킷: `{gd['bucket_name']}`\n"
-                        f"- manifest: {'있음' if gd['manifest_on_gcs'] else '없음'}\n"
-                        f"- snapshot: {'있음' if gd['snapshot_on_gcs'] else '없음'}\n"
-                        f"- {write_line}"
-                    )
-                    if not gd.get("write_test_ok"):
-                        st.error(gd.get("write_test_detail") or gd.get("error", ""))
-                        st.info(
-                            "**GCP Console 설정 (5분)**\n"
-                            "1. [Cloud Storage](https://console.cloud.google.com/storage/browser) "
-                            f"→ 버킷 `{gd['bucket_name']}` 클릭\n"
-                            "2. **권한** 탭 → **액세스 권한 부여**\n"
-                            "3. 새 주 구성원:\n"
-                            "   `patent-rag-drive@patentrag.iam.gserviceaccount.com`\n"
-                            "4. 역할: **Storage 관리자** (Storage Admin)\n"
-                            "5. 저장 후 1~2분 뒤 **GCS 연결 진단** 재실행"
-                        )
-                else:
-                    st.error(f"❌ GCS 연결 실패\n\n**원인:**\n{gd['error']}")
-
-            chroma_for_snap = safe_count(collection)
-            if st.button(
-                f"💾 벡터 스냅샷 수동 생성 · 업로드 ({storage_label})",
-                use_container_width=True,
-                disabled=chroma_for_snap == 0 or not _gcs_configured(),
-                help="ChromaDB 현재 상태를 parquet로 내보내 클라우드에 저장합니다. "
-                     "첫 마이그레이션·재배포 전 필수 1회 실행.",
-            ):
-                with st.spinner(
-                    f"ChromaDB {chroma_for_snap}건 스냅샷 생성 및 {storage_label} 업로드 중..."
-                ):
-                    ok, snap_detail = maybe_upload_vector_snapshot(collection)
+            # R2 → 로컬 강제 복원
+            if st.button("🔄 R2에서 벡터 DB 강제 복원", use_container_width=True):
+                with st.spinner("R2 → 로컬 복원 중..."):
+                    ok = restore_chroma_from_r2()
                 if ok:
-                    st.session_state.sync_feedback = {
-                        "level": "success",
-                        "message": (
-                            f"✅ 벡터 스냅샷 업로드 완료 "
-                            f"({chroma_for_snap}건). 재시작 시 재임베딩 없이 복원됩니다.\n\n"
-                            f"{snap_detail}"
-                        ),
-                    }
+                    _get_chroma_client.clear()
+                    st.session_state.infra_initialized = False
+                    st.session_state.restored = True
+                    st.toast("✅ 복원 완료 — 최신 벡터 DB가 로드됩니다.")
+                    st.rerun()
                 else:
-                    st.session_state.sync_feedback = {
-                        "level": "error",
-                        "message": (
-                            f"❌ 스냅샷 생성·업로드 실패\n\n"
-                            f"**상세:** {snap_detail}\n\n"
-                            f"👉 **GCS 연결 진단**을 실행하세요."
-                        ),
-                    }
-                st.rerun()
-
-            if st.button(
-                f"📥 클라우드 스냅샷 → ChromaDB 수동 복원 ({storage_label})",
-                use_container_width=True,
-                disabled=not _gcs_configured(),
-                help="재시작 없이 클라우드 스냅샷으로 Chroma를 덮어씁니다. manifest 검증 통과 시에만 실행.",
-            ):
-                with st.spinner(f"{storage_label} 스냅샷 다운로드 및 Chroma 복원 중..."):
-                    restored, msg = try_restore_chroma_from_storage(collection)
-                st.session_state._last_chroma_count = safe_count(collection)
-                _invalidate_patent_count_cache()
-                if restored > 0:
-                    st.session_state.sync_feedback = {
-                        "level": "success",
-                        "message": f"✅ {msg} (Chroma {safe_count(collection)}건)",
-                    }
-                else:
-                    st.session_state.sync_feedback = {
-                        "level": "warning",
-                        "message": f"⚠️ {msg}",
-                    }
-                st.rerun()
+                    st.warning("⚠️ R2에 백업이 없거나 복원에 실패했습니다.")
 
             st.divider()
 
+            # 엑셀 업로드 및 적재
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
             if uploaded_file is not None:
                 if st.button("🚀 신규 특허 무결성 적재"):
                     try:
                         preview_bytes = uploaded_file.read()
                         uploaded_file.seek(0)
-                        full_df       = pd.read_excel(io.BytesIO(preview_bytes))
-                        preview_df    = full_df.head(3)
-                        detected_cols = _detect_columns(full_df)
-                        total_rows    = len(full_df)
+                        preview_df = pd.read_excel(io.BytesIO(preview_bytes), nrows=3)
+                        detected = _detect_columns(preview_df)
+                        total_rows = pd.read_excel(io.BytesIO(preview_bytes)).shape[0]
                         uploaded_file.seek(0)
-
-                        with st.expander("📋 업로드 파일 열 감지 결과 (클릭 확인)", expanded=True):
+                        with st.expander("📋 업로드 파일 열 감지 결과", expanded=True):
                             st.write(f"- **전체 행 수:** {total_rows}행")
-                            st.write(f"- **감지된 출원번호 열:** `{detected_cols['id']}`")
-                            st.write(f"- **감지된 명칭 열:** `{detected_cols['title']}`")
+                            st.write(f"- **감지된 출원번호 열:** `{detected['id']}`")
+                            st.write(f"- **감지된 명칭 열:** `{detected['title']}`")
                             st.write(f"- **전체 열 목록:** {list(preview_df.columns)}")
                     except Exception as diag_e:
                         st.warning(f"파일 사전 진단 실패: {diag_e}")
 
-                    with st.spinner("canonical 출원번호 정규화 및 ChromaDB 적재 중..."):
-                        chroma_new, master_new, dup, skipped, synced = process_and_update_db(
+                    with st.spinner("중복 제거 및 실시간 인덱싱 중... (임베딩 호출, 건수에 따라 시간 소요)"):
+                        ingested, dup, already, skipped, backup_ok = process_and_update_db(
                             uploaded_file, collection
                         )
 
-                    total_now = safe_count(collection)
-                    _invalidate_patent_count_cache()
-                    master_now = _count_master_excel_patents(force=True)
-                    summary = (
-                        f"📊 처리 결과: Chroma 신규 **{chroma_new}건** / 마스터 신규 **{master_new}건** / "
-                        f"이미 색인됨 **{dup}건** / ChromaDB 총 **{total_now}건**"
+                    st.info(
+                        f"📊 처리 결과: 신규 **{ingested}건** / 파일내 중복 **{dup}건** / "
+                        f"이미 존재 **{already}건** / 번호없음 **{skipped}건** / "
+                        f"DB 총 **{safe_count(collection)}건**"
                     )
-                    if master_now is not None:
-                        summary += f" / 마스터 엑셀 **{master_now}건**"
-                    if skipped:
-                        summary += f" / 출원번호 없음 **{skipped}건** 스킵"
-                    if synced:
-                        summary += f" / 마스터→Chroma 추가복구 **{synced}건**"
-
-                    github_ok = None
-                    drive_ok = None
-                    drive_detail = ""
-                    if chroma_new > 0 or master_new > 0 or synced > 0:
-                        with st.spinner("💾 GitHub 데이터 웨어하우스 영구 동기화 중... (대용량 파일은 최대 2분 소요)"):
-                            github_ok = commit_and_push_data()
-                        if chroma_new > 0 or synced > 0:
-                            with st.spinner(
-                                f"☁️ 벡터 스냅샷 업로드 중 ({_vector_storage_label()})..."
-                            ):
-                                drive_ok, drive_detail = maybe_upload_vector_snapshot(collection)
-                        drive_note = ""
-                        if drive_ok is True:
-                            drive_note = f" {_vector_storage_label()} 벡터 스냅샷도 업데이트되었습니다."
-                        elif drive_ok is False and _vector_storage_configured():
-                            drive_note = (
-                                f" 스냅샷 업로드 실패 — {drive_detail} "
-                                f"수동 생성 버튼을 실행하세요."
+                    if ingested > 0:
+                        if backup_ok:
+                            st.success(
+                                f"✅ 신규 {ingested}건 인덱싱 + R2 백업 성공 — "
+                                f"재시작·슬립 후에도 데이터가 보존됩니다."
                             )
-                        if github_ok:
-                            st.session_state.upload_feedback = {
-                                "level": "success",
-                                "message": (
-                                    f"{summary}\n\n"
-                                    f"✅ 인덱싱 및 GitHub 백업 성공 — 재시작 후에도 데이터가 보존됩니다."
-                                    f"{drive_note}"
-                                ),
-                            }
-                            st.toast(f"✅ 적재 완료 (ChromaDB {total_now}건)")
                         else:
-                            st.session_state.upload_feedback = {
-                                "level": "warning",
-                                "message": (
-                                    f"{summary}\n\n"
-                                    f"⚠️ ChromaDB 인덱싱은 완료되었으나 GitHub 백업 실패. "
-                                    f"'💾 GitHub 마스터 백업 재시도' 버튼으로 다시 업로드하세요."
-                                ),
-                            }
-                    elif dup > 0:
-                        st.session_state.upload_feedback = {
-                            "level": "info",
-                            "message": (
-                                f"{summary}\n\n"
-                                f"ℹ️ 업로드 파일의 특허는 이미 ChromaDB에 색인되어 있습니다. "
-                                f"ChromaDB({total_now})와 마스터({master_now}) 건수가 다르면 "
-                                f"아래 **ChromaDB 누락분 복구** 버튼을 실행하세요."
-                            ),
-                        }
+                            st.error(
+                                f"⚠️ 신규 {ingested}건 인덱싱은 됐으나 **R2 백업 실패**. "
+                                f"'🔍 R2 연결 진단' 후 다시 적재하거나 아래 백업 버튼을 누르세요."
+                            )
+                    elif dup > 0 or already > 0:
+                        st.warning("업로드 특허가 이미 DB에 존재합니다. 새 데이터가 없습니다.")
                     else:
-                        st.session_state.upload_feedback = {
-                            "level": "error",
-                            "message": (
-                                f"{summary}\n\n"
-                                f"❌ 처리된 데이터가 없습니다. 열 감지 결과에서 '출원번호' 열이 올바른지 확인하세요."
-                            ),
-                        }
-
-            if st.session_state.upload_feedback:
-                _render_feedback_box(st.session_state.upload_feedback)
+                        st.error("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
+                    st.rerun()
 
             st.divider()
-            chroma_n          = safe_count(collection)
-            master_n          = _count_master_excel_patents()
-            unique_patent_n   = _count_chroma_unique_patents(collection)
-            st.markdown(_build_db_count_status(chroma_n, master_n, unique_patent_n))
+            st.markdown(f"📊 **누적 적재 데이터:** `{safe_count(collection)}` 건")
 
-            if st.session_state.sync_feedback:
-                _render_feedback_box(st.session_state.sync_feedback)
-                if st.button("✕ 알림 닫기", key="dismiss_sync_feedback", use_container_width=True):
-                    st.session_state.sync_feedback = None
-                    st.rerun()
+            # R2 수동 백업
+            if st.button("💾 R2 백업 재시도", use_container_width=True):
+                with st.spinner("R2에 벡터 DB 업로드 중..."):
+                    ok = backup_chroma_to_r2()
+                if ok:
+                    st.success("✅ R2 백업 성공!")
+                else:
+                    st.error("❌ 백업 실패. R2 연결 진단을 확인하세요.")
 
-            needs_reverse_sync = (
-                master_n is not None
-                and unique_patent_n > 0
-                and master_n < unique_patent_n
-            )
-            if needs_reverse_sync:
-                if st.button("📥 ChromaDB → 마스터 엑셀 역동기화", use_container_width=True):
-                    with st.spinner(
-                        f"ChromaDB {chroma_n}건을 마스터 엑셀로 보내는 중 "
-                        f"(재임베딩 없음, 약 1~3분)..."
-                    ):
-                        exported, before_n, after_n = sync_master_from_chroma(collection)
-                    if exported > 0:
-                        _invalidate_patent_count_cache()
-                        backup_msg = ""
-                        with st.spinner("💾 GitHub 마스터 자동 백업 중..."):
-                            github_ok = upload_file_to_github_api(
-                                MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx"
-                            )
-                        if github_ok:
-                            backup_msg = "  \n✅ GitHub 마스터 백업 자동 완료"
-                        else:
-                            backup_msg = (
-                                "  \n⚠️ GitHub 자동 백업 실패 — "
-                                "**💾 GitHub 마스터 백업 재시도** 버튼을 실행하세요."
-                            )
-                        st.session_state.sync_feedback = {
-                            "level": "success" if github_ok else "warning",
-                            "message": (
-                                f"✅ 역동기화 완료: Chroma **{exported}건** 반영 → "
-                                f"마스터 **{before_n} → {after_n}건** (ChromaDB는 그대로 유지)"
-                                f"{backup_msg}"
-                            ),
-                        }
-                        st.rerun()
-                    else:
-                        st.session_state.sync_feedback = {
-                            "level": "error",
-                            "message": "❌ 역동기화 실패 — ChromaDB 데이터를 읽지 못했습니다.",
-                        }
-                        st.rerun()
+            # 엑셀 내보내기 (원본 재생성)
+            if safe_count(collection) > 0:
+                xlsx_bytes = export_collection_to_excel_bytes(collection)
+                if xlsx_bytes:
+                    st.download_button(
+                        "📥 마스터 엑셀 내보내기 (.xlsx)",
+                        data=xlsx_bytes,
+                        file_name="master_patents.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
 
-            needs_gap_sync = (
-                master_n is not None
-                and unique_patent_n > 0
-                and master_n > unique_patent_n
-            )
-            if needs_gap_sync:
-                if st.button("🔧 ChromaDB 누락분 복구 (마스터 엑셀 기준)", use_container_width=True):
-                    _start_gap_sync()
-                    st.rerun()
+            st.divider()
 
-            if os.path.exists(MASTER_EXCEL_PATH) and os.path.getsize(MASTER_EXCEL_PATH) > 0:
-                file_kb = os.path.getsize(MASTER_EXCEL_PATH) // 1024
-                st.caption(f"로컬 마스터: {file_kb} KB")
-                if st.button("💾 GitHub 마스터 백업 재시도", use_container_width=True):
-                    with st.spinner("GitHub에 마스터 엑셀 업로드 중... (최대 2분)"):
-                        ok = upload_file_to_github_api(
-                            MASTER_EXCEL_PATH, "my_patent_folder/master_patents.xlsx"
-                        )
-                    if ok:
-                        _invalidate_patent_count_cache()
-                        master_now = _count_master_excel_patents(force=True)
-                        st.session_state.sync_feedback = {
-                            "level": "success",
-                            "message": (
-                                f"✅ GitHub 백업 성공! (마스터 엑셀 **{master_now}건** → GitHub 저장 완료)"
-                            ),
-                        }
-                    else:
-                        st.session_state.sync_feedback = {
-                            "level": "error",
-                            "message": (
-                                "❌ 백업 실패. **🔍 GitHub 연결 진단**으로 원인 확인 후 재시도하세요.  \n"
-                                "토큰 `repo` 쓰기 권한·만료 여부를 확인하세요."
-                            ),
-                        }
-                    st.rerun()
-            else:
-                st.caption("로컬 마스터 파일 없음 (업로드 후 활성화)")
-
-            also_clear_github = st.checkbox(
-                "GitHub 백업도 함께 초기화 (master_patents.xlsx 삭제)",
+            # 전체 포맷
+            also_clear_r2 = st.checkbox(
+                "R2 백업도 함께 삭제 (snapshot 제거)",
                 value=False,
-                help="체크 시 GitHub에 저장된 master_patents.xlsx도 삭제합니다. "
-                     "원본 Excel을 다시 업로드하여 완전히 새로 시작할 때 사용하세요."
+                help="체크 시 R2의 벡터 스냅샷도 삭제합니다. 완전히 새로 시작할 때 사용하세요.",
             )
-            if st.button("🚨 가상 데이터 웨어하우스 전체 포맷"):
-                with st.spinner("⏳ 벡터 DB 및 마스터 데이터 완전 초기화 중..."):
+            if st.button("🚨 데이터 웨어하우스 전체 포맷"):
+                with st.spinner("⏳ 벡터 DB 완전 초기화 중..."):
                     try:
-                        # 1. 로컬 마스터 엑셀 삭제
-                        if os.path.exists(MASTER_EXCEL_PATH):
-                            os.remove(MASTER_EXCEL_PATH)
-
-                        # 2. (옵션) GitHub 백업도 삭제
-                        github_cleared = False
-                        if also_clear_github:
-                            github_cleared = delete_file_from_github_api(
-                                "my_patent_folder/master_patents.xlsx"
-                            )
-                            if not github_cleared:
-                                st.warning("GitHub 삭제 실패 — GitHub 연결 진단 후 재시도하세요.")
-
                         reset_collection()
-
-                        st.session_state.sync_feedback = None
-                        st.session_state.upload_feedback = None
-                        _invalidate_patent_count_cache()
-                        st.session_state._last_chroma_count = 0
-
-                        # github_synced = True: 포맷 직후 리런에서 GitHub 재다운로드 방지
-                        # (이전에 False로 설정 시 GitHub의 기존 데이터가 즉시 복원되는 문제 해결)
-                        # 컨테이너 재시작 시에는 session_state가 초기화되므로 정상적으로 GitHub 동기화됨
-                        st.session_state.github_synced = True
-
-                        if also_clear_github and github_cleared:
-                            st.toast("✅ 로컬 + GitHub 데이터 완전 초기화 완료. 원본 Excel을 새로 업로드해 주세요.")
-                        elif also_clear_github and not github_cleared:
-                            st.toast("⚠️ 로컬 초기화 완료. GitHub 삭제 실패 — GitHub 연결 진단 후 재시도하세요.")
+                        if also_clear_r2:
+                            r2_delete(R2_SNAPSHOT_KEY)
+                        st.session_state["_last_chroma_count"] = 0
+                        st.session_state.restored = True  # 포맷 직후 R2 재복원 방지
+                        if also_clear_r2:
+                            st.toast("✅ 로컬 + R2 초기화 완료. 엑셀을 새로 업로드하세요.")
                         else:
-                            st.toast("✅ 로컬 초기화 완료. 원본 Excel을 업로드하면 GitHub 이전 데이터와 무관하게 새로 적재됩니다.")
+                            st.toast("✅ 로컬 초기화 완료. (R2 백업은 유지)")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"초기화 중 오류 발생: {e}")
+                        st.error(f"초기화 중 오류: {e}")
 
             st.divider()
             st.subheader("👥 가입 회원 현황")
@@ -3122,12 +1544,11 @@ def run_main_portal():
             else:
                 updated_registry = dict(registry)
                 for uid, info in registry.items():
-                    is_active   = info.get("active", True)
+                    is_active = info.get("active", True)
                     status_icon = "🟢" if is_active else "🔴"
                     status_note = "" if is_active else " · **승인 대기**"
-                    btn_label   = "비활성화" if is_active else "활성화 (승인)"
-                    btn_type    = "secondary" if is_active else "primary"
-
+                    btn_label = "비활성화" if is_active else "활성화 (승인)"
+                    btn_type = "secondary" if is_active else "primary"
                     col_info, col_btn = st.columns([3, 1])
                     with col_info:
                         st.markdown(
@@ -3141,8 +1562,8 @@ def run_main_portal():
                         if st.button(btn_label, key=f"toggle_{uid}", type=btn_type):
                             updated_registry[uid]["active"] = not is_active
                             save_user_registry(updated_registry)
-                            upload_user_registry_to_github()
-                            refresh_user_registry_from_github(force=True)
+                            upload_user_registry_to_r2()
+                            refresh_user_registry_from_r2(force=True)
                             action = "활성화(승인)" if not is_active else "비활성화"
                             st.toast(f"✅ {uid} 계정을 {action}했습니다.")
                             st.rerun()
@@ -3150,6 +1571,7 @@ def run_main_portal():
         else:
             st.caption("분석 기능 전용 접속 모드입니다.")
 
+    # ── 메인 분석 UI ──
     st.subheader("⚙️ 1단계: AI 전문가 선택")
     analysis_mode = st.selectbox(
         "사용 목적에 맞는 전문가 관점을 선택해 주세요:",
@@ -3157,8 +1579,8 @@ def run_main_portal():
             "💡 단순 키워드 매칭 및 특허 검색",
             "🔬 특정 기술 관련 심층 특허 분석",
             "🛡 개발기술 침해 분석 & 진보성 회피 설계",
-            "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)"
-        ]
+            "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)",
+        ],
     )
 
     st.subheader("🔍 2단계: 검색 키워드 또는 질의 내용 입력")
@@ -3167,9 +1589,8 @@ def run_main_portal():
         "🔬 특정 기술 관련 심층 특허 분석": "동향을 파악할 타겟 기술이나 모듈명을 입력하세요. (예: 센서 기반 매체 지폐 잼 장애 예측 알고리즘)",
         "🛡 개발기술 침해 분석 & 진보성 회피 설계": "우리가 출원 예정이거나 개발한 기술 아이디어를 청구항 수준으로 상세히 입력하세요.",
         "📊 출원정보 기반 다차원 통계조사 (출원인, 발명자, IPC, 일자 등)": (
-            "조건·질의 예: '2021년 이후 출원된 특허의 출원인별로 각각 중점적으로 개발한 기술 분석' "
-            "(연도·출원인별 코호트 전체 집계 — 10건 제한 없음)"
-        )
+            "통계 요약 조건을 입력하세요. (예: '2021년 이후 출원인별 기술 동향', '전체 통계 요약')"
+        ),
     }
     user_query = st.text_area("분석 대상 내용을 입력하세요:", height=110, placeholder=placeholders[analysis_mode])
 
@@ -3178,14 +1599,22 @@ def run_main_portal():
         n_results_user = st.slider(
             "🔢 3단계: 참조할 관련 특허 수",
             min_value=3, max_value=20, value=default_n, step=1,
-            help="AI가 분석에 참조할 최대 특허 건수입니다. Groq API 입력 한도(6,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다."
-        )
-        st.caption(
-            "💡 **출원연도·출원인별 전체 동향** 분석(예: '2021년 이후 출원인별 기술')은 "
-            "위 **📊 통계조사 모드**를 선택하세요. 10~20건 제한 없이 DB 전체를 집계합니다."
+            help="AI가 분석에 참조할 최대 특허 건수. Groq 입력 한도(12,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다.",
         )
     else:
-        n_results_user = 10  # 통계 모드는 슬라이더 불필요 (전체 데이터 집계)
+        n_results_user = 10
+        st.caption(
+            "💡 **출원연도·출원인별 전체 동향** 분석(예: '2021년 이후 출원인별 기술')은 "
+            "10~20건 제한 없이 DB 전체를 집계합니다."
+        )
+
+    # 일일 토큰 경고
+    used = _daily_tokens_used()
+    if used >= GROQ_DAILY_TOKEN_LIMIT * 0.8:
+        st.warning(
+            f"⚠️ 오늘 사용 토큰 {used:,} / {GROQ_DAILY_TOKEN_LIMIT:,} (80% 초과). "
+            f"무료 한도 소진이 가까워 분석이 곧 제한될 수 있습니다."
+        )
 
     if st.button("🧬 가상 전문가 엔진 구동"):
         if user_query.strip() == "":
@@ -3193,20 +1622,19 @@ def run_main_portal():
         elif safe_count(collection) == 0:
             st.error("서버 DB에 적재된 특허 소스가 없습니다. 좌측 메뉴에서 엑셀을 먼저 등록해 주세요.")
         else:
-            with st.spinner("가상 전문가가 실시간 시맨틱 문헌 대조 및 클라우드 초고속 추론을 진행 중입니다..."):
+            with st.spinner("가상 전문가가 시맨틱 문헌 대조 및 추론을 진행 중입니다..."):
                 context_truncated = False
 
-                # ── 통계 모드: 전체 메타데이터 pandas 집계 후 요약 컨텍스트 구성 ──
+                # ── 통계 모드: 전체 메타데이터 집계 + 복합 프롬프트 ──
                 if "📊" in analysis_mode:
-                    all_metas = _get_all_metadatas_cached(collection)
+                    all_data = collection.get(include=["metadatas"])
+                    all_metas = all_data.get("metadatas", [])
                     total_count = len(all_metas)
-
                     if total_count == 0:
                         st.error("서버 DB에 적재된 특허 소스가 없습니다.")
                         st.stop()
 
                     stats_df = pd.DataFrame(all_metas)
-
                     min_year, max_year = _extract_year_filter_from_query(user_query)
                     use_year_filter = min_year is not None or max_year is not None
                     analysis_df = (
@@ -3230,40 +1658,30 @@ def run_main_portal():
 
                     applicant_df, applicant_stat = _top_counts_table(
                         analysis_df.get("출원인", pd.Series(dtype=str)),
-                        n=15,
-                        label="출원인(대표명)",
-                        normalizer=_canonical_applicant_name,
-                        explode=True,
+                        n=15, label="출원인(대표명)",
+                        normalizer=_canonical_applicant_name, explode=True,
                     )
                     ipc_df, ipc_stat = _top_counts_table(
                         analysis_df.get("IPC", pd.Series(dtype=str)),
-                        n=10,
-                        label="IPC",
-                        explode=True,
-                        allow_comma=True,
+                        n=10, label="IPC", explode=True, allow_comma=True,
                     )
                     inventor_df, inventor_stat = _top_counts_table(
                         analysis_df.get("발명자", pd.Series(dtype=str)),
-                        n=10,
-                        label="발명자",
-                        explode=True,
-                        allow_comma=True,
+                        n=10, label="발명자", explode=True, allow_comma=True,
                     )
                     year_df, year_stat = _year_counts_table(
                         analysis_df.get("출원일", pd.Series(dtype=str))
                     )
 
-                    scope_label = (
-                        f"조건 필터 ({filtered_count}건)" if use_year_filter else "전체 DB"
-                    )
+                    scope_label = f"조건 필터 ({filtered_count}건)" if use_year_filter else "전체 DB"
                     st.markdown(f"### 📊 사전 집계 통계 ({scope_label})")
-                    stat_col1, stat_col2 = st.columns(2)
-                    with stat_col1:
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
                         st.markdown("**출원인별 (대표명 통합)**")
                         st.dataframe(applicant_df, use_container_width=True, hide_index=True)
                         st.markdown("**IPC 분류별**")
                         st.dataframe(ipc_df, use_container_width=True, hide_index=True)
-                    with stat_col2:
+                    with sc2:
                         st.markdown("**발명자별**")
                         st.dataframe(inventor_df, use_container_width=True, hide_index=True)
                         st.markdown("**출원 연도별**")
@@ -3303,8 +1721,7 @@ def run_main_portal():
 """
                     if cohort_md:
                         context_text += (
-                            f"\n■ 출원인별 기술 코호트 (필터 범위 전체 — 샘플 10건 아님)\n"
-                            f"{cohort_md}\n"
+                            f"\n■ 출원인별 기술 코호트 (필터 범위 전체 — 샘플 10건 아님)\n{cohort_md}\n"
                         )
                     elif not cohort_mode:
                         sem_results = collection.query(
@@ -3337,20 +1754,17 @@ def run_main_portal():
                         "체계적인 다차원 통계 리포트로 작성하세요."
                     )
 
-                # ── 일반 모드: 시맨틱 RAG 검색 ──
+                # ── 일반 모드: 시맨틱 RAG ──
                 else:
                     n_results = min(n_results_user, safe_count(collection))
-
                     results = collection.query(
-                        query_texts=[user_query.strip()],
-                        n_results=n_results
+                        query_texts=[user_query.strip()], n_results=n_results
                     )
-
                     if not (results and results["documents"] and results["documents"][0]):
                         st.error("관련 특허를 찾지 못했습니다. 다른 키워드로 시도해 보세요.")
                         st.stop()
 
-                    retrieved_docs  = results["documents"][0]
+                    retrieved_docs = results["documents"][0]
                     retrieved_metas = results["metadatas"][0]
 
                     if "💡 단순 키워드" in analysis_mode:
@@ -3384,18 +1798,20 @@ def run_main_portal():
                 try:
                     if truncated:
                         if "🛡" in analysis_mode:
-                            trunc_msg = (
-                                "Groq API 입력 한도(6,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
-                                "침해 분석 모드는 **청구항을 우선** 유지하고 요약을 먼저 줄입니다. "
-                                "더 상세한 분석이 필요하면 '참조할 관련 특허 수'를 줄여 보세요."
+                            st.info(
+                                "Groq 입력 한도(12,000 TPM)에 맞춰 본문을 축약했습니다. "
+                                "침해 분석 모드는 **청구항 우선** 유지, 요약을 먼저 줄입니다. "
+                                "더 상세하려면 '참조 특허 수'를 줄여 보세요."
                             )
                         else:
-                            trunc_msg = (
-                                "Groq API 입력 한도(6,000 TPM)에 맞추기 위해 참조 특허 본문을 자동 축약했습니다. "
-                                "키워드·심층 분석 모드는 **요약을 우선** 유지하고 청구항을 먼저 생략·축소합니다. "
-                                "더 상세한 분석이 필요하면 '참조할 관련 특허 수'를 줄여 보세요."
+                            st.info(
+                                "Groq 입력 한도(12,000 TPM)에 맞춰 본문을 축약했습니다. "
+                                "키워드·심층 분석 모드는 **요약 우선** 유지, 청구항을 먼저 줄입니다. "
+                                "더 상세하려면 '참조 특허 수'를 줄여 보세요."
                             )
-                        st.info(trunc_msg)
+                    # 일일 토큰 추정 누적
+                    _add_daily_tokens(_estimate_tokens(prompt) + GROQ_MAX_OUTPUT_TOKENS)
+
                     response = llm.invoke(prompt)
                     st.markdown(f"### 📊 AI {analysis_mode.split(' ')[1]} 결과 보고서")
                     st.write(response.content)
