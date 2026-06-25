@@ -159,56 +159,92 @@ def _normalize_patent_id(value) -> str:
 # ==========================================
 _MULTI_VALUE_SPLIT_RE = re.compile(r"\s*[|;/]\s*")
 
+# lookup key(대문자·기호·접미사 제거) → 대표명.
+# 효성·히타치처럼 변형이 많은 경쟁사는 모든 변형이 하나의 대표명으로 수렴하도록 매핑.
+# 한글 변형(노틸러스효성, 효성티앤에스 등)도 키로 등록.
 _APPLICANT_CANONICAL_KEYS: dict = {
+    # ── 효성 계열 → "효성" 으로 통합 ──
+    "HYOSUNG": "효성",
+    "HYOSUNGNAUTILUS": "효성",
+    "NAUTILUSHYOSUNG": "효성",
+    "HYOSUNGTNS": "효성",
+    "효성": "효성",
+    "효성티앤에스": "효성",
+    "효성티엔에스": "효성",
+    "노틸러스효성": "효성",
+    "효성노틸러스": "효성",
+    "나우테크놀로지": "효성",          # 효성 계열사(필요 시 조정)
+    # ── 히타치 계열 → "히타치" 로 통합 ──
+    "HITACHI": "히타치",
+    "HITACHIOMRON": "히타치",
+    "HITACHIOMRONTERMINALSOLUTIONS": "히타치",
+    "HITACHICHANNELSOLUTIONS": "히타치",
+    "HITACHITERMINALSOLUTIONS": "히타치",
+    "히타치": "히타치",
+    "히타치옴론": "히타치",
+    # ── Diebold/Wincor 계열 ──
     "DIEBOLD": "DIEBOLD NIXDORF",
     "DIEBOLDNIXDORF": "DIEBOLD NIXDORF",
     "DIEBOLDNIXDORFINCORPORATED": "DIEBOLD NIXDORF",
     "DIEBOLDNIXDORFSYSTEMSGMBH": "DIEBOLD NIXDORF",
     "WINCORNIXDORF": "DIEBOLD NIXDORF",
     "WINCORNIXDORFINTERNATIONALGMBH": "DIEBOLD NIXDORF",
+    "디볼드": "DIEBOLD NIXDORF",
+    "디볼드닉스도르프": "DIEBOLD NIXDORF",
+    # ── NCR ──
     "NCR": "NCR",
     "NCRCORPORATION": "NCR",
-    "NAUTILUSHYOSUNG": "HYOSUNG NAUTILUS",
-    "HYOSUNG": "HYOSUNG NAUTILUS",
-    "HYOSUNGNAUTILUS": "HYOSUNG NAUTILUS",
+    "NCRVOYIX": "NCR",
+    "NCRATLEOS": "NCR",
+    # ── 기타 경쟁사 ──
     "HOTS": "HOTS",
     "GLORY": "GLORY",
     "GLORYLTD": "GLORY",
     "OKIELECTRIC": "OKI ELECTRIC",
     "OKIELECTRICINDUSTRY": "OKI ELECTRIC",
     "OKIELECTRICINDUSTRYCOLTD": "OKI ELECTRIC",
+    "OKI": "OKI ELECTRIC",
     "FTEC": "FTEC",
     "GRGBANKING": "GRG BANKING",
     "GRGBANKINGEQUIPMENT": "GRG BANKING",
     "GRGBANKINGEQUIPMENTCOLTD": "GRG BANKING",
+    "GRG": "GRG BANKING",
     "SHENZHENYIHUA": "SHENZHEN YIHUA",
     "SHENZHENYIHUACOMPCOLTD": "SHENZHEN YIHUA",
     "SHENZHENYIHUATIMETECHNOLOGY": "SHENZHEN YIHUA",
     "SHENZHENYIHUAFINANCIALINTELLIGENTRESINST": "SHENZHEN YIHUA",
+    "YIHUA": "SHENZHEN YIHUA",
     "CASHWAY": "CASHWAY",
     "CASHWAYTECHNOLOGY": "CASHWAY",
     "GUARDIAN": "GUARDIAN",
     "GUARDIANANALYTICS": "GUARDIAN",
     "FUJITSU": "FUJITSU",
-    "HITACHI": "HITACHI",
+    "후지쯔": "FUJITSU",
     "TOSHIBA": "TOSHIBA",
+    "도시바": "TOSHIBA",
     "RICOH": "RICOH",
     "CANON": "CANON",
     "PANASONIC": "PANASONIC",
     "CUMMINSALLISON": "CUMMINS ALLISON",
-    "DE LA RUE": "DE LA RUE",
     "DELARUE": "DE LA RUE",
     "GIESSECKE": "GIECKE+DEVRIENT",
     "GIESECKE": "GIECKE+DEVRIENT",
     "GIECKE": "GIECKE+DEVRIENT",
 }
 
+# lookup key가 아래 접두사로 시작하면 대표명으로 통합 (매핑표에 없는 변형 포착).
+# 효성·히타치는 어떤 꼬리표가 붙어도 대표명으로 수렴.
 _APPLICANT_PREFIX_RULES: list = [
+    ("HYOSUNG", "효성"),
+    ("NAUTILUS", "효성"),
+    ("효성", "효성"),
+    ("노틸러스효성", "효성"),
+    ("HITACHI", "히타치"),
+    ("히타치", "히타치"),
     ("DIEBOLD", "DIEBOLD NIXDORF"),
     ("WINCOR", "DIEBOLD NIXDORF"),
+    ("디볼드", "DIEBOLD NIXDORF"),
     ("NCR", "NCR"),
-    ("NAUTILUS", "HYOSUNG NAUTILUS"),
-    ("HYOSUNG", "HYOSUNG NAUTILUS"),
     ("GLORY", "GLORY"),
     ("OKIELECTRIC", "OKI ELECTRIC"),
     ("GRGBANKING", "GRG BANKING"),
@@ -229,21 +265,34 @@ _CORP_SUFFIX_PATTERNS = (
     r"holdings?", r"group", r"international", r"systems?", r"equipment",
     r"technology", r"technologies", r"industry", r"industries", r"financial",
     r"intelligent", r"research", r"inst(?:itute)?", r"res", r"inst",
+    # 한글 접미사(효성티앤에스 → 효성, 히타치옴론 → 히타치 등 수렴 지원)
+    r"티앤에스", r"티엔에스", r"앤에스", r"테크놀로지", r"테크놀러지", r"전자",
+    r"솔루션즈?", r"시스템즈?", r"인더스트리", r"옴론",
 )
 # 결합 정규식: 접미사를 1패스로 제거 (성능 개선)
+# 영문은 단어경계(\b), 한글 접미사는 경계가 없으므로 위치 무관 제거.
+_ASCII_SUFFIXES = tuple(p for p in _CORP_SUFFIX_PATTERNS if not re.search(r"[가-힣]", p))
+_HANGUL_SUFFIXES = tuple(p for p in _CORP_SUFFIX_PATTERNS if re.search(r"[가-힣]", p))
+# 한글 회사 표현(주식회사/(주)/㈜ 등)은 어디에 있든 제거
+_HANGUL_CORP_TOKENS = (r"주식회사", r"\(주\)", r"㈜", r"유한회사", r"\(유\)")
 _CORP_SUFFIX_RE = re.compile(
-    r"\b(?:" + "|".join(_CORP_SUFFIX_PATTERNS) + r")\b", flags=re.IGNORECASE
+    r"\b(?:" + "|".join(_ASCII_SUFFIXES) + r")\b", flags=re.IGNORECASE
 )
+_HANGUL_CORP_RE = re.compile("(?:" + "|".join(_HANGUL_CORP_TOKENS) + ")")
+_CORP_SUFFIX_HANGUL_RE = re.compile("(?:" + "|".join(_HANGUL_SUFFIXES) + r")")
 _CORP_SEP_RE = re.compile(r"[\s\-_./\\()（）\[\]]+")
 
 
 def _applicant_lookup_key(name: str) -> str:
     """출원인 문자열을 alias 조회용 키로 변환."""
     s = str(name).strip()
+    # 한글 회사 표현(주식회사/(주)/㈜)을 먼저 위치 무관 제거
+    s = _HANGUL_CORP_RE.sub("", s)
     for _ in range(3):
         prev = s
         s = s.replace(",", " ")
         s = _CORP_SUFFIX_RE.sub("", s)
+        s = _CORP_SUFFIX_HANGUL_RE.sub("", s)  # 한글 접미사(티앤에스 등) 제거
         s = _CORP_SEP_RE.sub("", s)
         if s == prev:
             break
@@ -251,7 +300,7 @@ def _applicant_lookup_key(name: str) -> str:
 
 
 def _canonical_applicant_name(name: str) -> str:
-    """경쟁사 출원인 표기를 대표명으로 통합 (집계 전용, 메타데이터 원본 유지)."""
+    """경쟁사 출원인 표기를 대표명으로 통합 (집계·필터 전용, 메타데이터 원본 유지)."""
     raw = str(name).strip()
     if not raw or raw.lower() in ("nan", "none", "없음", "정보없음", "미기재"):
         return ""
@@ -260,13 +309,16 @@ def _canonical_applicant_name(name: str) -> str:
     if not key:
         return raw
 
+    # 1) 정확 매칭 (영문 키 + 한글 변형 키 모두 등록됨)
     if key in _APPLICANT_CANONICAL_KEYS:
         return _APPLICANT_CANONICAL_KEYS[key]
 
+    # 2) 접두사 매칭 (변형 흡수)
     for prefix, canonical in _APPLICANT_PREFIX_RULES:
         if key.startswith(prefix):
             return canonical
 
+    # 3) 매핑 없는 한글 출원인: 회사 접미사만 정리해 표시
     if re.search(r"[가-힣]", raw):
         cleaned = re.sub(r"\s*(\(주\)|주식회사|㈜|유한회사|\(유\))\s*", "", raw).strip()
         return cleaned if cleaned else raw
@@ -1192,8 +1244,26 @@ def _get_info_cell(row, col) -> str:
     return _get_cell(row, col, default="정보없음")
 
 
+def _canonical_applicants_for_meta(applicant_raw: str) -> str:
+    """
+    출원인 원본 → 대표명 문자열. 복수 출원인은 '|'로 결합.
+    ChromaDB where 필터에서 $in 또는 부분일치 검색에 사용.
+    """
+    apps = _explode_multi_values(applicant_raw, allow_comma=False)
+    if not apps:
+        c = _canonical_applicant_name(applicant_raw)
+        return c if c else "기타"
+    canon = []
+    for a in apps:
+        c = _canonical_applicant_name(a)
+        if c and c not in canon:
+            canon.append(c)
+    return "|".join(canon) if canon else "기타"
+
+
 def _build_metadata(row, cols: dict, patent_url: str = "") -> dict:
     title = _get_info_cell(row, cols["title"]) if cols["title"] else "정보없음"
+    applicant_raw = _get_cell(row, cols["applicant"])
     return {
         "출원번호": str(row[cols["id"]]),
         "명칭": title,
@@ -1202,7 +1272,8 @@ def _build_metadata(row, cols: dict, patent_url: str = "") -> dict:
         "IPC": _get_cell(row, cols["ipc"]),
         "CPC": _get_cell(row, cols["cpc"]),
         "발명자": _get_cell(row, cols["inventor"]),
-        "출원인": _get_cell(row, cols["applicant"]),
+        "출원인": applicant_raw,
+        "대표출원인": _canonical_applicants_for_meta(applicant_raw),  # 검색 필터용
         "URL": patent_url,
     }
 
@@ -1365,6 +1436,152 @@ def export_collection_to_excel_bytes(collection) -> bytes:
 
 
 # ==========================================
+# 13-b. 대표출원인 메타 마이그레이션 + 검색 재순위
+# ==========================================
+def migrate_add_representative_applicant(collection, batch_size: int = 200) -> int:
+    """
+    기존 적재분(대표출원인 필드 없음)에 대표출원인 메타를 채워 넣음.
+    재임베딩 불필요 — 메타데이터만 update. 반환: 갱신 건수.
+    """
+    try:
+        total = collection.count()
+        if total == 0:
+            return 0
+        data = collection.get(include=["metadatas"])
+        ids = data.get("ids", [])
+        metas = data.get("metadatas", [])
+
+        upd_ids, upd_metas = [], []
+        for cid, meta in zip(ids, metas):
+            meta = dict(meta or {})
+            rep = _canonical_applicants_for_meta(meta.get("출원인", ""))
+            if meta.get("대표출원인") != rep:
+                meta["대표출원인"] = rep
+                upd_ids.append(cid)
+                upd_metas.append(meta)
+
+        for i in range(0, len(upd_ids), batch_size):
+            collection.update(
+                ids=upd_ids[i:i + batch_size],
+                metadatas=upd_metas[i:i + batch_size],
+            )
+        return len(upd_ids)
+    except Exception as e:
+        print(f"[대표출원인 마이그레이션 오류] {e}")
+        return 0
+
+
+@st.cache_data(show_spinner=False)
+def _applicant_options_cached(chroma_n: int, collection_id: str) -> list:
+    """드롭다운용 대표출원인 목록 (건수 내림차순). chroma_n 변동 시 갱신."""
+    try:
+        col = _get_collection()
+        if col.count() == 0:
+            return []
+        metas = col.get(include=["metadatas"]).get("metadatas", [])
+        counter: dict = {}
+        for m in metas:
+            rep = (m or {}).get("대표출원인", "")
+            if not rep:
+                rep = _canonical_applicants_for_meta((m or {}).get("출원인", ""))
+            for name in str(rep).split("|"):
+                name = name.strip()
+                if name and name != "기타":
+                    counter[name] = counter.get(name, 0) + 1
+        return [n for n, _ in sorted(counter.items(), key=lambda x: -x[1])]
+    except Exception as e:
+        print(f"[출원인 목록 조회 오류] {e}")
+        return []
+
+
+def _extract_keywords(query: str) -> list:
+    """질의에서 키워드 가산용 토큰 추출 (2자 이상 한글/영문 단어)."""
+    tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", query)
+    # 너무 흔한 조사·일반어 제거
+    stop = {"특허", "기술", "관련", "분석", "대한", "조사", "검색", "출원", "모듈", "장치", "방법", "시스템"}
+    out = []
+    for t in tokens:
+        # 한글 토큰 끝의 조사(의/을/를/은/는/이/가/와/과/에) 1글자 제거 시도
+        if re.search(r"[가-힣]$", t) and len(t) >= 3 and t[-1] in "의을를은는이가와과에":
+            t = t[:-1]
+        if t and t not in stop:
+            out.append(t)
+    return out
+
+
+def _keyword_score(doc: str, meta: dict, keywords: list) -> int:
+    """문서·명칭에 키워드가 포함된 정도(가산점). 명칭 매칭에 가중치."""
+    if not keywords:
+        return 0
+    title = str(meta.get("명칭", ""))
+    score = 0
+    for kw in keywords:
+        if kw in title:
+            score += 3          # 명칭 매칭 강한 신호
+        if kw in doc:
+            score += 1          # 본문 매칭
+    return score
+
+
+def search_patents(
+    collection,
+    query: str,
+    n_results: int,
+    *,
+    applicant_filter: str = "",
+    keyword_boost: bool = True,
+):
+    """
+    시맨틱 검색 + (선택)출원인 필터 + 키워드 우선 재순위.
+
+    · applicant_filter: 대표출원인명. 지정 시 해당 출원인 특허만.
+    · keyword_boost: 질의 키워드가 명칭/본문에 포함된 특허를 상위로 재정렬.
+
+    반환: (docs, metas) — n_results 건.
+    """
+    # 출원인 필터 시 후보를 넉넉히 가져와 필터 후에도 n건 확보
+    over_fetch = n_results * 6 if applicant_filter else max(n_results * 3, n_results)
+    over_fetch = min(over_fetch, max(collection.count(), 1))
+
+    res = collection.query(query_texts=[query], n_results=over_fetch)
+    if not (res and res["documents"] and res["documents"][0]):
+        return [], []
+
+    docs = res["documents"][0]
+    metas = res["metadatas"][0]
+    dists = res.get("distances", [[None] * len(docs)])[0]
+
+    # 1) 출원인 필터 (대표출원인 부분일치 — '|' 결합 대응)
+    if applicant_filter:
+        keep = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            rep = str(meta.get("대표출원인", "")) or _canonical_applicants_for_meta(meta.get("출원인", ""))
+            reps = {r.strip() for r in rep.split("|")}
+            if applicant_filter in reps:
+                keep.append((doc, meta, dist))
+        triples = keep
+    else:
+        triples = list(zip(docs, metas, dists))
+
+    if not triples:
+        return [], []
+
+    # 2) 키워드 우선 재순위 (키워드 점수 desc, 그다음 거리 asc)
+    if keyword_boost:
+        keywords = _extract_keywords(query)
+        if keywords:
+            def _rank_key(t):
+                doc, meta, dist = t
+                kw = _keyword_score(doc, meta, keywords)
+                d = dist if dist is not None else 1.0
+                return (-kw, d)
+            triples.sort(key=_rank_key)
+
+    triples = triples[:n_results]
+    return [t[0] for t in triples], [t[1] for t in triples]
+
+
+# ==========================================
 # 14. 메인 포털
 # ==========================================
 def run_main_portal():
@@ -1499,6 +1716,17 @@ def run_main_portal():
                 else:
                     st.error("❌ 백업 실패. R2 연결 진단을 확인하세요.")
 
+            # 대표출원인 메타 마이그레이션 (기존 적재분에 검색 필터 필드 추가)
+            if st.button("🏷 대표출원인 필드 갱신 (검색 필터용)", use_container_width=True,
+                         help="기존 적재 특허에 '대표출원인' 메타를 채웁니다. 재임베딩 없이 메타만 갱신 → 빠름. "
+                              "효성·히타치 등 변형 통합 규칙이 바뀐 경우에도 다시 누르세요."):
+                with st.spinner("대표출원인 메타 갱신 중... (재임베딩 없음)"):
+                    n_upd = migrate_add_representative_applicant(collection)
+                    backup_chroma_to_r2()
+                _applicant_options_cached.clear()
+                st.success(f"✅ {n_upd}건 대표출원인 갱신 + R2 백업 완료. 출원인 드롭다운에 반영됩니다.")
+                st.rerun()
+
             # 엑셀 내보내기 (원본 재생성)
             if safe_count(collection) > 0:
                 xlsx_bytes = export_collection_to_excel_bytes(collection)
@@ -1601,8 +1829,24 @@ def run_main_portal():
             min_value=3, max_value=20, value=default_n, step=1,
             help="AI가 분석에 참조할 최대 특허 건수. Groq 입력 한도(12,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다.",
         )
+        # 출원인 한정 드롭다운 (경쟁사 특허 조사 정확도 향상)
+        applicant_opts = _applicant_options_cached(safe_count(collection), _COLLECTION_NAME)
+        applicant_filter = st.selectbox(
+            "🏢 4단계: 출원인 한정 (선택)",
+            ["(전체)"] + applicant_opts,
+            help="특정 경쟁사를 고르면 그 출원인의 특허 안에서만 검색합니다. "
+                 "예: '효성'을 고르고 '현금 수표 통합 모듈' 입력 → 효성 특허만 조사.",
+        )
+        applicant_filter = "" if applicant_filter == "(전체)" else applicant_filter
+        keyword_boost = st.checkbox(
+            "🔑 키워드 우선 매칭 (질의 단어가 명칭·본문에 포함된 특허를 상위로)",
+            value=True,
+            help="예: '수표' 입력 시 '수표'가 실제 포함된 특허를 의미만 비슷한 특허보다 우선합니다.",
+        )
     else:
         n_results_user = 10
+        applicant_filter = ""
+        keyword_boost = False
         st.caption(
             "💡 **출원연도·출원인별 전체 동향** 분석(예: '2021년 이후 출원인별 기술')은 "
             "10~20건 제한 없이 DB 전체를 집계합니다."
@@ -1754,18 +1998,28 @@ def run_main_portal():
                         "체계적인 다차원 통계 리포트로 작성하세요."
                     )
 
-                # ── 일반 모드: 시맨틱 RAG ──
+                # ── 일반 모드: 시맨틱 RAG (+ 출원인 필터 + 키워드 우선) ──
                 else:
                     n_results = min(n_results_user, safe_count(collection))
-                    results = collection.query(
-                        query_texts=[user_query.strip()], n_results=n_results
+                    retrieved_docs, retrieved_metas = search_patents(
+                        collection,
+                        user_query.strip(),
+                        n_results,
+                        applicant_filter=applicant_filter,
+                        keyword_boost=keyword_boost,
                     )
-                    if not (results and results["documents"] and results["documents"][0]):
-                        st.error("관련 특허를 찾지 못했습니다. 다른 키워드로 시도해 보세요.")
+                    if not retrieved_docs:
+                        if applicant_filter:
+                            st.error(
+                                f"'{applicant_filter}' 출원인 특허 중 관련 결과를 찾지 못했습니다. "
+                                f"출원인 한정을 '(전체)'로 바꾸거나 키워드를 조정해 보세요."
+                            )
+                        else:
+                            st.error("관련 특허를 찾지 못했습니다. 다른 키워드로 시도해 보세요.")
                         st.stop()
 
-                    retrieved_docs = results["documents"][0]
-                    retrieved_metas = results["metadatas"][0]
+                    if applicant_filter:
+                        st.info(f"🏢 '{applicant_filter}' 출원인으로 한정해 {len(retrieved_docs)}건을 조사했습니다.")
 
                     if "💡 단순 키워드" in analysis_mode:
                         system_prompt = (
