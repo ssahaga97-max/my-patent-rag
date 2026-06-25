@@ -89,6 +89,7 @@ def _init_session():
 _init_session()
 
 _REGISTRY_REFRESH_TTL_SEC = 30
+_APPLICANT_IDS_CACHE_KEY = "_applicant_ids_cache"
 
 
 # ==========================================
@@ -1393,6 +1394,7 @@ def process_and_update_db(uploaded_file, collection):
         try:
             _upsert_patent_batches(collection, ids, docs, metas)
             ingested = len(ids)
+            _invalidate_applicant_search_cache()
         except Exception as e:
             st.error(f"ChromaDB 적재 실패 — 백업하지 않았습니다: {e}")
             return 0, dup_in_file, already_indexed, skipped_empty, False
@@ -1494,6 +1496,63 @@ def _applicant_options_cached(chroma_n: int, collection_id: str) -> list:
         return []
 
 
+def _invalidate_applicant_search_cache() -> None:
+    """출원인 ID·드롭다운 캐시 무효화 (적재·마이그레이션 직후)."""
+    st.session_state.pop(_APPLICANT_IDS_CACHE_KEY, None)
+    _applicant_options_cached.clear()
+
+
+def _meta_representative_applicants(meta: dict) -> set[str]:
+    rep = str((meta or {}).get("대표출원인", "")) or _canonical_applicants_for_meta(
+        (meta or {}).get("출원인", "")
+    )
+    return {r.strip() for r in rep.split("|") if r.strip()}
+
+
+def _meta_matches_applicant(meta: dict, applicant_filter: str) -> bool:
+    if not applicant_filter:
+        return True
+    return applicant_filter in _meta_representative_applicants(meta)
+
+
+def _get_ids_for_applicant(collection, applicant_filter: str) -> list[str]:
+    """대표출원인 일치 document id 목록 (세션 캐시 — chroma_n·출원인 키)."""
+    chroma_n = safe_count(collection)
+    cache = st.session_state.setdefault(_APPLICANT_IDS_CACHE_KEY, {})
+    cache_key = (chroma_n, applicant_filter)
+    if cache_key in cache:
+        return cache[cache_key]
+    try:
+        data = collection.get(include=["metadatas"])
+        matched = [
+            cid
+            for cid, meta in zip(data.get("ids", []), data.get("metadatas", []))
+            if _meta_matches_applicant(meta, applicant_filter)
+        ]
+        cache[cache_key] = matched
+        return matched
+    except Exception as e:
+        print(f"[출원인 ID 선필터 오류] {e}")
+        return []
+
+
+def _tech_search_query(query: str, applicant_filter: str) -> str:
+    """출원인 드롭다운 지정 시 임베딩 질의에서 출원인 노이즈 제거."""
+    q = query.strip()
+    if not applicant_filter or not q:
+        return q
+    for pat in (
+        r"출원인\s*[:：]?\s*",
+        r"권리자\s*[:：]?\s*",
+        r"등록권자\s*[:：]?\s*",
+    ):
+        q = re.sub(pat, "", q, flags=re.IGNORECASE)
+    if applicant_filter in q:
+        q = q.replace(applicant_filter, " ")
+    q = re.sub(r"\s+", " ", q).strip()
+    return q or query.strip()
+
+
 def _extract_keywords(query: str) -> list:
     """질의에서 키워드 가산용 토큰 추출 (2자 이상 한글/영문 단어)."""
     tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", query)
@@ -1532,50 +1591,65 @@ def search_patents(
     keyword_boost: bool = True,
 ):
     """
-    시맨틱 검색 + (선택)출원인 필터 + 키워드 우선 재순위.
+    시맨틱 검색 + (선택)출원인 선필터 + 키워드 우선 재순위.
 
-    · applicant_filter: 대표출원인명. 지정 시 해당 출원인 특허만.
+    · applicant_filter: 대표출원인명. 지정 시 해당 ID 집합 안에서만 query.
     · keyword_boost: 질의 키워드가 명칭/본문에 포함된 특허를 상위로 재정렬.
 
     반환: (docs, metas) — n_results 건.
     """
-    # 출원인 필터 시 후보를 넉넉히 가져와 필터 후에도 n건 확보
-    over_fetch = n_results * 6 if applicant_filter else max(n_results * 3, n_results)
-    over_fetch = min(over_fetch, max(collection.count(), 1))
+    query = (query or "").strip()
+    if not query:
+        return [], []
 
-    res = collection.query(query_texts=[query], n_results=over_fetch)
+    tech_query = _tech_search_query(query, applicant_filter)
+    keywords = _extract_keywords(tech_query) if keyword_boost else []
+
+    candidate_ids: list[str] | None = None
+    if applicant_filter:
+        candidate_ids = _get_ids_for_applicant(collection, applicant_filter)
+        if not candidate_ids:
+            return [], []
+
+    if candidate_ids is not None:
+        over_fetch = min(
+            max(n_results * 3, n_results) if keyword_boost else n_results,
+            len(candidate_ids),
+        )
+        res = collection.query(
+            query_texts=[tech_query],
+            n_results=over_fetch,
+            ids=candidate_ids,
+        )
+    else:
+        over_fetch = min(
+            max(n_results * 3, n_results),
+            max(collection.count(), 1),
+        )
+        res = collection.query(query_texts=[tech_query], n_results=over_fetch)
+
     if not (res and res["documents"] and res["documents"][0]):
         return [], []
 
     docs = res["documents"][0]
     metas = res["metadatas"][0]
     dists = res.get("distances", [[None] * len(docs)])[0]
+    triples = list(zip(docs, metas, dists))
 
-    # 1) 출원인 필터 (대표출원인 부분일치 — '|' 결합 대응)
     if applicant_filter:
-        keep = []
-        for doc, meta, dist in zip(docs, metas, dists):
-            rep = str(meta.get("대표출원인", "")) or _canonical_applicants_for_meta(meta.get("출원인", ""))
-            reps = {r.strip() for r in rep.split("|")}
-            if applicant_filter in reps:
-                keep.append((doc, meta, dist))
-        triples = keep
-    else:
-        triples = list(zip(docs, metas, dists))
+        triples = [t for t in triples if _meta_matches_applicant(t[1], applicant_filter)]
 
     if not triples:
         return [], []
 
-    # 2) 키워드 우선 재순위 (키워드 점수 desc, 그다음 거리 asc)
-    if keyword_boost:
-        keywords = _extract_keywords(query)
-        if keywords:
-            def _rank_key(t):
-                doc, meta, dist = t
-                kw = _keyword_score(doc, meta, keywords)
-                d = dist if dist is not None else 1.0
-                return (-kw, d)
-            triples.sort(key=_rank_key)
+    if keyword_boost and keywords:
+        def _rank_key(t):
+            doc, meta, dist = t
+            kw = _keyword_score(doc, meta, keywords)
+            d = dist if dist is not None else 1.0
+            return (-kw, d)
+
+        triples.sort(key=_rank_key)
 
     triples = triples[:n_results]
     return [t[0] for t in triples], [t[1] for t in triples]
@@ -1723,7 +1797,7 @@ def run_main_portal():
                 with st.spinner("대표출원인 메타 갱신 중... (재임베딩 없음)"):
                     n_upd = migrate_add_representative_applicant(collection)
                     backup_chroma_to_r2()
-                _applicant_options_cached.clear()
+                _invalidate_applicant_search_cache()
                 st.success(f"✅ {n_upd}건 대표출원인 갱신 + R2 백업 완료. 출원인 드롭다운에 반영됩니다.")
                 st.rerun()
 
@@ -1751,6 +1825,7 @@ def run_main_portal():
                 with st.spinner("⏳ 벡터 DB 완전 초기화 중..."):
                     try:
                         reset_collection()
+                        _invalidate_applicant_search_cache()
                         if also_clear_r2:
                             r2_delete(R2_SNAPSHOT_KEY)
                         st.session_state["_last_chroma_count"] = 0
@@ -2019,7 +2094,11 @@ def run_main_portal():
                         st.stop()
 
                     if applicant_filter:
-                        st.info(f"🏢 '{applicant_filter}' 출원인으로 한정해 {len(retrieved_docs)}건을 조사했습니다.")
+                        pool_n = len(_get_ids_for_applicant(collection, applicant_filter))
+                        st.info(
+                            f"🏢 '{applicant_filter}' 출원인 **{pool_n}건** 중 "
+                            f"관련도 상위 **{len(retrieved_docs)}건**을 조사했습니다."
+                        )
 
                     if "💡 단순 키워드" in analysis_mode:
                         system_prompt = (
