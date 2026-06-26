@@ -639,6 +639,36 @@ def restore_chroma_from_r2() -> bool:
         return False
 
 
+def restore_chroma_from_r2_verbose() -> dict:
+    """복원 + 상세 진단 정보 반환 (디버깅용)."""
+    info = {"downloaded_mb": 0, "extracted": False, "files": [], "sqlite_mb": 0,
+            "tar_members": [], "error": ""}
+    data = r2_download_bytes(R2_SNAPSHOT_KEY)
+    if not data:
+        info["error"] = "스냅샷 다운로드 실패 (R2에 파일 없음)"
+        return info
+    info["downloaded_mb"] = round(len(data) / (1024 * 1024), 2)
+    try:
+        if os.path.isdir(CHROMA_DIR):
+            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            info["tar_members"] = tar.getnames()[:10]
+            tar.extractall(path=DATA_DIR)
+        info["extracted"] = os.path.isdir(CHROMA_DIR)
+        # 풀린 파일 목록·sqlite 크기
+        for root, dirs, files in os.walk(CHROMA_DIR):
+            for f in files:
+                fp = os.path.join(root, f)
+                rel = os.path.relpath(fp, CHROMA_DIR)
+                info["files"].append(rel)
+                if f == "chroma.sqlite3":
+                    info["sqlite_mb"] = round(os.path.getsize(fp) / (1024 * 1024), 2)
+        info["files"] = info["files"][:15]
+    except Exception as e:
+        info["error"] = str(e)
+    return info
+
+
 # ==========================================
 # 6. 회원 레지스트리 (R2 백업)
 # ==========================================
@@ -947,11 +977,24 @@ def _get_llm():
 
 
 def _get_collection():
-    return _get_chroma_client().get_or_create_collection(
-        name=_COLLECTION_NAME,
-        embedding_function=_get_embedding_fn(),
-        metadata={"hnsw:space": "cosine"},
-    )
+    """
+    기존 컬렉션이 있으면 그대로 열고(메타 충돌 회피), 없으면 생성.
+    복원된 DB의 컬렉션을 metadata 충돌 없이 안전하게 인식.
+    """
+    client = _get_chroma_client()
+    try:
+        # 기존 컬렉션 우선 — 임베딩 함수만 연결, metadata는 재지정하지 않음
+        return client.get_collection(
+            name=_COLLECTION_NAME,
+            embedding_function=_get_embedding_fn(),
+        )
+    except Exception:
+        # 없으면 새로 생성
+        return client.get_or_create_collection(
+            name=_COLLECTION_NAME,
+            embedding_function=_get_embedding_fn(),
+            metadata={"hnsw:space": "cosine"},
+        )
 
 
 def reset_collection():
@@ -1605,26 +1648,32 @@ def search_patents(
 # 14. 메인 포털
 # ==========================================
 def run_main_portal():
-    client, collection, llm = load_permanent_infra_singleton()
-
-    # ── 세션 최초 진입: R2 → 로컬 복원 (매일 슬립 대비, egress 무료) ──
+    # ── 세션 최초 진입: 인프라 초기화 전에 R2 복원 먼저 ──
+    # (빈 컬렉션이 디스크에 먼저 생기는 것을 방지)
     if not st.session_state.restored:
         download_logo_from_r2()
-        if safe_count(collection) == 0:
+        # 로컬에 chroma_db가 없을 때만 복원 (있으면 그대로 사용)
+        local_empty = not os.path.isdir(CHROMA_DIR) or not os.listdir(CHROMA_DIR)
+        if local_empty:
             with st.spinner("🔄 R2에서 벡터 DB 복원 중... (egress 무료)"):
-                if restore_chroma_from_r2():
-                    # 복원 후 캐시된 client 무효화하여 새 디렉토리 인식
-                    _get_chroma_client.clear()
-                    client = _get_chroma_client()
-                    collection = client.get_or_create_collection(
-                        name=_COLLECTION_NAME,
-                        embedding_function=_get_embedding_fn(),
-                        metadata={"hnsw:space": "cosine"},
-                    )
-                    n = safe_count(collection)
+                restored_ok = restore_chroma_from_r2()
+            # 복원 후 모든 캐시 초기화 (이전에 만들어진 빈 클라이언트 제거)
+            try:
+                _get_chroma_client.clear()
+                _get_embedding_fn.clear()
+            except Exception:
+                pass
+            st.session_state.infra_initialized = False
+            if restored_ok:
+                try:
+                    n = _get_collection().count()
                     if n > 0:
                         st.toast(f"✅ R2에서 벡터 DB 복원 완료 ({n}건)")
+                except Exception as e:
+                    print(f"[복원 후 카운트 오류] {e}")
         st.session_state.restored = True
+
+    client, collection, llm = load_permanent_infra_singleton()
 
     is_admin = st.session_state.is_admin
 
@@ -1687,27 +1736,55 @@ def run_main_portal():
 
             # R2 → 로컬 강제 복원 (상세 진단)
             if st.button("🔄 R2에서 벡터 DB 강제 복원", use_container_width=True):
-                with st.spinner("R2 → 로컬 복원 중..."):
-                    raw = r2_download_bytes(R2_SNAPSHOT_KEY)
-                    if raw is None:
+                with st.spinner("R2 → 로컬 복원 + 진단 중..."):
+                    info = restore_chroma_from_r2_verbose()
+
+                if info["error"]:
+                    st.error(f"❌ 복원 실패: {info['error']}")
+                elif not info["extracted"]:
+                    st.error("❌ 압축 해제 후 chroma_db 디렉토리가 생성되지 않았습니다.")
+                else:
+                    # 캐시 완전 초기화 후 컬렉션 새로 읽기
+                    try:
+                        _get_chroma_client.clear()
+                        _get_embedding_fn.clear()
+                    except Exception:
+                        pass
+                    st.session_state.infra_initialized = False
+                    st.session_state.restored = True
+
+                    # 컬렉션 직접 카운트
+                    try:
+                        new_col = _get_collection()
+                        n = new_col.count()
+                    except Exception as e:
+                        n = -1
+                        st.error(f"컬렉션 읽기 오류: {e}")
+
+                    st.info(
+                        f"📦 **복원 진단**\n\n"
+                        f"- 다운로드: {info['downloaded_mb']} MB\n"
+                        f"- 압축 해제: {'성공' if info['extracted'] else '실패'}\n"
+                        f"- chroma.sqlite3 크기: {info['sqlite_mb']} MB\n"
+                        f"- 풀린 파일 수: {len(info['files'])}개\n"
+                        f"- **로드된 특허 건수: {n}건**"
+                    )
+                    with st.expander("🔍 tar 내부 구조 / 풀린 파일"):
+                        st.write("**tar 멤버:**", info["tar_members"])
+                        st.write("**풀린 파일:**", info["files"])
+
+                    if n > 0:
+                        st.success(f"✅ {n}건 정상 로드. 새로고침하면 반영됩니다.")
+                        st.rerun()
+                    elif info["sqlite_mb"] > 1:
                         st.error(
-                            f"❌ R2에 벡터 스냅샷(`{R2_SNAPSHOT_KEY}`)이 없습니다. "
-                            f"→ '🔍 R2 연결 진단'으로 버킷 내용을 확인하세요. "
-                            f"백업이 안 된 상태이므로 엑셀을 다시 적재해야 합니다."
+                            "⚠️ sqlite 파일은 정상(데이터 있음)인데 0건으로 읽힙니다. "
+                            "→ **임베딩 함수 불일치**일 가능성이 큽니다. "
+                            "GEMINI_API_KEY가 어제와 동일하게 설정돼 있는지 확인하세요. "
+                            "키가 바뀌거나 비면 컬렉션을 못 읽습니다."
                         )
                     else:
-                        ok = restore_chroma_from_r2()
-                        if ok:
-                            _get_chroma_client.clear()
-                            st.session_state.infra_initialized = False
-                            st.session_state.restored = True
-                            n = safe_count(_get_collection())
-                            st.success(
-                                f"✅ 복원 완료 — 스냅샷 {len(raw)/(1024*1024):.1f}MB → {n}건 로드."
-                            )
-                            st.rerun()
-                        else:
-                            st.error("❌ 스냅샷은 받았으나 압축 해제/로드에 실패했습니다. 로그를 확인하세요.")
+                        st.warning("sqlite가 비어 있습니다 — 백업 시점에 데이터가 없었을 수 있습니다.")
 
             st.divider()
 
