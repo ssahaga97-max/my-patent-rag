@@ -669,6 +669,82 @@ def restore_chroma_from_r2_verbose() -> dict:
     return info
 
 
+def recover_from_sqlite_directly(collection) -> tuple:
+    """
+    chromadb 버전 불일치로 컬렉션이 0건일 때 최후 복구.
+    복원된 chroma.sqlite3에서 문서·메타데이터를 직접 SELECT하여
+    현재 버전·현재 임베딩 함수로 재적재(재임베딩)한다.
+
+    반환: (복구건수, 메시지)
+    """
+    import sqlite3
+
+    sqlite_path = os.path.join(CHROMA_DIR, "chroma.sqlite3")
+    if not os.path.exists(sqlite_path):
+        return 0, "chroma.sqlite3 파일이 없습니다."
+
+    try:
+        conn = sqlite3.connect(sqlite_path)
+        cur = conn.cursor()
+
+        # 0.5.x 스키마: embedding_metadata(id, key, string_value, ...) + embeddings(embedding_id, id...)
+        # 문서 본문은 embedding_metadata에서 key='chroma:document' 로 저장됨
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {r[0] for r in cur.fetchall()}
+        if "embedding_metadata" not in tables:
+            conn.close()
+            return 0, f"예상한 테이블 구조가 아닙니다. 발견된 테이블: {sorted(tables)[:8]}"
+
+        # 각 embedding의 메타데이터를 key-value로 모음
+        cur.execute("SELECT id, key, string_value FROM embedding_metadata")
+        rows = cur.fetchall()
+        conn.close()
+
+        records: dict = {}
+        for emb_id, key, sval in rows:
+            if emb_id not in records:
+                records[emb_id] = {}
+            if sval is not None:
+                records[emb_id][key] = sval
+
+        if not records:
+            return 0, "sqlite에 메타데이터 레코드가 없습니다."
+
+        # 재적재 배치 구성
+        ids, docs, metas = [], [], []
+        for emb_id, kv in records.items():
+            doc = kv.get("chroma:document", "")
+            pat_id = kv.get("출원번호", "")
+            cid = _normalize_patent_id(pat_id) if pat_id else ""
+            if not cid:
+                continue
+            meta = {
+                "출원번호": kv.get("출원번호", ""),
+                "명칭": kv.get("명칭", "정보없음"),
+                "출원일": kv.get("출원일", "없음"),
+                "등록일": kv.get("등록일", "없음"),
+                "IPC": kv.get("IPC", "없음"),
+                "CPC": kv.get("CPC", "없음"),
+                "발명자": kv.get("발명자", "없음"),
+                "출원인": kv.get("출원인", "없음"),
+                "대표출원인": kv.get("대표출원인", "") or _canonical_applicants_for_meta(kv.get("출원인", "")),
+                "URL": kv.get("URL", ""),
+            }
+            ids.append(cid)
+            docs.append(doc if doc else f"특허명칭: {meta['명칭']}")
+            metas.append(meta)
+
+        if not ids:
+            return 0, "복구 가능한 출원번호가 없습니다."
+
+        # 현재 임베딩 함수로 재적재 (재임베딩)
+        _upsert_patent_batches(collection, ids, docs, metas, batch_size=50)
+        return len(ids), f"{len(ids)}건을 sqlite에서 직접 읽어 재임베딩·복구했습니다."
+
+    except Exception as e:
+        return 0, f"sqlite 직접 복구 오류: {e}"
+
+
 # ==========================================
 # 6. 회원 레지스트리 (R2 백업)
 # ==========================================
@@ -1778,11 +1854,27 @@ def run_main_portal():
                         st.rerun()
                     elif info["sqlite_mb"] > 1:
                         st.error(
-                            "⚠️ sqlite 파일은 정상(데이터 있음)인데 0건으로 읽힙니다. "
-                            "→ **임베딩 함수 불일치**일 가능성이 큽니다. "
-                            "GEMINI_API_KEY가 어제와 동일하게 설정돼 있는지 확인하세요. "
-                            "키가 바뀌거나 비면 컬렉션을 못 읽습니다."
+                            "⚠️ sqlite에 데이터는 있는데 0건으로 읽힙니다 "
+                            "(chromadb 버전 불일치 가능성). "
+                            "→ **sqlite에서 직접 복구**를 시도합니다."
                         )
+                        with st.spinner("🛠 sqlite에서 직접 읽어 재임베딩 복구 중... (시간이 걸릴 수 있음)"):
+                            try:
+                                col2 = _get_collection()
+                                rec_n, rec_msg = recover_from_sqlite_directly(col2)
+                            except Exception as e:
+                                rec_n, rec_msg = 0, str(e)
+                        if rec_n > 0:
+                            with st.spinner("💾 복구분 R2 재백업 중..."):
+                                backup_chroma_to_r2()
+                            st.success(f"✅ {rec_msg} R2 재백업 완료. 새로고침하면 반영됩니다.")
+                            st.rerun()
+                        else:
+                            st.error(
+                                f"❌ sqlite 직접 복구 실패: {rec_msg}\n\n"
+                                "→ requirements.txt에 `chromadb==0.5.23`이 적용됐는지 확인하고, "
+                                "그래도 안 되면 원본 엑셀을 다시 적재해야 합니다."
+                            )
                     else:
                         st.warning("sqlite가 비어 있습니다 — 백업 시점에 데이터가 없었을 수 있습니다.")
 
