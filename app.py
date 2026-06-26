@@ -89,7 +89,6 @@ def _init_session():
 _init_session()
 
 _REGISTRY_REFRESH_TTL_SEC = 30
-_APPLICANT_IDS_CACHE_KEY = "_applicant_ids_cache"
 
 
 # ==========================================
@@ -591,6 +590,21 @@ def diagnose_r2() -> dict:
     except Exception as e:
         result["error"] = f"R2 버킷 접근 실패: {e}"
     return result
+
+
+def list_r2_objects() -> list:
+    """
+    R2 버킷의 객체 목록 반환 [(key, size_bytes), ...].
+    스냅샷이 실제로 존재하는지/용량은 얼마인지 진단용.
+    """
+    if not _r2_configured():
+        return []
+    try:
+        resp = _get_r2_client().list_objects_v2(Bucket=_r2_bucket())
+        return [(o["Key"], o["Size"]) for o in resp.get("Contents", [])]
+    except Exception as e:
+        print(f"[R2 목록 조회 실패] {e}")
+        return []
 
 
 # ── ChromaDB 디렉토리 ↔ R2 (tar.gz 통째 백업/복원) ──
@@ -1394,16 +1408,20 @@ def process_and_update_db(uploaded_file, collection):
         try:
             _upsert_patent_batches(collection, ids, docs, metas)
             ingested = len(ids)
-            _invalidate_applicant_search_cache()
         except Exception as e:
             st.error(f"ChromaDB 적재 실패 — 백업하지 않았습니다: {e}")
             return 0, dup_in_file, already_indexed, skipped_empty, False
 
-    # 적재 → 즉시 R2 백업 (트랜잭션처럼 묶음)
+    # 적재 → 즉시 R2 백업 (트랜잭션처럼 묶음, 실패 시 2회 재시도)
     backup_ok = False
     if ingested:
         with st.spinner("💾 R2에 벡터 DB 백업 중... (재시작 후에도 데이터 보존)"):
-            backup_ok = backup_chroma_to_r2()
+            for attempt in range(3):
+                backup_ok = backup_chroma_to_r2()
+                if backup_ok:
+                    break
+                if attempt < 2:
+                    time.sleep(2)
 
     return ingested, dup_in_file, already_indexed, skipped_empty, backup_ok
 
@@ -1496,63 +1514,6 @@ def _applicant_options_cached(chroma_n: int, collection_id: str) -> list:
         return []
 
 
-def _invalidate_applicant_search_cache() -> None:
-    """출원인 ID·드롭다운 캐시 무효화 (적재·마이그레이션 직후)."""
-    st.session_state.pop(_APPLICANT_IDS_CACHE_KEY, None)
-    _applicant_options_cached.clear()
-
-
-def _meta_representative_applicants(meta: dict) -> set[str]:
-    rep = str((meta or {}).get("대표출원인", "")) or _canonical_applicants_for_meta(
-        (meta or {}).get("출원인", "")
-    )
-    return {r.strip() for r in rep.split("|") if r.strip()}
-
-
-def _meta_matches_applicant(meta: dict, applicant_filter: str) -> bool:
-    if not applicant_filter:
-        return True
-    return applicant_filter in _meta_representative_applicants(meta)
-
-
-def _get_ids_for_applicant(collection, applicant_filter: str) -> list[str]:
-    """대표출원인 일치 document id 목록 (세션 캐시 — chroma_n·출원인 키)."""
-    chroma_n = safe_count(collection)
-    cache = st.session_state.setdefault(_APPLICANT_IDS_CACHE_KEY, {})
-    cache_key = (chroma_n, applicant_filter)
-    if cache_key in cache:
-        return cache[cache_key]
-    try:
-        data = collection.get(include=["metadatas"])
-        matched = [
-            cid
-            for cid, meta in zip(data.get("ids", []), data.get("metadatas", []))
-            if _meta_matches_applicant(meta, applicant_filter)
-        ]
-        cache[cache_key] = matched
-        return matched
-    except Exception as e:
-        print(f"[출원인 ID 선필터 오류] {e}")
-        return []
-
-
-def _tech_search_query(query: str, applicant_filter: str) -> str:
-    """출원인 드롭다운 지정 시 임베딩 질의에서 출원인 노이즈 제거."""
-    q = query.strip()
-    if not applicant_filter or not q:
-        return q
-    for pat in (
-        r"출원인\s*[:：]?\s*",
-        r"권리자\s*[:：]?\s*",
-        r"등록권자\s*[:：]?\s*",
-    ):
-        q = re.sub(pat, "", q, flags=re.IGNORECASE)
-    if applicant_filter in q:
-        q = q.replace(applicant_filter, " ")
-    q = re.sub(r"\s+", " ", q).strip()
-    return q or query.strip()
-
-
 def _extract_keywords(query: str) -> list:
     """질의에서 키워드 가산용 토큰 추출 (2자 이상 한글/영문 단어)."""
     tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", query)
@@ -1591,65 +1552,50 @@ def search_patents(
     keyword_boost: bool = True,
 ):
     """
-    시맨틱 검색 + (선택)출원인 선필터 + 키워드 우선 재순위.
+    시맨틱 검색 + (선택)출원인 필터 + 키워드 우선 재순위.
 
-    · applicant_filter: 대표출원인명. 지정 시 해당 ID 집합 안에서만 query.
+    · applicant_filter: 대표출원인명. 지정 시 해당 출원인 특허만.
     · keyword_boost: 질의 키워드가 명칭/본문에 포함된 특허를 상위로 재정렬.
 
     반환: (docs, metas) — n_results 건.
     """
-    query = (query or "").strip()
-    if not query:
-        return [], []
+    # 출원인 필터 시 후보를 넉넉히 가져와 필터 후에도 n건 확보
+    over_fetch = n_results * 6 if applicant_filter else max(n_results * 3, n_results)
+    over_fetch = min(over_fetch, max(collection.count(), 1))
 
-    tech_query = _tech_search_query(query, applicant_filter)
-    keywords = _extract_keywords(tech_query) if keyword_boost else []
-
-    candidate_ids: list[str] | None = None
-    if applicant_filter:
-        candidate_ids = _get_ids_for_applicant(collection, applicant_filter)
-        if not candidate_ids:
-            return [], []
-
-    if candidate_ids is not None:
-        over_fetch = min(
-            max(n_results * 3, n_results) if keyword_boost else n_results,
-            len(candidate_ids),
-        )
-        res = collection.query(
-            query_texts=[tech_query],
-            n_results=over_fetch,
-            ids=candidate_ids,
-        )
-    else:
-        over_fetch = min(
-            max(n_results * 3, n_results),
-            max(collection.count(), 1),
-        )
-        res = collection.query(query_texts=[tech_query], n_results=over_fetch)
-
+    res = collection.query(query_texts=[query], n_results=over_fetch)
     if not (res and res["documents"] and res["documents"][0]):
         return [], []
 
     docs = res["documents"][0]
     metas = res["metadatas"][0]
     dists = res.get("distances", [[None] * len(docs)])[0]
-    triples = list(zip(docs, metas, dists))
 
+    # 1) 출원인 필터 (대표출원인 부분일치 — '|' 결합 대응)
     if applicant_filter:
-        triples = [t for t in triples if _meta_matches_applicant(t[1], applicant_filter)]
+        keep = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            rep = str(meta.get("대표출원인", "")) or _canonical_applicants_for_meta(meta.get("출원인", ""))
+            reps = {r.strip() for r in rep.split("|")}
+            if applicant_filter in reps:
+                keep.append((doc, meta, dist))
+        triples = keep
+    else:
+        triples = list(zip(docs, metas, dists))
 
     if not triples:
         return [], []
 
-    if keyword_boost and keywords:
-        def _rank_key(t):
-            doc, meta, dist = t
-            kw = _keyword_score(doc, meta, keywords)
-            d = dist if dist is not None else 1.0
-            return (-kw, d)
-
-        triples.sort(key=_rank_key)
+    # 2) 키워드 우선 재순위 (키워드 점수 desc, 그다음 거리 asc)
+    if keyword_boost:
+        keywords = _extract_keywords(query)
+        if keywords:
+            def _rank_key(t):
+                doc, meta, dist = t
+                kw = _keyword_score(doc, meta, keywords)
+                d = dist if dist is not None else 1.0
+                return (-kw, d)
+            triples.sort(key=_rank_key)
 
     triples = triples[:n_results]
     return [t[0] for t in triples], [t[1] for t in triples]
@@ -1708,27 +1654,60 @@ def run_main_portal():
         if is_admin:
             st.header("📂 데이터 관리 센터")
 
-            # R2 연결 진단
+            # R2 연결 진단 (버킷 객체 목록 포함)
             if st.button("🔍 R2 연결 진단", use_container_width=True):
                 with st.spinner("진단 중..."):
                     diag = diagnose_r2()
+                    objs = list_r2_objects() if diag["reachable"] else []
                 if diag["reachable"]:
                     st.success(f"✅ R2 연결 정상\n\n- 버킷: `{diag['bucket']}`")
+                    if objs:
+                        st.markdown("**📦 버킷 내 파일 목록:**")
+                        snapshot_found = False
+                        for key, size in objs:
+                            mb = size / (1024 * 1024)
+                            flag = ""
+                            if key == R2_SNAPSHOT_KEY:
+                                snapshot_found = True
+                                flag = " ← 벡터 스냅샷"
+                            st.markdown(f"- `{key}` ({mb:.2f} MB){flag}")
+                        if not snapshot_found:
+                            st.error(
+                                f"⚠️ 벡터 스냅샷(`{R2_SNAPSHOT_KEY}`)이 버킷에 **없습니다**. "
+                                f"→ 어제 적재 후 R2 백업이 실패했을 가능성이 큽니다. "
+                                f"엑셀을 다시 적재하거나, 로컬에 데이터가 남아 있으면 '💾 R2 백업 재시도'를 누르세요."
+                            )
+                    else:
+                        st.error(
+                            "⚠️ 버킷이 **비어 있습니다**. 벡터 스냅샷이 한 번도 저장되지 않았습니다. "
+                            "→ 엑셀을 다시 적재하면 적재 직후 자동 백업됩니다."
+                        )
                 else:
                     st.error(f"❌ 연결 실패\n\n{diag['error']}")
 
-            # R2 → 로컬 강제 복원
+            # R2 → 로컬 강제 복원 (상세 진단)
             if st.button("🔄 R2에서 벡터 DB 강제 복원", use_container_width=True):
                 with st.spinner("R2 → 로컬 복원 중..."):
-                    ok = restore_chroma_from_r2()
-                if ok:
-                    _get_chroma_client.clear()
-                    st.session_state.infra_initialized = False
-                    st.session_state.restored = True
-                    st.toast("✅ 복원 완료 — 최신 벡터 DB가 로드됩니다.")
-                    st.rerun()
-                else:
-                    st.warning("⚠️ R2에 백업이 없거나 복원에 실패했습니다.")
+                    raw = r2_download_bytes(R2_SNAPSHOT_KEY)
+                    if raw is None:
+                        st.error(
+                            f"❌ R2에 벡터 스냅샷(`{R2_SNAPSHOT_KEY}`)이 없습니다. "
+                            f"→ '🔍 R2 연결 진단'으로 버킷 내용을 확인하세요. "
+                            f"백업이 안 된 상태이므로 엑셀을 다시 적재해야 합니다."
+                        )
+                    else:
+                        ok = restore_chroma_from_r2()
+                        if ok:
+                            _get_chroma_client.clear()
+                            st.session_state.infra_initialized = False
+                            st.session_state.restored = True
+                            n = safe_count(_get_collection())
+                            st.success(
+                                f"✅ 복원 완료 — 스냅샷 {len(raw)/(1024*1024):.1f}MB → {n}건 로드."
+                            )
+                            st.rerun()
+                        else:
+                            st.error("❌ 스냅샷은 받았으나 압축 해제/로드에 실패했습니다. 로그를 확인하세요.")
 
             st.divider()
 
@@ -1797,7 +1776,7 @@ def run_main_portal():
                 with st.spinner("대표출원인 메타 갱신 중... (재임베딩 없음)"):
                     n_upd = migrate_add_representative_applicant(collection)
                     backup_chroma_to_r2()
-                _invalidate_applicant_search_cache()
+                _applicant_options_cached.clear()
                 st.success(f"✅ {n_upd}건 대표출원인 갱신 + R2 백업 완료. 출원인 드롭다운에 반영됩니다.")
                 st.rerun()
 
@@ -1825,7 +1804,6 @@ def run_main_portal():
                 with st.spinner("⏳ 벡터 DB 완전 초기화 중..."):
                     try:
                         reset_collection()
-                        _invalidate_applicant_search_cache()
                         if also_clear_r2:
                             r2_delete(R2_SNAPSHOT_KEY)
                         st.session_state["_last_chroma_count"] = 0
@@ -2094,11 +2072,7 @@ def run_main_portal():
                         st.stop()
 
                     if applicant_filter:
-                        pool_n = len(_get_ids_for_applicant(collection, applicant_filter))
-                        st.info(
-                            f"🏢 '{applicant_filter}' 출원인 **{pool_n}건** 중 "
-                            f"관련도 상위 **{len(retrieved_docs)}건**을 조사했습니다."
-                        )
+                        st.info(f"🏢 '{applicant_filter}' 출원인으로 한정해 {len(retrieved_docs)}건을 조사했습니다.")
 
                     if "💡 단순 키워드" in analysis_mode:
                         system_prompt = (
