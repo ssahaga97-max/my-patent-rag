@@ -8,10 +8,10 @@ import io
 import re
 import json
 import time
-import base64
 import hashlib
 import hmac
 import shutil
+import sqlite3
 import tarfile
 import smtplib
 import chromadb
@@ -624,23 +624,14 @@ def backup_chroma_to_r2() -> bool:
 
 
 def restore_chroma_from_r2() -> bool:
-    """R2의 tar.gz를 받아 CHROMA_DIR로 복원. 성공 시 True."""
-    data = r2_download_bytes(R2_SNAPSHOT_KEY)
-    if not data:
-        return False
-    try:
-        if os.path.isdir(CHROMA_DIR):
-            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            tar.extractall(path=DATA_DIR)
-        return os.path.isdir(CHROMA_DIR)
-    except Exception as e:
-        print(f"[Chroma 복원 실패] {e}")
-        return False
+    """R2의 tar.gz를 받아 CHROMA_DIR로 복원. 성공 시 True.
+    (상세 진단이 필요하면 restore_chroma_from_r2_verbose 사용)"""
+    info = restore_chroma_from_r2_verbose()
+    return bool(info["extracted"]) and not info["error"]
 
 
 def restore_chroma_from_r2_verbose() -> dict:
-    """복원 + 상세 진단 정보 반환 (디버깅용)."""
+    """복원 + 상세 진단 정보 반환. 복원의 단일 진입점."""
     info = {"downloaded_mb": 0, "extracted": False, "files": [], "sqlite_mb": 0,
             "tar_members": [], "error": ""}
     data = r2_download_bytes(R2_SNAPSHOT_KEY)
@@ -677,8 +668,6 @@ def recover_from_sqlite_directly(collection) -> tuple:
 
     반환: (복구건수, 메시지)
     """
-    import sqlite3
-
     sqlite_path = os.path.join(CHROMA_DIR, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
         return 0, "chroma.sqlite3 파일이 없습니다."
