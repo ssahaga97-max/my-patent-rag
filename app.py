@@ -984,19 +984,36 @@ class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
         genai.configure(api_key=api_key)
         self._model = model
 
-    def _embed_one(self, text: str, task_type: str):
+    def _embed_one(self, text: str, task_type: str, *, max_retries: int = 5):
         text = (text or "").strip() or " "
         # 2048토큰 ≈ 한글 수천 자. 청구항 포함 대비 여유 있게 12000자까지 허용
         if len(text) > 12000:
             text = text[:12000]
-        try:
-            resp = genai.embed_content(
-                model=self._model, content=text, task_type=task_type,
-            )
-            return resp["embedding"]
-        except Exception as e:
-            print(f"[Gemini 임베딩 오류/{task_type}] {e}")
-            return [0.0] * _EMBED_DIM
+        delay = 2.0
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                resp = genai.embed_content(
+                    model=self._model, content=text, task_type=task_type,
+                )
+                return resp["embedding"]
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                # 429/rate limit/quota → 지수 백오프 후 재시도
+                if any(k in msg for k in ("429", "rate", "quota", "resource", "exhaust")):
+                    if attempt < max_retries - 1:
+                        time.sleep(delay)
+                        delay = min(delay * 2, 30)  # 2→4→8→16→30초
+                        continue
+                # 그 외 오류는 짧게 한 번만 재시도
+                if attempt < 1:
+                    time.sleep(1.0)
+                    continue
+                break
+        print(f"[Gemini 임베딩 최종 실패/{task_type}] {last_err}")
+        # 재시도 다 소진 → 0벡터 (검색에서 제외됨, 나중에 재임베딩 대상)
+        return [0.0] * _EMBED_DIM
 
     def __call__(self, input):
         """문서 저장용 — retrieval_document."""
@@ -1634,7 +1651,17 @@ def reembed_zero_vector_patents(collection, batch_size: int = 50) -> tuple:
             return 0, len(ids)
 
         # upsert로 재임베딩 (컬렉션 임베딩 함수가 retrieval_document로 재생성)
-        _upsert_patent_batches(collection, zero_ids, zero_docs, zero_metas, batch_size=batch_size)
+        # 배치 간 짧은 대기로 rate limit(429) 회피
+        for i in range(0, len(zero_ids), batch_size):
+            _upsert_patent_batches(
+                collection,
+                zero_ids[i:i + batch_size],
+                zero_docs[i:i + batch_size],
+                zero_metas[i:i + batch_size],
+                batch_size=batch_size,
+            )
+            if i + batch_size < len(zero_ids):
+                time.sleep(1.0)
         return len(zero_ids), len(ids)
     except Exception as e:
         print(f"[0벡터 재임베딩 오류] {e}")
