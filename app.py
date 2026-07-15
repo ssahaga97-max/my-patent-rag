@@ -1651,23 +1651,24 @@ def count_zero_vector_patents(collection) -> tuple:
 
 
 def reembed_zero_vector_patents(collection, batch_size: int = 50, max_process: int = 300,
-                                progress_cb=None) -> tuple:
+                                progress_cb=None, sleep_between: float = 0.0) -> tuple:
     """
-    0벡터 특허를 찾아 재임베딩. 이번 호출에서 최대 max_process건만 처리
-    (Streamlit ~20분 WebSocket 타임아웃 회피 — 여러 번 나눠 실행).
-    반환: (이번에 처리한 건수, 남은 0벡터 건수, 전체 건수)
+    0벡터 특허를 찾아 재임베딩. 이번 호출에서 최대 max_process건 처리.
+    각 건을 직접 임베딩→검증 후 저장. rate limit(429) 감지 시 우아하게 중단.
+    반환: (성공 건수, 남은 0벡터 건수, 상태문자열)
+      상태: "ok"(정상 완료), "rate_limited"(한도 도달로 중단), "no_gemini"(폴백), "error"
     """
     try:
         total = collection.count()
         if total == 0:
-            return 0, 0, 0
+            return 0, 0, "ok"
         data = collection.get(include=["documents", "metadatas", "embeddings"])
         ids = data.get("ids", [])
         docs = data.get("documents", [])
         metas = data.get("metadatas", [])
         embs = data.get("embeddings", None)
         if embs is None:
-            return 0, 0, len(ids)
+            return 0, 0, "error"
 
         zero_ids, zero_docs, zero_metas = [], [], []
         for cid, doc, meta, emb in zip(ids, docs, metas, embs):
@@ -1678,30 +1679,69 @@ def reembed_zero_vector_patents(collection, batch_size: int = 50, max_process: i
 
         total_zero = len(zero_ids)
         if total_zero == 0:
-            return 0, 0, len(ids)
+            return 0, 0, "ok"
 
-        # 이번 호출에서 처리할 만큼만 자름
+        fn = _get_embedding_fn()
+        is_gemini = isinstance(fn, GeminiEmbeddingFunction)
+
         proc_ids = zero_ids[:max_process]
         proc_docs = zero_docs[:max_process]
         proc_metas = zero_metas[:max_process]
 
         done = 0
-        for i in range(0, len(proc_ids), batch_size):
-            _upsert_patent_batches(
-                collection,
-                proc_ids[i:i + batch_size],
-                proc_docs[i:i + batch_size],
-                proc_metas[i:i + batch_size],
-                batch_size=batch_size,
-            )
-            done += len(proc_ids[i:i + batch_size])
+        status = "ok"
+        buf_ids, buf_docs, buf_metas, buf_embs = [], [], [], []
+
+        def _flush():
+            if buf_ids:
+                collection.update(ids=list(buf_ids), documents=list(buf_docs),
+                                  metadatas=list(buf_metas), embeddings=list(buf_embs))
+                buf_ids.clear(); buf_docs.clear(); buf_metas.clear(); buf_embs.clear()
+
+        for idx, (cid, doc, meta) in enumerate(zip(proc_ids, proc_docs, proc_metas)):
+            if is_gemini:
+                # 직접 임베딩(재시도 없이 1회) → rate limit 즉시 감지
+                try:
+                    import google.generativeai as _g
+                    resp = _g.embed_content(
+                        model="models/gemini-embedding-001", content=(doc or " ")[:12000],
+                        task_type="retrieval_document", output_dimensionality=_EMBED_DIM,
+                    )
+                    vec = resp["embedding"]
+                    nrm = sum(x * x for x in vec) ** 0.5
+                    if nrm > 0:
+                        vec = [x / nrm for x in vec]
+                    if sum(1 for x in vec if abs(x) > 1e-9) == 0:
+                        raise RuntimeError("zero vector returned")
+                except Exception as e:
+                    msg = str(e).lower()
+                    if any(k in msg for k in ("429", "rate", "quota", "resource", "exhaust")):
+                        status = "rate_limited"
+                        break
+                    # 그 외 오류는 이 건만 건너뜀
+                    continue
+            else:
+                vec = fn([doc or " "])[0]
+                if sum(1 for x in vec if abs(x) > 1e-9) == 0:
+                    continue
+
+            buf_ids.append(cid); buf_docs.append(doc)
+            buf_metas.append(meta); buf_embs.append(vec)
+            done += 1
+
+            if len(buf_ids) >= batch_size:
+                _flush()
             if progress_cb:
                 progress_cb(done, len(proc_ids))
-            if i + batch_size < len(proc_ids):
-                time.sleep(1.0)
+            if sleep_between > 0:
+                time.sleep(sleep_between)
 
+        _flush()
         remaining = total_zero - done
-        return done, remaining, len(ids)
+        return done, remaining, status
+    except Exception as e:
+        print(f"[0벡터 재임베딩 오류] {e}")
+        return 0, -1, "error"
     except Exception as e:
         print(f"[0벡터 재임베딩 오류] {e}")
         return 0, -1, 0
@@ -2312,9 +2352,9 @@ def run_main_portal():
                     else:
                         st.warning(f"⚠️ 0벡터 특허 **{zn}건** / 전체 {tn}건. 아래 재임베딩을 실행하세요.")
             with col_fix:
-                chunk = st.number_input("한 번에 처리할 건수", min_value=100, max_value=1000,
-                                        value=400, step=100,
-                                        help="20분 타임아웃 내에 끝날 만큼. 400~500 권장.")
+                chunk = st.number_input("한 번에 처리할 건수", min_value=50, max_value=1000,
+                                        value=300, step=50,
+                                        help="rate limit 도달 시 자동 중단됩니다. 300 권장.")
                 if st.button("🔧 0벡터 재임베딩", use_container_width=True):
                     prog = st.progress(0.0, text="재임베딩 준비 중...")
 
@@ -2322,7 +2362,7 @@ def run_main_portal():
                         prog.progress(min(done / max(tot, 1), 1.0),
                                       text=f"재임베딩 {done}/{tot}건...")
 
-                    done, remaining, tn = reembed_zero_vector_patents(
+                    done, remaining, status = reembed_zero_vector_patents(
                         collection, max_process=int(chunk), progress_cb=_cb
                     )
                     prog.empty()
@@ -2330,16 +2370,25 @@ def run_main_portal():
                         with st.spinner("💾 R2 백업 중..."):
                             backup_chroma_to_r2()
                         _applicant_options_cached.clear()
-                        if remaining > 0:
-                            st.warning(
-                                f"✅ 이번에 {done}건 재임베딩 완료. "
-                                f"**아직 {remaining}건 남음** → 버튼을 다시 눌러 계속하세요."
-                            )
-                        else:
-                            st.success(f"🎉 {done}건 재임베딩 완료. 0벡터 특허가 모두 복구됐습니다!")
-                        st.rerun()
-                    elif remaining == -1:
+
+                    if status == "rate_limited":
+                        st.warning(
+                            f"⏸ 이번에 **{done}건** 완료 후 Gemini rate limit에 도달해 멈췄습니다. "
+                            f"(남은 {remaining}건)\n\n"
+                            f"- **분당 한도(RPM)**면 1~2분 뒤 다시 누르면 이어집니다.\n"
+                            f"- **일일 한도(RPD)**면 태평양시 자정(한국 오후 4~5시) 이후 재개됩니다.\n"
+                            f"진행분은 R2에 저장됐으니 언제 다시 눌러도 이어서 됩니다."
+                        )
+                    elif status == "error":
                         st.error("재임베딩 중 오류. 로그를 확인하세요.")
+                    elif remaining > 0:
+                        st.success(
+                            f"✅ 이번에 {done}건 완료. 남은 {remaining}건 → 버튼을 다시 누르세요."
+                        )
+                        st.rerun()
+                    elif done > 0:
+                        st.success(f"🎉 {done}건 완료. 0벡터 특허가 모두 복구됐습니다!")
+                        st.rerun()
                     else:
                         st.info("0벡터 특허가 없습니다. 모두 정상입니다.")
 
