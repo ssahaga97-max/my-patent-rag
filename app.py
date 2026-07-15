@@ -707,6 +707,7 @@ def recover_from_sqlite_directly(collection) -> tuple:
             cid = _normalize_patent_id(pat_id) if pat_id else ""
             if not cid:
                 continue
+            _rep_list = _canonical_applicants_list(kv.get("출원인", ""))
             meta = {
                 "출원번호": kv.get("출원번호", ""),
                 "명칭": kv.get("명칭", "정보없음"),
@@ -716,7 +717,8 @@ def recover_from_sqlite_directly(collection) -> tuple:
                 "CPC": kv.get("CPC", "없음"),
                 "발명자": kv.get("발명자", "없음"),
                 "출원인": kv.get("출원인", "없음"),
-                "대표출원인": kv.get("대표출원인", "") or _canonical_applicants_for_meta(kv.get("출원인", "")),
+                "대표출원인": "|".join(_rep_list),
+                "대표출원인목록": _rep_list,
                 "URL": kv.get("URL", ""),
             }
             ids.append(cid)
@@ -1370,23 +1372,33 @@ def _get_info_cell(row, col) -> str:
 def _canonical_applicants_for_meta(applicant_raw: str) -> str:
     """
     출원인 원본 → 대표명 문자열. 복수 출원인은 '|'로 결합.
-    ChromaDB where 필터에서 $in 또는 부분일치 검색에 사용.
+    (표시·하위호환용. 필터는 _canonical_applicants_list 배열 필드 사용)
+    """
+    lst = _canonical_applicants_list(applicant_raw)
+    return "|".join(lst) if lst else "기타"
+
+
+def _canonical_applicants_list(applicant_raw: str) -> list:
+    """
+    출원인 원본 → 대표명 리스트 (중복 제거).
+    ChromaDB 배열 메타데이터($contains 필터)용. chromadb>=1.5 필요.
     """
     apps = _explode_multi_values(applicant_raw, allow_comma=False)
     if not apps:
         c = _canonical_applicant_name(applicant_raw)
-        return c if c else "기타"
+        return [c] if c else ["기타"]
     canon = []
     for a in apps:
         c = _canonical_applicant_name(a)
         if c and c not in canon:
             canon.append(c)
-    return "|".join(canon) if canon else "기타"
+    return canon if canon else ["기타"]
 
 
 def _build_metadata(row, cols: dict, patent_url: str = "") -> dict:
     title = _get_info_cell(row, cols["title"]) if cols["title"] else "정보없음"
     applicant_raw = _get_cell(row, cols["applicant"])
+    rep_list = _canonical_applicants_list(applicant_raw)
     return {
         "출원번호": str(row[cols["id"]]),
         "명칭": title,
@@ -1396,7 +1408,8 @@ def _build_metadata(row, cols: dict, patent_url: str = "") -> dict:
         "CPC": _get_cell(row, cols["cpc"]),
         "발명자": _get_cell(row, cols["inventor"]),
         "출원인": applicant_raw,
-        "대표출원인": _canonical_applicants_for_meta(applicant_raw),  # 검색 필터용
+        "대표출원인": "|".join(rep_list),          # 표시·하위호환용 문자열
+        "대표출원인목록": rep_list,                 # $contains 필터용 배열 (chromadb>=1.5)
         "URL": patent_url,
     }
 
@@ -1582,9 +1595,12 @@ def migrate_add_representative_applicant(collection, batch_size: int = 200) -> i
         upd_ids, upd_metas = [], []
         for cid, meta in zip(ids, metas):
             meta = dict(meta or {})
-            rep = _canonical_applicants_for_meta(meta.get("출원인", ""))
-            if meta.get("대표출원인") != rep:
-                meta["대표출원인"] = rep
+            rep_list = _canonical_applicants_list(meta.get("출원인", ""))
+            rep_str = "|".join(rep_list)
+            # 문자열 또는 배열 필드가 최신이 아니면 갱신
+            if meta.get("대표출원인") != rep_str or meta.get("대표출원인목록") != rep_list:
+                meta["대표출원인"] = rep_str
+                meta["대표출원인목록"] = rep_list
                 upd_ids.append(cid)
                 upd_metas.append(meta)
 
@@ -1662,24 +1678,20 @@ def search_patents(
     """
     시맨틱 검색 + (선택)출원인 필터 + 키워드 우선 재순위.
 
-    · applicant_filter: 대표출원인명. 지정 시 해당 출원인 특허만.
-    · keyword_boost: 질의 키워드가 명칭/본문에 포함된 특허를 상위로 재정렬.
-
-    출원인 필터 전략(하이브리드):
-      1) ChromaDB where로 DB 레벨에서 해당 출원인만 1차 검색 (단일 대표출원인 매칭)
-      2) '|' 결합(복수 출원인) 케이스를 놓치지 않도록, where 없는 대량 over_fetch
-         결과를 파이썬에서 부분일치 필터하여 병합
+    출원인 필터: chromadb>=1.5의 배열 메타 $contains로 DB 레벨에서 정확히 필터.
+      대표출원인목록 = ["효성", "푸른기술"] 형태이므로, 단독·공동출원 모두 매칭됨.
+      (구버전 데이터로 배열 필드가 없으면 문자열 부분일치로 폴백)
     반환: (docs, metas) — n_results 건.
     """
     total = max(collection.count(), 1)
 
-    def _run_query(where=None, k=None):
+    def _query(where=None, k=None):
         k = min(k or n_results, total)
         try:
+            kwargs = {"query_texts": [query], "n_results": k}
             if where:
-                r = collection.query(query_texts=[query], n_results=k, where=where)
-            else:
-                r = collection.query(query_texts=[query], n_results=k)
+                kwargs["where"] = where
+            r = collection.query(**kwargs)
         except Exception as e:
             print(f"[query 오류] {e}")
             return [], [], []
@@ -1689,37 +1701,30 @@ def search_patents(
         return r["documents"][0], r["metadatas"][0], d
 
     if applicant_filter:
-        seen = set()
-        merged = []  # (doc, meta, dist)
-
-        # 1) where로 단일 대표출원인 정확 매칭 (가장 정확·효율적)
-        docs1, metas1, dists1 = _run_query(
-            where={"대표출원인": applicant_filter}, k=n_results * 4
+        triples = []
+        # 1순위: 배열 메타 $contains (정확·효율, 단독+공동출원 모두 포착)
+        docs, metas, dists = _query(
+            where={"대표출원인목록": {"$contains": applicant_filter}},
+            k=min(n_results * 3, total),
         )
-        for doc, meta, dist in zip(docs1, metas1, dists1):
-            key = meta.get("출원번호", id(meta))
-            if key not in seen:
-                seen.add(key)
-                merged.append((doc, meta, dist))
-
-        # 2) 복수 출원인('|' 결합) 보강 — where 없이 대량 검색 후 부분일치
-        #    효성처럼 특허가 많거나 공동출원이 있는 경우까지 포착
-        over_fetch = min(max(n_results * 20, 200), total)
-        docs2, metas2, dists2 = _run_query(k=over_fetch)
-        for doc, meta, dist in zip(docs2, metas2, dists2):
-            key = meta.get("출원번호", id(meta))
-            if key in seen:
-                continue
-            rep = str(meta.get("대표출원인", "")) or _canonical_applicants_for_meta(meta.get("출원인", ""))
-            reps = {r.strip() for r in rep.split("|")}
-            if applicant_filter in reps:
-                seen.add(key)
-                merged.append((doc, meta, dist))
-
-        triples = merged
+        if docs:
+            triples = list(zip(docs, metas, dists))
+        else:
+            # 폴백: 배열 필드 없는 구버전 데이터 → 대량 fetch 후 문자열 부분일치
+            of = min(max(n_results * 20, 300), total)
+            d2, m2, ds2 = _query(k=of)
+            for doc, meta, dist in zip(d2, m2, ds2):
+                lst = meta.get("대표출원인목록")
+                if isinstance(lst, list):
+                    match = applicant_filter in lst
+                else:
+                    rep = str(meta.get("대표출원인", "")) or _canonical_applicants_for_meta(meta.get("출원인", ""))
+                    match = applicant_filter in {r.strip() for r in rep.split("|")}
+                if match:
+                    triples.append((doc, meta, dist))
     else:
-        over_fetch = min(max(n_results * 3, n_results), total)
-        docs, metas, dists = _run_query(k=over_fetch)
+        of = min(max(n_results * 3, n_results), total)
+        docs, metas, dists = _query(k=of)
         triples = list(zip(docs, metas, dists))
 
     if not triples:
@@ -1736,7 +1741,6 @@ def search_patents(
                 return (-kw, d)
             triples.sort(key=_rank_key)
     else:
-        # 출원인 필터 시 거리순 정렬 (병합으로 순서가 섞였을 수 있음)
         triples.sort(key=lambda t: t[2] if t[2] is not None else 1.0)
 
     triples = triples[:n_results]
@@ -1999,12 +2003,24 @@ def run_main_portal():
                         st.write(f"- 단독 대표출원인 일치: **{exact}건**")
                         st.write(f"- 복수출원인('|') 포함: **{contains}건**")
 
-                        # 2) where 필터 직접 테스트
+                        # 2) $contains 배열 필터 직접 테스트
                         try:
-                            wres = collection.get(where={"대표출원인": diag_name}, limit=5)
-                            st.write(f"- where 필터 매칭(정확): **{len(wres.get('ids', []))}건** (샘플 5건 한정 조회)")
+                            wres = collection.get(
+                                where={"대표출원인목록": {"$contains": diag_name}}, limit=10000
+                            )
+                            n_contains = len(wres.get("ids", []))
+                            st.write(f"- **$contains 배열 필터 매칭: {n_contains}건** ← 실제 검색에 쓰이는 방식")
+                            if n_contains == 0 and contains > 0:
+                                st.warning(
+                                    "⚠️ 문자열엔 있으나 배열 필터가 0건 → **배열 필드가 아직 없습니다**. "
+                                    "'🏷 대표출원인 필드 갱신'을 누르면 배열 필드가 채워집니다."
+                                )
                         except Exception as we:
-                            st.warning(f"where 필터 오류: {we}")
+                            st.warning(
+                                f"$contains 필터 오류: {we}\n\n"
+                                "→ chromadb가 1.5 미만이거나 배열 필드가 없습니다. "
+                                "requirements.txt의 `chromadb==1.5.9` 확인 후 '대표출원인 필드 갱신'을 누르세요."
+                            )
 
                         # 3) 원본 출원인 표기 샘플
                         if raw_samples:
