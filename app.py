@@ -973,7 +973,9 @@ def check_authentication():
 class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
     """
     Google Gemini text-embedding-004 (768차원, 2048토큰 컨텍스트).
-    무료 티어로 호출 (rate limit 내). 로컬 모델 미로딩 → Streamlit RAM 절약.
+    비대칭 임베딩: 문서는 retrieval_document, 질의는 retrieval_query로 인코딩해야
+    검색 정확도가 최적화됨. __call__(문서 저장용)은 document,
+    embed_query(검색용)는 query task_type을 사용.
     """
 
     def __init__(self, api_key: str, model: str = "models/text-embedding-004"):
@@ -982,26 +984,29 @@ class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
         genai.configure(api_key=api_key)
         self._model = model
 
+    def _embed_one(self, text: str, task_type: str):
+        text = (text or "").strip() or " "
+        # 2048토큰 ≈ 한글 수천 자. 청구항 포함 대비 여유 있게 12000자까지 허용
+        if len(text) > 12000:
+            text = text[:12000]
+        try:
+            resp = genai.embed_content(
+                model=self._model, content=text, task_type=task_type,
+            )
+            return resp["embedding"]
+        except Exception as e:
+            print(f"[Gemini 임베딩 오류/{task_type}] {e}")
+            return [0.0] * _EMBED_DIM
+
     def __call__(self, input):
+        """문서 저장용 — retrieval_document."""
         if isinstance(input, str):
             input = [input]
-        out = []
-        for text in input:
-            text = (text or "").strip() or " "
-            # 안전: 너무 긴 입력은 임베딩 컨텍스트(2048토큰≈수천자) 내로 자름
-            if len(text) > 8000:
-                text = text[:8000]
-            try:
-                resp = genai.embed_content(
-                    model=self._model,
-                    content=text,
-                    task_type="retrieval_document",
-                )
-                out.append(resp["embedding"])
-            except Exception as e:
-                print(f"[Gemini 임베딩 오류] {e}")
-                out.append([0.0] * _EMBED_DIM)
-        return out
+        return [self._embed_one(t, "retrieval_document") for t in input]
+
+    def embed_query(self, text: str):
+        """검색 질의용 — retrieval_query (비대칭 검색 정확도 핵심)."""
+        return self._embed_one(text, "retrieval_query")
 
 
 # ==========================================
@@ -1041,6 +1046,22 @@ def _get_llm():
         temperature=0.1,
         max_tokens=GROQ_MAX_OUTPUT_TOKENS,
     )
+
+
+def _embed_query_vector(query: str):
+    """
+    검색 질의를 retrieval_query task_type으로 임베딩.
+    Gemini(비대칭)면 query 전용 벡터를 반환 → query_embeddings로 사용.
+    로컬 모델(대칭)이면 None 반환 → 호출부에서 query_texts 사용.
+    """
+    fn = _get_embedding_fn()
+    if isinstance(fn, GeminiEmbeddingFunction):
+        try:
+            return fn.embed_query(query)
+        except Exception as e:
+            print(f"[질의 임베딩 오류] {e}")
+            return None
+    return None
 
 
 def _get_collection():
@@ -1684,11 +1705,17 @@ def search_patents(
     반환: (docs, metas) — n_results 건.
     """
     total = max(collection.count(), 1)
+    # 질의를 retrieval_query로 임베딩 (비대칭 검색 — 정확도 핵심)
+    q_vec = _embed_query_vector(query)
 
     def _query(where=None, k=None):
         k = min(k or n_results, total)
         try:
-            kwargs = {"query_texts": [query], "n_results": k}
+            kwargs = {"n_results": k}
+            if q_vec is not None:
+                kwargs["query_embeddings"] = [q_vec]
+            else:
+                kwargs["query_texts"] = [query]
             if where:
                 kwargs["where"] = where
             r = collection.query(**kwargs)
@@ -1703,9 +1730,10 @@ def search_patents(
     if applicant_filter:
         triples = []
         # 1순위: 배열 메타 $contains (정확·효율, 단독+공동출원 모두 포착)
+        #  후보를 넉넉히(최소 100, n_results*10) 확보해 정확도 손실 방지
         docs, metas, dists = _query(
             where={"대표출원인목록": {"$contains": applicant_filter}},
-            k=min(n_results * 3, total),
+            k=min(max(n_results * 10, 100), total),
         )
         if docs:
             triples = list(zip(docs, metas, dists))
@@ -2283,10 +2311,12 @@ def run_main_portal():
                             f"\n■ 출원인별 기술 코호트 (필터 범위 전체 — 샘플 10건 아님)\n{cohort_md}\n"
                         )
                     elif not cohort_mode:
-                        sem_results = collection.query(
-                            query_texts=[user_query.strip()],
-                            n_results=min(filtered_count if use_year_filter else total_count, 10),
-                        )
+                        _qv = _embed_query_vector(user_query.strip())
+                        _sk = min(filtered_count if use_year_filter else total_count, 10)
+                        if _qv is not None:
+                            sem_results = collection.query(query_embeddings=[_qv], n_results=_sk)
+                        else:
+                            sem_results = collection.query(query_texts=[user_query.strip()], n_results=_sk)
                         if sem_results and sem_results["documents"][0]:
                             context_text += "\n■ 질의 관련 시맨틱 매칭 상위 특허\n"
                             for i, m in enumerate(sem_results["metadatas"][0]):
