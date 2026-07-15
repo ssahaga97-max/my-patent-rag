@@ -55,7 +55,7 @@ R2_SNAPSHOT_KEY = "chroma_snapshot.tar.gz"
 R2_REGISTRY_KEY = "user_registry.json"
 R2_LOGO_KEY = "atec_logo.png"
 
-_EMBED_DIM = 768                      # Gemini text-embedding-004 = 768
+_EMBED_DIM = 768                      # gemini-embedding-001을 768차원으로 축소 사용
 _COLLECTION_NAME = "competitor_patents"
 
 # ── Groq 무료 한도 (2026-06 기준: llama-3.3-70b-versatile = 12K TPM / 100K TPD) ──
@@ -972,13 +972,13 @@ def check_authentication():
 # ==========================================
 class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
     """
-    Google Gemini text-embedding-004 (768차원, 2048토큰 컨텍스트).
-    비대칭 임베딩: 문서는 retrieval_document, 질의는 retrieval_query로 인코딩해야
-    검색 정확도가 최적화됨. __call__(문서 저장용)은 document,
-    embed_query(검색용)는 query task_type을 사용.
+    Google Gemini embedding (gemini-embedding-001, 768차원으로 축소 사용).
+    text-embedding-004는 2026-01-14 deprecated → gemini-embedding-001로 마이그레이션.
+    기본 3072차원이지만 output_dimensionality=768로 기존 데이터와 차원 호환.
+    비대칭 임베딩: 문서는 retrieval_document, 질의는 retrieval_query로 인코딩.
     """
 
-    def __init__(self, api_key: str, model: str = "models/text-embedding-004"):
+    def __init__(self, api_key: str, model: str = "models/gemini-embedding-001"):
         if not _GENAI_AVAILABLE:
             raise RuntimeError("google-generativeai 미설치 — requirements.txt에 추가 필요")
         genai.configure(api_key=api_key)
@@ -995,8 +995,14 @@ class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
             try:
                 resp = genai.embed_content(
                     model=self._model, content=text, task_type=task_type,
+                    output_dimensionality=_EMBED_DIM,   # 768 — 기존 데이터 차원 유지
                 )
-                return resp["embedding"]
+                emb = resp["embedding"]
+                # gemini-embedding-001은 축소 차원 사용 시 정규화 권장
+                norm = sum(x * x for x in emb) ** 0.5
+                if norm > 0:
+                    emb = [x / norm for x in emb]
+                return emb
             except Exception as e:
                 last_err = e
                 msg = str(e).lower()
@@ -2248,6 +2254,54 @@ def run_main_portal():
                 "적재 시 rate limit으로 임베딩 실패한 특허를 재임베딩합니다. "
                 "Streamlit 20분 제한 때문에 한 번에 300건씩 처리 → 여러 번 나눠 누르세요."
             )
+
+            # 임베딩 엔진 실시간 진단 (전량 0벡터일 때 원인 파악)
+            if st.button("🩺 임베딩 엔진 진단 (먼저 실행)", use_container_width=True):
+                st.write("**1. 설정 확인**")
+                gkey = _clean_ascii(st.secrets.get("GEMINI_API_KEY", ""))
+                st.write(f"- GEMINI_API_KEY 존재: {'✅ 예 (길이 ' + str(len(gkey)) + ')' if gkey else '❌ 없음'}")
+                st.write(f"- google-generativeai 설치: {'✅' if _GENAI_AVAILABLE else '❌'}")
+
+                fn = _get_embedding_fn()
+                fn_type = type(fn).__name__
+                st.write(f"- 현재 임베딩 함수: `{fn_type}`")
+                if fn_type != "GeminiEmbeddingFunction":
+                    st.error(
+                        "⚠️ Gemini가 아닌 폴백(로컬) 임베딩이 선택됐습니다. "
+                        "GEMINI_API_KEY 또는 google-generativeai 설치를 확인하세요."
+                    )
+
+                st.write("**2. 실제 임베딩 호출 테스트**")
+                try:
+                    if fn_type == "GeminiEmbeddingFunction":
+                        # 재시도 없이 1회만 직접 호출해 raw 에러 확인
+                        import google.generativeai as _genai
+                        _genai.configure(api_key=gkey)
+                        resp = _genai.embed_content(
+                            model="models/gemini-embedding-001",
+                            content="지폐 계수 장치 테스트",
+                            task_type="retrieval_document",
+                            output_dimensionality=_EMBED_DIM,
+                        )
+                        vec = resp["embedding"]
+                        nonzero = sum(1 for x in vec if abs(x) > 1e-9)
+                        st.write(f"- 반환 벡터 차원: {len(vec)}, 비영 성분: {nonzero}")
+                        if nonzero > 0:
+                            st.success("✅ Gemini 임베딩 정상 작동! 이제 재임베딩하면 0벡터가 채워집니다.")
+                        else:
+                            st.error("❌ 호출은 됐으나 0벡터 반환. 모델/키 상태 이상.")
+                    else:
+                        test_vec = fn(["지폐 계수 장치 테스트"])[0]
+                        nonzero = sum(1 for x in test_vec if abs(x) > 1e-9)
+                        st.write(f"- 로컬 임베딩 비영 성분: {nonzero}")
+                        st.info("로컬 임베딩 사용 중. Gemini로 바꾸려면 GEMINI_API_KEY 설정 필요.")
+                except Exception as e:
+                    st.error(
+                        f"❌ **임베딩 호출 실패 (이게 전량 0벡터의 원인):**\n\n```\n{e}\n```\n\n"
+                        "→ 에러 내용에 따라: API 키 만료·무효, 할당량 소진(quota), "
+                        "또는 google-generativeai 버전 문제일 수 있습니다."
+                    )
+
             col_chk, col_fix = st.columns(2)
             with col_chk:
                 if st.button("🔍 0벡터 개수 확인", use_container_width=True):
@@ -2258,7 +2312,10 @@ def run_main_portal():
                     else:
                         st.warning(f"⚠️ 0벡터 특허 **{zn}건** / 전체 {tn}건. 아래 재임베딩을 실행하세요.")
             with col_fix:
-                if st.button("🔧 0벡터 재임베딩 (300건씩)", use_container_width=True):
+                chunk = st.number_input("한 번에 처리할 건수", min_value=100, max_value=1000,
+                                        value=400, step=100,
+                                        help="20분 타임아웃 내에 끝날 만큼. 400~500 권장.")
+                if st.button("🔧 0벡터 재임베딩", use_container_width=True):
                     prog = st.progress(0.0, text="재임베딩 준비 중...")
 
                     def _cb(done, tot):
@@ -2266,7 +2323,7 @@ def run_main_portal():
                                       text=f"재임베딩 {done}/{tot}건...")
 
                     done, remaining, tn = reembed_zero_vector_patents(
-                        collection, max_process=300, progress_cb=_cb
+                        collection, max_process=int(chunk), progress_cb=_cb
                     )
                     prog.empty()
                     if done > 0:
