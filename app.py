@@ -1591,12 +1591,18 @@ def export_collection_to_excel_bytes(collection) -> bytes:
         if collection.count() == 0:
             return b""
         data = collection.get(include=["metadatas", "documents"])
+        metas = data.get("metadatas", [])
+        docs = data.get("documents", []) or [""] * len(metas)
         rows = []
-        for meta in data.get("metadatas", []):
+        for meta, doc in zip(metas, docs):
             meta = meta or {}
+            parsed = _parse_patent_doc(doc or "")
+            _title = meta.get("명칭", "") or parsed.get("title", "").replace("특허명칭:", "").strip()
             rows.append({
                 "출원번호": meta.get("출원번호", ""),
-                "명칭": meta.get("명칭", ""),
+                "명칭": _title,
+                "요약": parsed.get("abstract", ""),
+                "청구항": parsed.get("claims", ""),
                 "출원인": meta.get("출원인", ""),
                 "발명자": meta.get("발명자", ""),
                 "IPC": meta.get("IPC", ""),
@@ -1617,52 +1623,82 @@ def export_collection_to_excel_bytes(collection) -> bytes:
 # ==========================================
 # 13-b. 대표출원인 메타 마이그레이션 + 검색 재순위
 # ==========================================
-def reembed_zero_vector_patents(collection, batch_size: int = 50) -> tuple:
-    """
-    적재 시 임베딩 실패로 0벡터로 저장된 특허를 찾아 재임베딩(재upsert).
-    반환: (재임베딩 건수, 스캔 건수)
-    """
-    import math
+def count_zero_vector_patents(collection) -> tuple:
+    """0벡터 특허 수를 센다. 반환: (0벡터 건수, 전체 건수)."""
     try:
         total = collection.count()
         if total == 0:
             return 0, 0
+        data = collection.get(include=["embeddings"])
+        ids = data.get("ids", [])
+        embs = data.get("embeddings", None)
+        if embs is None:
+            return 0, len(ids)
+        zero = 0
+        for emb in embs:
+            if emb is None or sum(1 for x in emb if abs(x) > 1e-9) == 0:
+                zero += 1
+        return zero, len(ids)
+    except Exception as e:
+        print(f"[0벡터 카운트 오류] {e}")
+        return 0, 0
+
+
+def reembed_zero_vector_patents(collection, batch_size: int = 50, max_process: int = 300,
+                                progress_cb=None) -> tuple:
+    """
+    0벡터 특허를 찾아 재임베딩. 이번 호출에서 최대 max_process건만 처리
+    (Streamlit ~20분 WebSocket 타임아웃 회피 — 여러 번 나눠 실행).
+    반환: (이번에 처리한 건수, 남은 0벡터 건수, 전체 건수)
+    """
+    try:
+        total = collection.count()
+        if total == 0:
+            return 0, 0, 0
         data = collection.get(include=["documents", "metadatas", "embeddings"])
         ids = data.get("ids", [])
         docs = data.get("documents", [])
         metas = data.get("metadatas", [])
         embs = data.get("embeddings", None)
         if embs is None:
-            return 0, len(ids)
+            return 0, 0, len(ids)
 
         zero_ids, zero_docs, zero_metas = [], [], []
         for cid, doc, meta, emb in zip(ids, docs, metas, embs):
-            if emb is None:
-                is_zero = True
-            else:
-                nonzero = sum(1 for x in emb if abs(x) > 1e-9)
-                is_zero = (nonzero == 0)
-            if is_zero:
+            if emb is None or sum(1 for x in emb if abs(x) > 1e-9) == 0:
                 zero_ids.append(cid)
                 zero_docs.append(doc if doc else f"특허명칭: {(meta or {}).get('명칭','')}")
                 zero_metas.append(meta or {})
 
-        if not zero_ids:
-            return 0, len(ids)
+        total_zero = len(zero_ids)
+        if total_zero == 0:
+            return 0, 0, len(ids)
 
-        # upsert로 재임베딩 (컬렉션 임베딩 함수가 retrieval_document로 재생성)
-        # 배치 간 짧은 대기로 rate limit(429) 회피
-        for i in range(0, len(zero_ids), batch_size):
+        # 이번 호출에서 처리할 만큼만 자름
+        proc_ids = zero_ids[:max_process]
+        proc_docs = zero_docs[:max_process]
+        proc_metas = zero_metas[:max_process]
+
+        done = 0
+        for i in range(0, len(proc_ids), batch_size):
             _upsert_patent_batches(
                 collection,
-                zero_ids[i:i + batch_size],
-                zero_docs[i:i + batch_size],
-                zero_metas[i:i + batch_size],
+                proc_ids[i:i + batch_size],
+                proc_docs[i:i + batch_size],
+                proc_metas[i:i + batch_size],
                 batch_size=batch_size,
             )
-            if i + batch_size < len(zero_ids):
+            done += len(proc_ids[i:i + batch_size])
+            if progress_cb:
+                progress_cb(done, len(proc_ids))
+            if i + batch_size < len(proc_ids):
                 time.sleep(1.0)
-        return len(zero_ids), len(ids)
+
+        remaining = total_zero - done
+        return done, remaining, len(ids)
+    except Exception as e:
+        print(f"[0벡터 재임베딩 오류] {e}")
+        return 0, -1, 0
     except Exception as e:
         print(f"[0벡터 재임베딩 오류] {e}")
         return 0, 0
@@ -2206,26 +2242,65 @@ def run_main_portal():
                     except Exception as e:
                         st.error(f"진단 오류: {e}")
 
-            # 0벡터 특허 재임베딩 (임베딩 실패분 복구)
-            if st.button("🔧 0벡터 특허 재임베딩", use_container_width=True,
-                         help="적재 시 임베딩 호출이 실패해 0벡터로 저장된 특허를 찾아 재임베딩합니다."):
-                with st.spinner("0벡터 특허 탐색 및 재임베딩 중... (시간이 걸릴 수 있음)"):
-                    fixed, scanned = reembed_zero_vector_patents(collection)
-                    if fixed > 0:
-                        backup_chroma_to_r2()
-                if fixed > 0:
-                    st.success(f"✅ {scanned}건 중 {fixed}건의 0벡터 특허를 재임베딩 + R2 백업했습니다.")
-                    st.rerun()
-                else:
-                    st.info(f"{scanned}건을 확인했으며 0벡터 특허는 없었습니다.")
-                if xlsx_bytes:
-                    st.download_button(
-                        "📥 마스터 엑셀 내보내기 (.xlsx)",
-                        data=xlsx_bytes,
-                        file_name="master_patents.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
+            # 0벡터 특허 재임베딩 (임베딩 실패분 복구) — 청크 처리로 타임아웃 회피
+            st.markdown("**🔧 0벡터 특허 복구**")
+            st.caption(
+                "적재 시 rate limit으로 임베딩 실패한 특허를 재임베딩합니다. "
+                "Streamlit 20분 제한 때문에 한 번에 300건씩 처리 → 여러 번 나눠 누르세요."
+            )
+            col_chk, col_fix = st.columns(2)
+            with col_chk:
+                if st.button("🔍 0벡터 개수 확인", use_container_width=True):
+                    with st.spinner("스캔 중..."):
+                        zn, tn = count_zero_vector_patents(collection)
+                    if zn == 0:
+                        st.success(f"✅ 0벡터 특허 없음 (전체 {tn}건 정상)")
+                    else:
+                        st.warning(f"⚠️ 0벡터 특허 **{zn}건** / 전체 {tn}건. 아래 재임베딩을 실행하세요.")
+            with col_fix:
+                if st.button("🔧 0벡터 재임베딩 (300건씩)", use_container_width=True):
+                    prog = st.progress(0.0, text="재임베딩 준비 중...")
+
+                    def _cb(done, tot):
+                        prog.progress(min(done / max(tot, 1), 1.0),
+                                      text=f"재임베딩 {done}/{tot}건...")
+
+                    done, remaining, tn = reembed_zero_vector_patents(
+                        collection, max_process=300, progress_cb=_cb
                     )
+                    prog.empty()
+                    if done > 0:
+                        with st.spinner("💾 R2 백업 중..."):
+                            backup_chroma_to_r2()
+                        _applicant_options_cached.clear()
+                        if remaining > 0:
+                            st.warning(
+                                f"✅ 이번에 {done}건 재임베딩 완료. "
+                                f"**아직 {remaining}건 남음** → 버튼을 다시 눌러 계속하세요."
+                            )
+                        else:
+                            st.success(f"🎉 {done}건 재임베딩 완료. 0벡터 특허가 모두 복구됐습니다!")
+                        st.rerun()
+                    elif remaining == -1:
+                        st.error("재임베딩 중 오류. 로그를 확인하세요.")
+                    else:
+                        st.info("0벡터 특허가 없습니다. 모두 정상입니다.")
+
+            st.divider()
+
+            # 엑셀 내보내기 (원본 재생성)
+            if safe_count(collection) > 0:
+                if st.button("📥 마스터 엑셀 준비", use_container_width=True):
+                    with st.spinner("엑셀 생성 중..."):
+                        xlsx_bytes = export_collection_to_excel_bytes(collection)
+                    if xlsx_bytes:
+                        st.download_button(
+                            "⬇️ 다운로드 (요약·청구항 포함)",
+                            data=xlsx_bytes,
+                            file_name="master_patents.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
 
             st.divider()
 
