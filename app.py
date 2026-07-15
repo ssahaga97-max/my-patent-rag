@@ -1600,6 +1600,47 @@ def export_collection_to_excel_bytes(collection) -> bytes:
 # ==========================================
 # 13-b. 대표출원인 메타 마이그레이션 + 검색 재순위
 # ==========================================
+def reembed_zero_vector_patents(collection, batch_size: int = 50) -> tuple:
+    """
+    적재 시 임베딩 실패로 0벡터로 저장된 특허를 찾아 재임베딩(재upsert).
+    반환: (재임베딩 건수, 스캔 건수)
+    """
+    import math
+    try:
+        total = collection.count()
+        if total == 0:
+            return 0, 0
+        data = collection.get(include=["documents", "metadatas", "embeddings"])
+        ids = data.get("ids", [])
+        docs = data.get("documents", [])
+        metas = data.get("metadatas", [])
+        embs = data.get("embeddings", None)
+        if embs is None:
+            return 0, len(ids)
+
+        zero_ids, zero_docs, zero_metas = [], [], []
+        for cid, doc, meta, emb in zip(ids, docs, metas, embs):
+            if emb is None:
+                is_zero = True
+            else:
+                nonzero = sum(1 for x in emb if abs(x) > 1e-9)
+                is_zero = (nonzero == 0)
+            if is_zero:
+                zero_ids.append(cid)
+                zero_docs.append(doc if doc else f"특허명칭: {(meta or {}).get('명칭','')}")
+                zero_metas.append(meta or {})
+
+        if not zero_ids:
+            return 0, len(ids)
+
+        # upsert로 재임베딩 (컬렉션 임베딩 함수가 retrieval_document로 재생성)
+        _upsert_patent_batches(collection, zero_ids, zero_docs, zero_metas, batch_size=batch_size)
+        return len(zero_ids), len(ids)
+    except Exception as e:
+        print(f"[0벡터 재임베딩 오류] {e}")
+        return 0, 0
+
+
 def migrate_add_representative_applicant(collection, batch_size: int = 200) -> int:
     """
     기존 적재분(대표출원인 필드 없음)에 대표출원인 메타를 채워 넣음.
@@ -2070,9 +2111,86 @@ def run_main_portal():
                     except Exception as e:
                         st.error(f"진단 오류: {e}")
 
-            # 엑셀 내보내기 (원본 재생성)
-            if safe_count(collection) > 0:
-                xlsx_bytes = export_collection_to_excel_bytes(collection)
+            # 검색 경로 진단 (특정 특허가 검색 안 될 때 원인 추적)
+            with st.expander("🔎 특허 검색 경로 진단"):
+                st.caption("검색이 안 되는 특허의 출원번호를 넣으면 저장·임베딩·검색을 단계별로 추적합니다.")
+                diag_pid = st.text_input("출원번호 (마스터 엑셀의 값)", key="diag_pid")
+                if st.button("검색 경로 추적", key="run_search_diag") and diag_pid.strip():
+                    try:
+                        cid = _normalize_patent_id(diag_pid.strip())
+                        st.write(f"정규화된 ID: `{cid}`")
+
+                        # 1) 해당 ID가 컬렉션에 있는지 + 문서/메타/임베딩 확인
+                        got = collection.get(ids=[cid], include=["documents", "metadatas", "embeddings"])
+                        if not got.get("ids"):
+                            st.error(
+                                f"❌ ID `{cid}`가 컬렉션에 없습니다. "
+                                f"정규화 규칙 때문에 저장된 ID와 다를 수 있습니다. "
+                                f"엑셀의 출원번호 원본 표기를 확인하세요."
+                            )
+                        else:
+                            doc = got["documents"][0]
+                            emb = got["embeddings"][0] if got.get("embeddings") is not None else None
+                            st.success(f"✅ ID `{cid}` 존재")
+                            st.write(f"- 문서 길이: {len(doc)}자")
+                            st.write(f"- 문서 앞 120자: `{doc[:120]}`")
+
+                            # 2) 임베딩 유효성 (0벡터면 적재 시 임베딩 실패한 것)
+                            if emb is not None:
+                                import math
+                                norm = math.sqrt(sum(x * x for x in emb))
+                                nonzero = sum(1 for x in emb if abs(x) > 1e-9)
+                                st.write(f"- 임베딩 차원: {len(emb)}, 비영(非零) 성분: {nonzero}, 노름: {norm:.4f}")
+                                if norm < 1e-6 or nonzero == 0:
+                                    st.error(
+                                        "🚨 **이 특허의 임베딩이 0벡터입니다.** "
+                                        "적재 시 Gemini 임베딩 호출이 실패해 0벡터로 저장됐습니다. "
+                                        "→ 이 특허(및 유사 케이스)를 재임베딩해야 합니다. "
+                                        "아래 '🔧 0벡터 특허 재임베딩'을 실행하세요."
+                                    )
+                                else:
+                                    st.info("임베딩은 정상(비영 벡터)입니다.")
+
+                            # 3) 문서 자체로 검색 시 몇 위에 나오는지 (retrieval_query)
+                            st.write("---")
+                            st.write("**이 특허의 문서 내용으로 검색 시 순위:**")
+                            qtext = doc[:500]
+                            qv = _embed_query_vector(qtext)
+                            if qv is not None:
+                                rq = collection.query(query_embeddings=[qv], n_results=10)
+                            else:
+                                rq = collection.query(query_texts=[qtext], n_results=10)
+                            found_rank = None
+                            for rank, m in enumerate(rq["metadatas"][0], 1):
+                                if _normalize_patent_id(m.get("출원번호", "")) == cid:
+                                    found_rank = rank
+                                    break
+                            if found_rank:
+                                st.success(f"✅ 자기 문서로 검색 시 **{found_rank}위**에 나옵니다. 검색 경로 정상.")
+                            else:
+                                st.error(
+                                    "🚨 자기 문서로 검색해도 상위 10위 안에 안 나옵니다. "
+                                    "임베딩이 0벡터이거나, 저장 임베딩과 질의 임베딩 방식이 다릅니다."
+                                )
+                                # 상위 10위가 뭔지 표시
+                                st.write("상위 10위 특허:")
+                                for rank, m in enumerate(rq["metadatas"][0], 1):
+                                    st.write(f"  {rank}. {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
+                    except Exception as e:
+                        st.error(f"진단 오류: {e}")
+
+            # 0벡터 특허 재임베딩 (임베딩 실패분 복구)
+            if st.button("🔧 0벡터 특허 재임베딩", use_container_width=True,
+                         help="적재 시 임베딩 호출이 실패해 0벡터로 저장된 특허를 찾아 재임베딩합니다."):
+                with st.spinner("0벡터 특허 탐색 및 재임베딩 중... (시간이 걸릴 수 있음)"):
+                    fixed, scanned = reembed_zero_vector_patents(collection)
+                    if fixed > 0:
+                        backup_chroma_to_r2()
+                if fixed > 0:
+                    st.success(f"✅ {scanned}건 중 {fixed}건의 0벡터 특허를 재임베딩 + R2 백업했습니다.")
+                    st.rerun()
+                else:
+                    st.info(f"{scanned}건을 확인했으며 0벡터 특허는 없었습니다.")
                 if xlsx_bytes:
                     st.download_button(
                         "📥 마스터 엑셀 내보내기 (.xlsx)",
