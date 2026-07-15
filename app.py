@@ -1665,36 +1665,67 @@ def search_patents(
     · applicant_filter: 대표출원인명. 지정 시 해당 출원인 특허만.
     · keyword_boost: 질의 키워드가 명칭/본문에 포함된 특허를 상위로 재정렬.
 
+    출원인 필터 전략(하이브리드):
+      1) ChromaDB where로 DB 레벨에서 해당 출원인만 1차 검색 (단일 대표출원인 매칭)
+      2) '|' 결합(복수 출원인) 케이스를 놓치지 않도록, where 없는 대량 over_fetch
+         결과를 파이썬에서 부분일치 필터하여 병합
     반환: (docs, metas) — n_results 건.
     """
-    # 출원인 필터 시 후보를 넉넉히 가져와 필터 후에도 n건 확보
-    over_fetch = n_results * 6 if applicant_filter else max(n_results * 3, n_results)
-    over_fetch = min(over_fetch, max(collection.count(), 1))
+    total = max(collection.count(), 1)
 
-    res = collection.query(query_texts=[query], n_results=over_fetch)
-    if not (res and res["documents"] and res["documents"][0]):
-        return [], []
+    def _run_query(where=None, k=None):
+        k = min(k or n_results, total)
+        try:
+            if where:
+                r = collection.query(query_texts=[query], n_results=k, where=where)
+            else:
+                r = collection.query(query_texts=[query], n_results=k)
+        except Exception as e:
+            print(f"[query 오류] {e}")
+            return [], [], []
+        if not (r and r["documents"] and r["documents"][0]):
+            return [], [], []
+        d = r.get("distances", [[None] * len(r["documents"][0])])[0]
+        return r["documents"][0], r["metadatas"][0], d
 
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
-    dists = res.get("distances", [[None] * len(docs)])[0]
-
-    # 1) 출원인 필터 (대표출원인 부분일치 — '|' 결합 대응)
     if applicant_filter:
-        keep = []
-        for doc, meta, dist in zip(docs, metas, dists):
+        seen = set()
+        merged = []  # (doc, meta, dist)
+
+        # 1) where로 단일 대표출원인 정확 매칭 (가장 정확·효율적)
+        docs1, metas1, dists1 = _run_query(
+            where={"대표출원인": applicant_filter}, k=n_results * 4
+        )
+        for doc, meta, dist in zip(docs1, metas1, dists1):
+            key = meta.get("출원번호", id(meta))
+            if key not in seen:
+                seen.add(key)
+                merged.append((doc, meta, dist))
+
+        # 2) 복수 출원인('|' 결합) 보강 — where 없이 대량 검색 후 부분일치
+        #    효성처럼 특허가 많거나 공동출원이 있는 경우까지 포착
+        over_fetch = min(max(n_results * 20, 200), total)
+        docs2, metas2, dists2 = _run_query(k=over_fetch)
+        for doc, meta, dist in zip(docs2, metas2, dists2):
+            key = meta.get("출원번호", id(meta))
+            if key in seen:
+                continue
             rep = str(meta.get("대표출원인", "")) or _canonical_applicants_for_meta(meta.get("출원인", ""))
             reps = {r.strip() for r in rep.split("|")}
             if applicant_filter in reps:
-                keep.append((doc, meta, dist))
-        triples = keep
+                seen.add(key)
+                merged.append((doc, meta, dist))
+
+        triples = merged
     else:
+        over_fetch = min(max(n_results * 3, n_results), total)
+        docs, metas, dists = _run_query(k=over_fetch)
         triples = list(zip(docs, metas, dists))
 
     if not triples:
         return [], []
 
-    # 2) 키워드 우선 재순위 (키워드 점수 desc, 그다음 거리 asc)
+    # 키워드 우선 재순위 (키워드 점수 desc, 그다음 거리 asc)
     if keyword_boost:
         keywords = _extract_keywords(query)
         if keywords:
@@ -1704,6 +1735,9 @@ def search_patents(
                 d = dist if dist is not None else 1.0
                 return (-kw, d)
             triples.sort(key=_rank_key)
+    else:
+        # 출원인 필터 시 거리순 정렬 (병합으로 순서가 섞였을 수 있음)
+        triples.sort(key=lambda t: t[2] if t[2] is not None else 1.0)
 
     triples = triples[:n_results]
     return [t[0] for t in triples], [t[1] for t in triples]
@@ -1937,6 +1971,60 @@ def run_main_portal():
                 _applicant_options_cached.clear()
                 st.success(f"✅ {n_upd}건 대표출원인 갱신 + R2 백업 완료. 출원인 드롭다운에 반영됩니다.")
                 st.rerun()
+
+            # 출원인 필터 진단 (특정 출원인이 검색 안 될 때 원인 파악)
+            with st.expander("🔬 출원인 필터 진단"):
+                diag_name = st.text_input("진단할 대표출원인명", value="효성", key="diag_applicant")
+                if st.button("진단 실행", key="run_applicant_diag"):
+                    try:
+                        # 1) 전체 메타에서 대표출원인 값 분포
+                        all_metas = collection.get(include=["metadatas"]).get("metadatas", [])
+                        exact = 0        # 대표출원인 == diag_name
+                        contains = 0     # '|' 결합 포함
+                        raw_samples = set()
+                        for m in all_metas:
+                            rep = str((m or {}).get("대표출원인", ""))
+                            reps = {r.strip() for r in rep.split("|")}
+                            if diag_name in reps:
+                                contains += 1
+                                if rep.strip() == diag_name:
+                                    exact += 1
+                            # 원본 출원인 표기 샘플 수집 (해당 대표명 관련)
+                            raw = str((m or {}).get("출원인", ""))
+                            if diag_name in _canonical_applicants_for_meta(raw):
+                                if len(raw_samples) < 8:
+                                    raw_samples.add(raw)
+
+                        st.write(f"**'{diag_name}' 대표출원인 통계:**")
+                        st.write(f"- 단독 대표출원인 일치: **{exact}건**")
+                        st.write(f"- 복수출원인('|') 포함: **{contains}건**")
+
+                        # 2) where 필터 직접 테스트
+                        try:
+                            wres = collection.get(where={"대표출원인": diag_name}, limit=5)
+                            st.write(f"- where 필터 매칭(정확): **{len(wres.get('ids', []))}건** (샘플 5건 한정 조회)")
+                        except Exception as we:
+                            st.warning(f"where 필터 오류: {we}")
+
+                        # 3) 원본 출원인 표기 샘플
+                        if raw_samples:
+                            st.write("**원본 출원인 표기 샘플:**")
+                            for s in raw_samples:
+                                st.write(f"  - `{s}` → 대표명: `{_canonical_applicants_for_meta(s)}`")
+
+                        if contains == 0:
+                            st.error(
+                                f"⚠️ '{diag_name}'로 저장된 특허가 0건입니다. "
+                                f"대표출원인 필드가 아직 안 채워졌을 수 있습니다 → "
+                                f"'🏷 대표출원인 필드 갱신'을 먼저 누르세요."
+                            )
+                        elif exact == 0 and contains > 0:
+                            st.warning(
+                                f"'{diag_name}'가 모두 복수출원인('|' 결합)으로만 존재합니다. "
+                                f"where 정확매칭은 0건이지만 하이브리드 검색으로 조회됩니다."
+                            )
+                    except Exception as e:
+                        st.error(f"진단 오류: {e}")
 
             # 엑셀 내보내기 (원본 재생성)
             if safe_count(collection) > 0:
