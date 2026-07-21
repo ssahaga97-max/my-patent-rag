@@ -1671,6 +1671,59 @@ def count_zero_vector_patents(collection) -> tuple:
         return 0, 0
 
 
+def rebuild_index_from_stored_embeddings(collection, max_process: int = 1000,
+                                         batch_size: int = 100, progress_cb=None) -> tuple:
+    """
+    저장소엔 정상 벡터가 있으나 HNSW 인덱스가 옛 값(0벡터)인 경우를 복구.
+    Gemini API 호출 없이, 저장된 임베딩 그대로 delete→add 하여 인덱스를 다시 씀.
+    (rate limit 무관, 빠름)
+    반환: (처리 건수, 남은 건수, 상태)
+    """
+    try:
+        data = collection.get(include=["documents", "metadatas", "embeddings"])
+        ids = data.get("ids", [])
+        docs = data.get("documents", [])
+        metas = data.get("metadatas", [])
+        embs = data.get("embeddings", None)
+        if embs is None or not ids:
+            return 0, 0, "error"
+
+        # 정상(비영) 벡터를 가진 것만 대상 — 0벡터는 재임베딩이 따로 필요
+        tgt = [(c, d, m, e) for c, d, m, e in zip(ids, docs, metas, embs)
+               if e is not None and sum(1 for x in e if abs(x) > 1e-9) > 0]
+        if not tgt:
+            return 0, 0, "ok"
+
+        # 이미 처리한 위치를 세션에 기록해 이어서 진행
+        start = st.session_state.get("_reindex_cursor", 0)
+        if start >= len(tgt):
+            start = 0
+        chunk = tgt[start:start + max_process]
+
+        done = 0
+        for i in range(0, len(chunk), batch_size):
+            part = chunk[i:i + batch_size]
+            p_ids = [x[0] for x in part]
+            p_docs = [x[1] for x in part]
+            p_metas = [x[2] for x in part]
+            p_embs = [list(x[3]) for x in part]
+            try:
+                collection.delete(ids=p_ids)
+            except Exception as de:
+                print(f"[재구축 삭제 경고] {de}")
+            collection.add(ids=p_ids, documents=p_docs, metadatas=p_metas, embeddings=p_embs)
+            done += len(part)
+            if progress_cb:
+                progress_cb(done, len(chunk))
+
+        st.session_state["_reindex_cursor"] = start + done
+        remaining = max(0, len(tgt) - (start + done))
+        return done, remaining, "ok"
+    except Exception as e:
+        print(f"[인덱스 재구축 오류] {e}")
+        return 0, -1, "error"
+
+
 def reembed_zero_vector_patents(collection, batch_size: int = 50, max_process: int = 300,
                                 progress_cb=None, sleep_between: float = 0.0) -> tuple:
     """
@@ -1715,8 +1768,14 @@ def reembed_zero_vector_patents(collection, batch_size: int = 50, max_process: i
 
         def _flush():
             if buf_ids:
-                collection.update(ids=list(buf_ids), documents=list(buf_docs),
-                                  metadatas=list(buf_metas), embeddings=list(buf_embs))
+                # update()는 저장값만 바꾸고 HNSW 인덱스를 갱신 못 하는 경우가 있어
+                # 삭제 → 재추가로 인덱스를 확실히 새로 쓴다.
+                try:
+                    collection.delete(ids=list(buf_ids))
+                except Exception as de:
+                    print(f"[삭제 경고] {de}")
+                collection.add(ids=list(buf_ids), documents=list(buf_docs),
+                               metadatas=list(buf_metas), embeddings=list(buf_embs))
                 buf_ids.clear(); buf_docs.clear(); buf_metas.clear(); buf_embs.clear()
 
         for idx, (cid, doc, meta) in enumerate(zip(proc_ids, proc_docs, proc_metas)):
@@ -2337,6 +2396,39 @@ def run_main_portal():
                                 st.write(f"  {rank}. [{dtxt}] {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
                     except Exception as e:
                         st.error(f"진단 오류: {e}")
+
+            # 인덱스 재구축 (저장 벡터는 정상인데 검색이 안 될 때 — API 호출 없음)
+            st.markdown("**🧱 검색 인덱스 재구축**")
+            st.caption(
+                "저장된 임베딩은 정상인데 검색에 안 잡힐 때 사용. "
+                "Gemini 호출 없이 인덱스만 다시 씁니다 (빠름·rate limit 무관)."
+            )
+            rb_chunk = st.number_input("재구축 건수", min_value=200, max_value=5000,
+                                       value=1500, step=100, key="rb_chunk")
+            if st.button("🧱 인덱스 재구축 실행", use_container_width=True):
+                prog2 = st.progress(0.0, text="재구축 준비 중...")
+
+                def _cb2(d, t):
+                    prog2.progress(min(d / max(t, 1), 1.0), text=f"재구축 {d}/{t}건...")
+
+                d2, r2, s2 = rebuild_index_from_stored_embeddings(
+                    collection, max_process=int(rb_chunk), progress_cb=_cb2
+                )
+                prog2.empty()
+                if s2 == "error":
+                    st.error("재구축 중 오류. 로그를 확인하세요.")
+                elif d2 > 0:
+                    with st.spinner("💾 R2 백업 중..."):
+                        backup_chroma_to_r2()
+                    if r2 > 0:
+                        st.success(f"✅ {d2}건 재구축. 남은 {r2}건 → 버튼을 다시 누르세요.")
+                    else:
+                        st.success(f"🎉 {d2}건 재구축 완료. 인덱스가 모두 갱신됐습니다!")
+                    st.rerun()
+                else:
+                    st.info("재구축 대상이 없습니다.")
+
+            st.divider()
 
             # 0벡터 특허 재임베딩 (임베딩 실패분 복구) — 청크 처리로 타임아웃 회피
             st.markdown("**🔧 0벡터 특허 복구**")
