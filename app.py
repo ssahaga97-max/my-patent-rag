@@ -1090,14 +1090,18 @@ def _get_llm():
 
 def _embed_query_vector(query: str):
     """
-    검색 질의를 retrieval_query task_type으로 임베딩.
-    Gemini(비대칭)면 query 전용 벡터를 반환 → query_embeddings로 사용.
+    검색 질의를 임베딩. 질의 성격에 따라 task_type 자동 선택.
+      · 짧은 키워드 검색(<200자) → retrieval_query (비대칭: 키워드→문서)
+      · 긴 텍스트 붙여넣기(≥200자) → retrieval_document (대칭: 문서→문서)
+        특허 요약/청구항을 통째로 붙여넣어 유사 특허를 찾는 용도에 맞춤.
     로컬 모델(대칭)이면 None 반환 → 호출부에서 query_texts 사용.
     """
     fn = _get_embedding_fn()
     if isinstance(fn, GeminiEmbeddingFunction):
         try:
-            return fn.embed_query(query)
+            q = (query or "").strip()
+            task = "retrieval_document" if len(q) >= 200 else "retrieval_query"
+            return fn._embed_one(q, task)
         except Exception as e:
             print(f"[질의 임베딩 오류] {e}")
             return None
@@ -2304,24 +2308,33 @@ def run_main_portal():
                                     )
 
                             if qv is not None:
-                                rq = collection.query(query_embeddings=[qv], n_results=10)
+                                rq = collection.query(query_embeddings=[qv], n_results=50)
                             else:
-                                rq = collection.query(query_texts=[qtext], n_results=10)
+                                rq = collection.query(query_texts=[qtext], n_results=50)
                             found_rank = None
-                            for rank, m in enumerate(rq["metadatas"][0], 1):
+                            found_dist = None
+                            _ds_all = rq.get("distances", [[None] * 50])[0]
+                            for rank, (m, dd) in enumerate(zip(rq["metadatas"][0], _ds_all), 1):
                                 if _normalize_patent_id(m.get("출원번호", "")) == cid:
                                     found_rank = rank
+                                    found_dist = dd
                                     break
                             if found_rank:
-                                st.success(f"✅ 자기 문서로 검색 시 **{found_rank}위**에 나옵니다. 검색 경로 정상.")
+                                dtxt = f"{found_dist:.4f}" if isinstance(found_dist, (int, float)) else "?"
+                                if found_rank <= 3:
+                                    st.success(f"✅ 자기 문서로 검색 시 **{found_rank}위** (거리 {dtxt}). 검색 정상.")
+                                else:
+                                    st.warning(
+                                        f"⚠️ 자기 문서가 **{found_rank}위** (거리 {dtxt})입니다. "
+                                        f"유사 특허가 많아 밀린 것으로, 검색 자체는 작동합니다."
+                                    )
                             else:
-                                st.error("🚨 자기 문서로 검색해도 상위 10위 안에 안 나옵니다.")
-                                # 상위 10위 + 거리 표시 (0벡터 오염 여부 판별)
-                                st.write("상위 10위 특허 (거리):")
-                                _ds = rq.get("distances", [[None] * 10])[0]
-                                for rank, (m, dd) in enumerate(zip(rq["metadatas"][0], _ds), 1):
-                                    dtxt = f"{dd:.4f}" if isinstance(dd, (int, float)) else str(dd)
-                                    st.write(f"  {rank}. [{dtxt}] {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
+                                st.error("🚨 자기 문서가 상위 50위 안에도 없습니다.")
+                            # 상위 10위 + 거리 표시
+                            st.write("상위 10위 특허 (거리):")
+                            for rank, (m, dd) in enumerate(zip(rq["metadatas"][0][:10], _ds_all[:10]), 1):
+                                dtxt = f"{dd:.4f}" if isinstance(dd, (int, float)) else str(dd)
+                                st.write(f"  {rank}. [{dtxt}] {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
                     except Exception as e:
                         st.error(f"진단 오류: {e}")
 
