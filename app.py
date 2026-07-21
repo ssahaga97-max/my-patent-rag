@@ -2282,6 +2282,27 @@ def run_main_portal():
                             st.write("**이 특허의 문서 내용으로 검색 시 순위:**")
                             qtext = doc[:500]
                             qv = _embed_query_vector(qtext)
+
+                            # 3-a) 결정적 판별: 저장벡터 vs 질의벡터 코사인 유사도 직접 계산
+                            if qv is not None and emb is not None:
+                                dot = sum(a * b for a, b in zip(emb, qv))
+                                na = sum(a * a for a in emb) ** 0.5
+                                nb = sum(b * b for b in qv) ** 0.5
+                                cos = dot / (na * nb) if na > 0 and nb > 0 else 0.0
+                                st.write(f"- **저장벡터 ↔ 질의벡터 코사인 유사도: `{cos:.4f}`**")
+                                if cos > 0.7:
+                                    st.info(
+                                        "→ 유사도가 높습니다. 임베딩 공간은 정상. "
+                                        "순위에서 밀린다면 **0벡터 특허들이 검색 결과를 오염**시키는 것이 원인입니다."
+                                    )
+                                elif cos > 0.3:
+                                    st.warning("→ 유사도가 애매합니다. 문서 앞 500자만 질의해 그럴 수 있습니다.")
+                                else:
+                                    st.error(
+                                        "→ 유사도가 낮습니다. **저장 임베딩과 질의 임베딩이 다른 공간**입니다. "
+                                        "(저장은 옛 모델, 질의는 새 모델일 가능성) → 전체 재임베딩 필요."
+                                    )
+
                             if qv is not None:
                                 rq = collection.query(query_embeddings=[qv], n_results=10)
                             else:
@@ -2294,14 +2315,13 @@ def run_main_portal():
                             if found_rank:
                                 st.success(f"✅ 자기 문서로 검색 시 **{found_rank}위**에 나옵니다. 검색 경로 정상.")
                             else:
-                                st.error(
-                                    "🚨 자기 문서로 검색해도 상위 10위 안에 안 나옵니다. "
-                                    "임베딩이 0벡터이거나, 저장 임베딩과 질의 임베딩 방식이 다릅니다."
-                                )
-                                # 상위 10위가 뭔지 표시
-                                st.write("상위 10위 특허:")
-                                for rank, m in enumerate(rq["metadatas"][0], 1):
-                                    st.write(f"  {rank}. {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
+                                st.error("🚨 자기 문서로 검색해도 상위 10위 안에 안 나옵니다.")
+                                # 상위 10위 + 거리 표시 (0벡터 오염 여부 판별)
+                                st.write("상위 10위 특허 (거리):")
+                                _ds = rq.get("distances", [[None] * 10])[0]
+                                for rank, (m, dd) in enumerate(zip(rq["metadatas"][0], _ds), 1):
+                                    dtxt = f"{dd:.4f}" if isinstance(dd, (int, float)) else str(dd)
+                                    st.write(f"  {rank}. [{dtxt}] {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
                     except Exception as e:
                         st.error(f"진단 오류: {e}")
 
