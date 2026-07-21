@@ -1027,13 +1027,23 @@ class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
             input = [input]
         return [self._embed_one(t, "retrieval_document") for t in input]
 
-    def embed_query(self, input):
+    def embed_query(self, input=None, *args, **kwargs):
         """
         검색 질의용 — retrieval_query (비대칭 검색 정확도 핵심).
-        ChromaDB 1.x가 embed_query(input=[...])로 호출하므로 인자명을 'input'으로 맞춤.
+        ChromaDB 버전별 호출 규약 차이(input=/texts=/위치인자)를 모두 수용.
         · list 입력 → 벡터 리스트 반환 (ChromaDB 규약)
         · str  입력 → 단일 벡터 반환 (내부 호출용)
         """
+        if input is None:
+            if args:
+                input = args[0]
+            else:
+                for k in ("texts", "text", "query", "queries", "documents"):
+                    if k in kwargs:
+                        input = kwargs[k]
+                        break
+        if input is None:
+            return []
         if isinstance(input, str):
             return self._embed_one(input, "retrieval_query")
         return [self._embed_one(t, "retrieval_query") for t in input]
@@ -2303,6 +2313,18 @@ def run_main_portal():
             )
 
             # 임베딩 엔진 실시간 진단 (전량 0벡터일 때 원인 파악)
+            if st.button("♻️ 임베딩/DB 캐시 초기화 (코드 수정 후 필수)", use_container_width=True,
+                         help="Streamlit이 붙들고 있는 옛 임베딩 함수 객체를 버리고 새로 로드합니다."):
+                try:
+                    _get_embedding_fn.clear()
+                    _get_chroma_client.clear()
+                    _applicant_options_cached.clear()
+                except Exception:
+                    pass
+                st.session_state.infra_initialized = False
+                st.success("✅ 캐시를 비웠습니다. 새 임베딩 함수로 다시 로드됩니다.")
+                st.rerun()
+
             if st.button("🩺 임베딩 엔진 진단 (먼저 실행)", use_container_width=True):
                 st.write("**1. 설정 확인**")
                 gkey = _clean_ascii(st.secrets.get("GEMINI_API_KEY", ""))
