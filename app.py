@@ -1027,9 +1027,16 @@ class GeminiEmbeddingFunction(embedding_functions.EmbeddingFunction):
             input = [input]
         return [self._embed_one(t, "retrieval_document") for t in input]
 
-    def embed_query(self, text: str):
-        """검색 질의용 — retrieval_query (비대칭 검색 정확도 핵심)."""
-        return self._embed_one(text, "retrieval_query")
+    def embed_query(self, input):
+        """
+        검색 질의용 — retrieval_query (비대칭 검색 정확도 핵심).
+        ChromaDB 1.x가 embed_query(input=[...])로 호출하므로 인자명을 'input'으로 맞춤.
+        · list 입력 → 벡터 리스트 반환 (ChromaDB 규약)
+        · str  입력 → 단일 벡터 반환 (내부 호출용)
+        """
+        if isinstance(input, str):
+            return self._embed_one(input, "retrieval_query")
+        return [self._embed_one(t, "retrieval_query") for t in input]
 
 
 # ==========================================
