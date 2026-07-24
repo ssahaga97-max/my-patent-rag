@@ -158,6 +158,9 @@ def _normalize_patent_id(value) -> str:
 # 4. 통계 집계: 복수값 분리 · 경쟁사 대표명화
 # ==========================================
 _MULTI_VALUE_SPLIT_RE = re.compile(r"\s*[|;/]\s*")
+# IPC/CPC 코드는 'G06K-009/00'처럼 슬래시가 코드의 일부이므로 구분자에서 제외.
+# 실제 구분자는 파이프·세미콜론·쉼표만 사용.
+_IPC_SPLIT_RE = re.compile(r"\s*[|;,]\s*")
 
 # lookup key(대문자·기호·접미사 제거) → 대표명.
 # 효성·히타치처럼 변형이 많은 경쟁사는 모든 변형이 하나의 대표명으로 수렴하도록 매핑.
@@ -326,17 +329,24 @@ def _canonical_applicant_name(name: str) -> str:
     return raw
 
 
-def _explode_multi_values(value, *, allow_comma: bool = False) -> list:
-    """한 셀에 묶인 복수 값(출원인·발명자·IPC)을 개별 항목 리스트로 분리."""
+def _explode_multi_values(value, *, allow_comma: bool = False, is_code: bool = False) -> list:
+    """
+    한 셀에 묶인 복수 값(출원인·발명자·IPC)을 개별 항목 리스트로 분리.
+    is_code=True (IPC/CPC): 슬래시가 코드의 일부이므로 구분자에서 제외.
+      예) 'G06K-009/00' → ['G06K-009/00']  (기존엔 ['G06K-009','00']로 잘못 분리)
+    """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
     s = str(value).strip()
     if not s or s.lower() in ("nan", "none", "없음", "정보없음", "미기재"):
         return []
 
-    parts = [p.strip() for p in _MULTI_VALUE_SPLIT_RE.split(s) if p.strip()]
-    if allow_comma and len(parts) <= 1:
-        parts = [p.strip() for p in re.split(r"\s*,\s*", s) if p.strip()]
+    if is_code:
+        parts = [p.strip() for p in _IPC_SPLIT_RE.split(s) if p.strip()]
+    else:
+        parts = [p.strip() for p in _MULTI_VALUE_SPLIT_RE.split(s) if p.strip()]
+        if allow_comma and len(parts) <= 1:
+            parts = [p.strip() for p in re.split(r"\s*,\s*", s) if p.strip()]
 
     return [
         p for p in parts
@@ -344,12 +354,13 @@ def _explode_multi_values(value, *, allow_comma: bool = False) -> list:
     ]
 
 
-def _flatten_for_counts(series, *, normalizer=None, explode=False, allow_comma=False):
+def _flatten_for_counts(series, *, normalizer=None, explode=False, allow_comma=False,
+                        is_code=False):
     """Series를 value_counts 가능한 flat Series로 변환."""
     items: list = []
     for val in series:
         if explode:
-            parts = _explode_multi_values(val, allow_comma=allow_comma)
+            parts = _explode_multi_values(val, allow_comma=allow_comma, is_code=is_code)
         else:
             parts = [str(val).strip()] if pd.notna(val) else []
         for part in parts:
@@ -360,10 +371,10 @@ def _flatten_for_counts(series, *, normalizer=None, explode=False, allow_comma=F
 
 
 def _top_counts_table(series, n=10, *, label="항목", normalizer=None,
-                      explode=False, allow_comma=False):
+                      explode=False, allow_comma=False, is_code=False):
     """상위 N건 집계표(DataFrame)와 LLM용 마크다운 표 문자열 반환."""
     flat = _flatten_for_counts(series, normalizer=normalizer, explode=explode,
-                               allow_comma=allow_comma)
+                               allow_comma=allow_comma, is_code=is_code)
     if flat.empty:
         empty = pd.DataFrame(columns=[label, "건수"])
         return empty, f"| {label} | 건수 |\n| --- | ---: |\n| (데이터 없음) | 0 |"
@@ -397,27 +408,38 @@ def _year_counts_table(series):
 
 
 def _extract_year_filter_from_query(query: str):
-    """질의문에서 출원연도 필터 추출. (min_year, max_year)."""
+    """
+    질의문에서 출원연도 필터 추출. (min_year, max_year).
+    (?<!\\d)(\\d{4})(?!\\d) — 정확히 4자리 연도만 인식.
+    '20000년' 같은 오타는 연도로 잡지 않아 필터 무력화를 방지.
+    """
     min_y, max_y = None, None
+    Y = r"(?<!\d)(\d{4})(?!\d)"
 
-    m = re.search(r"(\d{4})\s*년?\s*[~\-–]\s*(\d{4})\s*년?", query)
+    m = re.search(Y + r"\s*년?\s*[~\-–]\s*" + Y + r"\s*년?", query)
     if m:
         return int(m.group(1)), int(m.group(2))
 
     for pat in (
-        r"(\d{4})\s*년?\s*(이후|부터|이상)",
-        r"(\d{4})\s*년?\s*~\s*(현재|지금|now)",
-        r"after\s*(\d{4})",
-        r"since\s*(\d{4})",
+        Y + r"\s*년?\s*(?:이후|부터|이상)",
+        Y + r"\s*년?\s*~\s*(?:현재|지금|now)",
+        r"after\s*" + Y,
+        r"since\s*" + Y,
     ):
         m = re.search(pat, query, re.IGNORECASE)
         if m:
             min_y = int(m.group(1))
             break
 
-    m = re.search(r"(\d{4})\s*년?\s*(이전|까지|미만)", query)
+    m = re.search(Y + r"\s*년?\s*(?:이전|까지|미만)", query)
     if m:
         max_y = int(m.group(1))
+
+    # 상식적 범위 밖은 무시 (오타·오인식 방어)
+    if min_y is not None and not (1900 <= min_y <= 2100):
+        min_y = None
+    if max_y is not None and not (1900 <= max_y <= 2100):
+        max_y = None
 
     return min_y, max_y
 
@@ -482,7 +504,7 @@ def _build_applicant_cohort_context(df, max_applicants=25, titles_per=15, ipc_pe
         sub = exploded[exploded["_대표출원인"] == app]
         _, ipc_md = _top_counts_table(
             sub.get("IPC", pd.Series(dtype=str)),
-            n=ipc_per, label="IPC", explode=True, allow_comma=True,
+            n=ipc_per, label="IPC", explode=True, is_code=True,
         )
         titles = [
             str(t).strip()
@@ -2722,6 +2744,11 @@ def run_main_portal():
                         if filtered_count == 0:
                             st.warning("조건에 맞는 특허가 없습니다. 연도 표현을 확인해 주세요.")
                             st.stop()
+                    elif re.search(r"\d{4}", user_query):
+                        st.warning(
+                            "⚠️ 질의에 숫자가 있으나 **연도 조건으로 인식되지 않아 전체 DB**를 집계합니다. "
+                            "연도로 좁히려면 `2015년 이후`, `2015년~2020년` 형식으로 입력해 주세요."
+                        )
 
                     applicant_df, applicant_stat = _top_counts_table(
                         analysis_df.get("출원인", pd.Series(dtype=str)),
@@ -2730,7 +2757,7 @@ def run_main_portal():
                     )
                     ipc_df, ipc_stat = _top_counts_table(
                         analysis_df.get("IPC", pd.Series(dtype=str)),
-                        n=10, label="IPC", explode=True, allow_comma=True,
+                        n=10, label="IPC", explode=True, is_code=True,
                     )
                     inventor_df, inventor_stat = _top_counts_table(
                         analysis_df.get("발명자", pd.Series(dtype=str)),
