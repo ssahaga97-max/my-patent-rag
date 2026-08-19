@@ -43,28 +43,48 @@ except ImportError:
 # ==========================================
 # 1. 경로·상수
 # ==========================================
+def _secret(key: str, default: str = "") -> str:
+    """Secrets 조회 (secrets.toml 부재 시에도 안전)."""
+    try:
+        v = st.secrets.get(key, default)
+    except Exception:
+        v = default
+    return str(v).strip()
+
+
+# ── 환경 분리: prod(운영) / test(클론) ──
+# 클론 앱은 Secrets에 APP_ENV="test"만 넣으면 데이터·스냅샷이 완전히 분리됨.
+APP_ENV = (_secret("APP_ENV", "prod") or "prod").lower()
+IS_TEST_ENV = APP_ENV != "prod"
+_ENV_SUFFIX = "" if not IS_TEST_ENV else f"_{APP_ENV}"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "my_patent_folder")
+DATA_DIR = os.path.join(BASE_DIR, f"my_patent_folder{_ENV_SUFFIX}")
 CHROMA_DIR = os.path.join(DATA_DIR, "chroma_db")          # PersistentClient 디렉토리
 USER_REGISTRY_PATH = os.path.join(DATA_DIR, "user_registry.json")
 LOGO_PATH = os.path.join(BASE_DIR, "atec_logo.png")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# R2 오브젝트 키 (버킷 내 고정 경로)
-R2_SNAPSHOT_KEY = "chroma_snapshot.tar.gz"
-R2_REGISTRY_KEY = "user_registry.json"
-R2_LOGO_KEY = "atec_logo.png"
+# R2 오브젝트 키 (환경별 분리 — 운영 스냅샷을 테스트가 덮어쓰지 않음)
+R2_SNAPSHOT_KEY = _secret("R2_SNAPSHOT_KEY") or f"chroma_snapshot{_ENV_SUFFIX}.tar.gz"
+R2_PROD_SNAPSHOT_KEY = "chroma_snapshot.tar.gz"           # 복제 원본(운영)
+R2_REGISTRY_KEY = f"user_registry{_ENV_SUFFIX}.json"
+R2_LOGO_KEY = "atec_logo.png"                             # 로고는 환경 공용
 
 _EMBED_DIM = 768                      # gemini-embedding-001을 768차원으로 축소 사용
-_COLLECTION_NAME = "competitor_patents"
+_COLLECTION_NAME = _secret("COLLECTION_NAME") or "competitor_patents"
 
-# ── Groq 무료 한도 (2026-06 기준: llama-3.3-70b-versatile = 12K TPM / 100K TPD) ──
-GROQ_TPM_LIMIT = 12000
+# ── Groq 무료 한도 (2026-06 기준: gpt-oss-120b = 8K TPM / 200K TPD) ──
+# 모델명은 Secrets(GROQ_MODEL)로 교체 가능 — 향후 폐기 시 코드 수정 없이 대응.
+# 2026-06-17 llama-3.3-70b-versatile 폐기 → openai/gpt-oss-120b로 마이그레이션.
+GROQ_MODEL = _secret("GROQ_MODEL") or "openai/gpt-oss-120b"
+GROQ_TPM_LIMIT = int(_secret("GROQ_TPM_LIMIT") or "8000")     # gpt-oss-120b = 8K TPM
 GROQ_MAX_OUTPUT_TOKENS = 1024
 GROQ_REQUEST_MARGIN = 800             # 추정 오차·API 오버헤드 여유
-GROQ_DAILY_TOKEN_LIMIT = 100000       # TPD — 일일 누적 추적용
+GROQ_DAILY_TOKEN_LIMIT = int(_secret("GROQ_DAILY_TOKEN_LIMIT") or "200000")  # 200K TPD
 
-st.set_page_config(page_title="AI 경쟁사 특허 조사 분석", layout="wide", page_icon="🔬")
+_PAGE_TITLE = "AI 경쟁사 특허 조사 분석" + (" [TEST]" if IS_TEST_ENV else "")
+st.set_page_config(page_title=_PAGE_TITLE, layout="wide", page_icon="🧪" if IS_TEST_ENV else "🔬")
 
 
 # ==========================================
@@ -614,6 +634,29 @@ def diagnose_r2() -> dict:
     return result
 
 
+def r2_copy(src_key: str, dst_key: str) -> tuple:
+    """
+    R2 내부에서 오브젝트를 서버 측 복사 (다운로드/업로드 없음 → 즉시, egress 0).
+    클론 환경 구축용. 반환: (성공여부, 메시지)
+    """
+    if not _r2_configured():
+        return False, "R2 설정이 없습니다."
+    if src_key == dst_key:
+        return False, "원본과 대상 키가 같습니다."
+    try:
+        cli = _get_r2_client()
+        bucket = _r2_bucket()
+        head = cli.head_object(Bucket=bucket, Key=src_key)   # 존재·크기 확인
+        size_mb = head.get("ContentLength", 0) / (1024 * 1024)
+        cli.copy_object(
+            Bucket=bucket, Key=dst_key,
+            CopySource={"Bucket": bucket, "Key": src_key},
+        )
+        return True, f"{src_key} → {dst_key} 복제 완료 ({size_mb:.1f} MB)"
+    except Exception as e:
+        return False, f"복제 실패: {e}"
+
+
 def list_r2_objects() -> list:
     """
     R2 버킷의 객체 목록 반환 [(key, size_bytes), ...].
@@ -1103,7 +1146,7 @@ def _get_llm():
     if not groq_api_key:
         raise ValueError("Streamlit Secrets에 GROQ_API_KEY가 설정되어 있지 않습니다.")
     return ChatGroq(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_MODEL,
         groq_api_key=groq_api_key,
         temperature=0.1,
         max_tokens=GROQ_MAX_OUTPUT_TOKENS,
@@ -2066,7 +2109,7 @@ def run_main_portal():
         if os.path.exists(LOGO_PATH):
             st.image(LOGO_PATH, width=110)
     with col_title:
-        st.title("AI 경쟁사 특허 조사 분석")
+        st.title("AI 경쟁사 특허 조사 분석" + (" 🧪 [테스트]" if IS_TEST_ENV else ""))
         mode_label = "🔧 관리자" if is_admin else "👤 사용자"
         used = _daily_tokens_used()
         st.caption(
@@ -2081,10 +2124,50 @@ def run_main_portal():
             st.session_state.is_admin = False
             st.rerun()
 
+    if IS_TEST_ENV:
+        st.warning(
+            f"🧪 **테스트 환경(`{APP_ENV}`)입니다.** 스냅샷 `{R2_SNAPSHOT_KEY}` 사용 — "
+            f"여기서 무엇을 하든 운영 데이터에 영향이 없습니다."
+        )
+
     # ── 사이드바: 관리자 데이터 관리 ──
     with st.sidebar:
         if is_admin:
             st.header("📂 데이터 관리 센터")
+
+            if IS_TEST_ENV:
+                st.info(f"🧪 환경: `{APP_ENV}` | 스냅샷: `{R2_SNAPSHOT_KEY}`")
+                if st.button("🧬 운영 데이터 복제해오기", use_container_width=True,
+                             help="운영 스냅샷을 테스트 키로 R2 내부 복사 후 로컬 복원. "
+                                  "재임베딩 불필요 (벡터까지 그대로 복제)."):
+                    with st.spinner("R2 내부 복제 중..."):
+                        ok, msg = r2_copy(R2_PROD_SNAPSHOT_KEY, R2_SNAPSHOT_KEY)
+                    if not ok:
+                        st.error(f"❌ {msg}")
+                    else:
+                        st.success(f"✅ {msg}")
+                        with st.spinner("로컬로 복원 중..."):
+                            info = restore_chroma_from_r2_verbose()
+                        try:
+                            _get_chroma_client.clear()
+                            _get_embedding_fn.clear()
+                            _applicant_options_cached.clear()
+                        except Exception:
+                            pass
+                        st.session_state.infra_initialized = False
+                        st.session_state.restored = True
+                        if info.get("extracted"):
+                            try:
+                                n = _get_collection().count()
+                                st.success(f"🎉 복제 완료 — {n}건 로드됐습니다.")
+                            except Exception as e:
+                                st.warning(f"복원됐으나 카운트 실패: {e}")
+                            st.rerun()
+                        else:
+                            st.error(f"복원 실패: {info.get('error','')}")
+                st.divider()
+            else:
+                st.caption(f"🔒 운영 환경 | 스냅샷: `{R2_SNAPSHOT_KEY}`")
 
             # R2 연결 진단 (버킷 객체 목록 포함)
             if st.button("🔍 R2 연결 진단", use_container_width=True):
@@ -2672,7 +2755,7 @@ def run_main_portal():
         n_results_user = st.slider(
             "🔢 3단계: 참조할 관련 특허 수",
             min_value=3, max_value=20, value=default_n, step=1,
-            help="AI가 분석에 참조할 최대 특허 건수. Groq 입력 한도(12,000 TPM) 때문에 수가 많으면 본문이 자동 축약됩니다.",
+            help=f"AI가 분석에 참조할 최대 특허 건수. Groq 입력 한도({GROQ_TPM_LIMIT:,} TPM) 때문에 수가 많으면 본문이 자동 축약됩니다.",
         )
         # 출원인 한정 드롭다운 (경쟁사 특허 조사 정확도 향상)
         applicant_opts = _applicant_options_cached(safe_count(collection), _COLLECTION_NAME)
@@ -2905,13 +2988,13 @@ def run_main_portal():
                     if truncated:
                         if "🛡" in analysis_mode:
                             st.info(
-                                "Groq 입력 한도(12,000 TPM)에 맞춰 본문을 축약했습니다. "
+                                f"Groq 입력 한도({GROQ_TPM_LIMIT:,} TPM)에 맞춰 본문을 축약했습니다. "
                                 "침해 분석 모드는 **청구항 우선** 유지, 요약을 먼저 줄입니다. "
                                 "더 상세하려면 '참조 특허 수'를 줄여 보세요."
                             )
                         else:
                             st.info(
-                                "Groq 입력 한도(12,000 TPM)에 맞춰 본문을 축약했습니다. "
+                                f"Groq 입력 한도({GROQ_TPM_LIMIT:,} TPM)에 맞춰 본문을 축약했습니다. "
                                 "키워드·심층 분석 모드는 **요약 우선** 유지, 청구항을 먼저 줄입니다. "
                                 "더 상세하려면 '참조 특허 수'를 줄여 보세요."
                             )
