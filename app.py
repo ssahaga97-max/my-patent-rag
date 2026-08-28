@@ -1617,13 +1617,16 @@ def _build_chroma_batches(rows_by_id: dict, cols: dict, hyperlink_map: dict):
     return batch_ids, batch_docs, batch_metas
 
 
-def process_and_update_db(uploaded_file, collection):
+def process_and_update_db(uploaded_file, collection, *, overwrite: bool = False):
     """
     업로드 엑셀 기준 누락 없는 적재 (canonical 출원번호 스키마).
     ChromaDB가 유일한 진실 — 마스터 엑셀 비교/저장 단계 제거.
     적재 성공 후 R2 백업까지 한 번에.
 
-    반환: (신규적재, 파일내중복, 이미존재, 출원번호없음, 백업성공bool)
+    overwrite=False (기본): 신규 출원번호만 추가, 기존은 건너뜀.
+    overwrite=True: 이미 존재하는 출원번호도 업로드 데이터로 전량 교체(재임베딩).
+
+    반환: (신규적재, 파일내중복, 이미존재_또는_덮어쓴수, 출원번호없음, 백업성공bool)
     """
     file_bytes = uploaded_file.read()
     hyperlink_map = extract_excel_hyperlinks(io.BytesIO(file_bytes))
@@ -1648,24 +1651,32 @@ def process_and_update_db(uploaded_file, collection):
             continue
         if cid in file_rows:
             dup_in_file += 1
-        file_rows[cid] = row
+        file_rows[cid] = row  # 파일 내 중복은 뒤 행이 이김(최신 우선)
 
-    needed = {cid: row for cid, row in file_rows.items() if cid not in chroma_ids}
-    already_indexed = len(file_rows) - len(needed)
+    if overwrite:
+        # 전량: 파일의 모든 행을 upsert (기존이면 교체=재임베딩, 신규면 추가)
+        target = file_rows
+        new_count = sum(1 for cid in file_rows if cid not in chroma_ids)
+        overwritten = len(file_rows) - new_count
+    else:
+        # 신규만: 이미 있는 출원번호는 건너뜀
+        target = {cid: row for cid, row in file_rows.items() if cid not in chroma_ids}
+        new_count = len(target)
+        overwritten = len(file_rows) - len(target)
 
     ingested = 0
-    if needed:
-        ids, docs, metas = _build_chroma_batches(needed, cols, hyperlink_map)
+    if target:
+        ids, docs, metas = _build_chroma_batches(target, cols, hyperlink_map)
         try:
             _upsert_patent_batches(collection, ids, docs, metas)
-            ingested = len(ids)
+            ingested = len(ids) if not overwrite else new_count
         except Exception as e:
             st.error(f"ChromaDB 적재 실패 — 백업하지 않았습니다: {e}")
-            return 0, dup_in_file, already_indexed, skipped_empty, False
+            return 0, dup_in_file, overwritten, skipped_empty, False
 
     # 적재 → 즉시 R2 백업 (트랜잭션처럼 묶음, 실패 시 2회 재시도)
     backup_ok = False
-    if ingested:
+    if target:  # 신규든 덮어쓰기든 변경이 있었으면 백업
         with st.spinner("💾 R2에 벡터 DB 백업 중... (재시작 후에도 데이터 보존)"):
             for attempt in range(3):
                 backup_ok = backup_chroma_to_r2()
@@ -1674,7 +1685,7 @@ def process_and_update_db(uploaded_file, collection):
                 if attempt < 2:
                     time.sleep(2)
 
-    return ingested, dup_in_file, already_indexed, skipped_empty, backup_ok
+    return ingested, dup_in_file, overwritten, skipped_empty, backup_ok
 
 
 def export_collection_to_excel_bytes(collection) -> bytes:
@@ -2273,7 +2284,20 @@ def run_main_portal():
             # 엑셀 업로드 및 적재
             uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
             if uploaded_file is not None:
-                if st.button("🚀 신규 특허 무결성 적재"):
+                overwrite_mode = st.checkbox(
+                    "🔄 기존 데이터 덮어쓰기 (전량 교체)",
+                    value=False,
+                    help="체크 시: 출원번호가 이미 있어도 업로드 데이터로 교체합니다(재임베딩 발생). "
+                         "미체크 시: 신규 출원번호만 추가하고 기존은 유지합니다.",
+                )
+                if overwrite_mode:
+                    st.warning(
+                        "⚠️ **덮어쓰기 모드**: 중복 출원번호를 업로드 내용으로 **전량 교체**합니다. "
+                        "교체분은 다시 임베딩되므로 Gemini rate limit이 발생할 수 있습니다. "
+                        "덮어쓸 건수가 많으면 나눠서 올리는 것을 권장합니다."
+                    )
+                btn_label = "🔄 덮어쓰기 적재" if overwrite_mode else "🚀 신규 특허 무결성 적재"
+                if st.button(btn_label):
                     try:
                         preview_bytes = uploaded_file.read()
                         uploaded_file.seek(0)
@@ -2289,31 +2313,56 @@ def run_main_portal():
                     except Exception as diag_e:
                         st.warning(f"파일 사전 진단 실패: {diag_e}")
 
-                    with st.spinner("중복 제거 및 실시간 인덱싱 중... (임베딩 호출, 건수에 따라 시간 소요)"):
-                        ingested, dup, already, skipped, backup_ok = process_and_update_db(
-                            uploaded_file, collection
+                    spin_msg = ("덮어쓰기 및 재임베딩 중..." if overwrite_mode
+                                else "중복 제거 및 실시간 인덱싱 중...") + " (임베딩 호출, 건수에 따라 시간 소요)"
+                    with st.spinner(spin_msg):
+                        ingested, dup, overwritten, skipped, backup_ok = process_and_update_db(
+                            uploaded_file, collection, overwrite=overwrite_mode
                         )
 
-                    st.info(
-                        f"📊 처리 결과: 신규 **{ingested}건** / 파일내 중복 **{dup}건** / "
-                        f"이미 존재 **{already}건** / 번호없음 **{skipped}건** / "
-                        f"DB 총 **{safe_count(collection)}건**"
-                    )
-                    if ingested > 0:
-                        if backup_ok:
-                            st.success(
-                                f"✅ 신규 {ingested}건 인덱싱 + R2 백업 성공 — "
-                                f"재시작·슬립 후에도 데이터가 보존됩니다."
+                    if overwrite_mode:
+                        st.info(
+                            f"📊 처리 결과(덮어쓰기): 신규 **{ingested}건** / 교체 **{overwritten}건** / "
+                            f"파일내 중복 **{dup}건** / 번호없음 **{skipped}건** / "
+                            f"DB 총 **{safe_count(collection)}건**"
+                        )
+                        changed = ingested + overwritten
+                        if changed > 0:
+                            if backup_ok:
+                                st.success(
+                                    f"✅ 신규 {ingested}건 + 교체 {overwritten}건 반영 + R2 백업 성공."
+                                )
+                            else:
+                                st.error(
+                                    f"⚠️ {changed}건 반영됐으나 **R2 백업 실패**. "
+                                    f"'💾 R2 백업 재시도'를 눌러 주세요."
+                                )
+                        else:
+                            st.warning("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
+                    else:
+                        st.info(
+                            f"📊 처리 결과: 신규 **{ingested}건** / 파일내 중복 **{dup}건** / "
+                            f"이미 존재 **{overwritten}건** / 번호없음 **{skipped}건** / "
+                            f"DB 총 **{safe_count(collection)}건**"
+                        )
+                        if ingested > 0:
+                            if backup_ok:
+                                st.success(
+                                    f"✅ 신규 {ingested}건 인덱싱 + R2 백업 성공 — "
+                                    f"재시작·슬립 후에도 데이터가 보존됩니다."
+                                )
+                            else:
+                                st.error(
+                                    f"⚠️ 신규 {ingested}건 인덱싱은 됐으나 **R2 백업 실패**. "
+                                    f"'🔍 R2 연결 진단' 후 다시 적재하거나 아래 백업 버튼을 누르세요."
+                                )
+                        elif dup > 0 or overwritten > 0:
+                            st.warning(
+                                "업로드 특허가 이미 DB에 존재합니다. 새 데이터가 없습니다. "
+                                "기존 내용을 갱신하려면 **덮어쓰기**를 체크하세요."
                             )
                         else:
-                            st.error(
-                                f"⚠️ 신규 {ingested}건 인덱싱은 됐으나 **R2 백업 실패**. "
-                                f"'🔍 R2 연결 진단' 후 다시 적재하거나 아래 백업 버튼을 누르세요."
-                            )
-                    elif dup > 0 or already > 0:
-                        st.warning("업로드 특허가 이미 DB에 존재합니다. 새 데이터가 없습니다.")
-                    else:
-                        st.error("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
+                            st.error("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
                     st.rerun()
 
             st.divider()
