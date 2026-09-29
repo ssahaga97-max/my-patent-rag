@@ -2084,6 +2084,493 @@ def search_patents(
 # ==========================================
 # 14. 메인 포털
 # ==========================================
+def _sb_data_ingest(collection):
+    """📥 특허 데이터 — 업로드·적재·내보내기·건수 (항상 펼침)."""
+    st.markdown(f"### 📥 특허 데이터")
+    st.markdown(f"**누적 적재:** `{safe_count(collection)}` 건")
+
+    uploaded_file = st.file_uploader("경쟁사 특허 엑셀 업로드 (.xlsx)", type=["xlsx"])
+    if uploaded_file is not None:
+        overwrite_mode = st.checkbox(
+            "🔄 기존 데이터 덮어쓰기 (전량 교체)",
+            value=False,
+            help="체크 시: 출원번호가 이미 있어도 업로드 데이터로 교체합니다(재임베딩 발생). "
+                 "미체크 시: 신규 출원번호만 추가하고 기존은 유지합니다.",
+        )
+        if overwrite_mode:
+            st.warning(
+                "⚠️ **덮어쓰기 모드**: 중복 출원번호를 업로드 내용으로 **전량 교체**합니다. "
+                "교체분은 다시 임베딩되므로 Gemini rate limit이 발생할 수 있습니다. "
+                "덮어쓸 건수가 많으면 나눠서 올리는 것을 권장합니다."
+            )
+        btn_label = "🔄 덮어쓰기 적재" if overwrite_mode else "🚀 신규 특허 무결성 적재"
+        if st.button(btn_label):
+            try:
+                preview_bytes = uploaded_file.read()
+                uploaded_file.seek(0)
+                preview_df = pd.read_excel(io.BytesIO(preview_bytes), nrows=3)
+                detected = _detect_columns(preview_df)
+                total_rows = pd.read_excel(io.BytesIO(preview_bytes)).shape[0]
+                uploaded_file.seek(0)
+                with st.expander("📋 업로드 파일 열 감지 결과", expanded=True):
+                    st.write(f"- **전체 행 수:** {total_rows}행")
+                    st.write(f"- **감지된 출원번호 열:** `{detected['id']}`")
+                    st.write(f"- **감지된 명칭 열:** `{detected['title']}`")
+                    st.write(f"- **전체 열 목록:** {list(preview_df.columns)}")
+            except Exception as diag_e:
+                st.warning(f"파일 사전 진단 실패: {diag_e}")
+
+            spin_msg = ("덮어쓰기 및 재임베딩 중..." if overwrite_mode
+                        else "중복 제거 및 실시간 인덱싱 중...") + " (임베딩 호출, 건수에 따라 시간 소요)"
+            with st.spinner(spin_msg):
+                ingested, dup, overwritten, skipped, backup_ok = process_and_update_db(
+                    uploaded_file, collection, overwrite=overwrite_mode
+                )
+
+            if overwrite_mode:
+                st.info(
+                    f"📊 처리 결과(덮어쓰기): 신규 **{ingested}건** / 교체 **{overwritten}건** / "
+                    f"파일내 중복 **{dup}건** / 번호없음 **{skipped}건** / "
+                    f"DB 총 **{safe_count(collection)}건**"
+                )
+                changed = ingested + overwritten
+                if changed > 0:
+                    if backup_ok:
+                        st.success(f"✅ 신규 {ingested}건 + 교체 {overwritten}건 반영 + R2 백업 성공.")
+                    else:
+                        st.error(f"⚠️ {changed}건 반영됐으나 **R2 백업 실패**. '유지보수 → R2 백업 재시도'를 눌러 주세요.")
+                else:
+                    st.warning("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
+            else:
+                st.info(
+                    f"📊 처리 결과: 신규 **{ingested}건** / 파일내 중복 **{dup}건** / "
+                    f"이미 존재 **{overwritten}건** / 번호없음 **{skipped}건** / "
+                    f"DB 총 **{safe_count(collection)}건**"
+                )
+                if ingested > 0:
+                    if backup_ok:
+                        st.success(f"✅ 신규 {ingested}건 인덱싱 + R2 백업 성공 — 재시작·슬립 후에도 보존됩니다.")
+                    else:
+                        st.error(f"⚠️ 신규 {ingested}건 인덱싱은 됐으나 **R2 백업 실패**. '진단 & 복구 → R2 연결 진단' 후 다시 시도하세요.")
+                elif dup > 0 or overwritten > 0:
+                    st.warning("업로드 특허가 이미 DB에 존재합니다. 기존 내용을 갱신하려면 **덮어쓰기**를 체크하세요.")
+                else:
+                    st.error("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
+            st.rerun()
+
+    # 마스터 엑셀 내보내기
+    if safe_count(collection) > 0:
+        if st.button("📥 마스터 엑셀 준비", use_container_width=True):
+            with st.spinner("엑셀 생성 중..."):
+                xlsx_bytes = export_collection_to_excel_bytes(collection)
+            if xlsx_bytes:
+                st.download_button(
+                    "⬇️ 다운로드 (요약·청구항 포함)",
+                    data=xlsx_bytes,
+                    file_name="master_patents.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+
+def _sb_maintenance(collection):
+    """🔧 유지보수 — 백업·필드 갱신·인덱스 재구축 (가끔 씀)."""
+    if st.button("💾 R2 백업 재시도", use_container_width=True):
+        with st.spinner("R2에 벡터 DB 업로드 중..."):
+            ok = backup_chroma_to_r2()
+        st.success("✅ R2 백업 성공!") if ok else st.error("❌ 백업 실패. '진단 & 복구 → R2 연결 진단'을 확인하세요.")
+
+    if st.button("🏷 대표출원인 필드 갱신", use_container_width=True,
+                 help="기존 적재 특허에 '대표출원인' 메타를 채웁니다. 재임베딩 없이 메타만 갱신 → 빠름. "
+                      "효성·히타치 등 변형 통합 규칙이 바뀐 경우에도 다시 누르세요."):
+        with st.spinner("대표출원인 메타 갱신 중... (재임베딩 없음)"):
+            n_upd = migrate_add_representative_applicant(collection)
+            backup_chroma_to_r2()
+        _applicant_options_cached.clear()
+        st.success(f"✅ {n_upd}건 대표출원인 갱신 + R2 백업 완료.")
+        st.rerun()
+
+    st.markdown("**🧱 검색 인덱스 재구축**")
+    st.caption("저장 임베딩은 정상인데 검색에 안 잡힐 때. Gemini 호출 없이 인덱스만 다시 씀 (빠름).")
+    rb_chunk = st.number_input("재구축 건수", min_value=200, max_value=5000,
+                               value=1500, step=100, key="rb_chunk")
+    if st.button("🧱 인덱스 재구축 실행", use_container_width=True):
+        prog2 = st.progress(0.0, text="재구축 준비 중...")
+
+        def _cb2(d, t):
+            prog2.progress(min(d / max(t, 1), 1.0), text=f"재구축 {d}/{t}건...")
+
+        d2, r2, s2 = rebuild_index_from_stored_embeddings(
+            collection, max_process=int(rb_chunk), progress_cb=_cb2
+        )
+        prog2.empty()
+        if s2 == "error":
+            st.error("재구축 중 오류. 로그를 확인하세요.")
+        elif d2 > 0:
+            with st.spinner("💾 R2 백업 중..."):
+                backup_chroma_to_r2()
+            if r2 > 0:
+                st.success(f"✅ {d2}건 재구축. 남은 {r2}건 → 버튼을 다시 누르세요.")
+            else:
+                st.success(f"🎉 {d2}건 재구축 완료. 인덱스가 모두 갱신됐습니다!")
+            st.rerun()
+        else:
+            st.info("재구축 대상이 없습니다.")
+
+
+def _sb_diagnostics(collection):
+    """🩺 진단 & 복구 — 문제 생겼을 때만."""
+    # 임베딩 엔진 진단
+    if st.button("🩺 임베딩 엔진 진단", use_container_width=True,
+                 help="분석·검색이 안 될 때 먼저 실행. 모델 폐기·키 만료를 감지합니다."):
+        st.write("**1. 설정 확인**")
+        gkey = _clean_ascii(st.secrets.get("GEMINI_API_KEY", ""))
+        st.write(f"- GEMINI_API_KEY 존재: {'✅ 예 (길이 ' + str(len(gkey)) + ')' if gkey else '❌ 없음'}")
+        st.write(f"- google-generativeai 설치: {'✅' if _GENAI_AVAILABLE else '❌'}")
+        fn = _get_embedding_fn()
+        fn_type = type(fn).__name__
+        st.write(f"- 현재 임베딩 함수: `{fn_type}`")
+        if fn_type != "GeminiEmbeddingFunction":
+            st.error("⚠️ Gemini가 아닌 폴백(로컬) 임베딩이 선택됐습니다. GEMINI_API_KEY를 확인하세요.")
+        st.write("**2. 실제 임베딩 호출 테스트**")
+        try:
+            if fn_type == "GeminiEmbeddingFunction":
+                import google.generativeai as _genai
+                _genai.configure(api_key=gkey)
+                resp = _genai.embed_content(
+                    model="models/gemini-embedding-001", content="지폐 계수 장치 테스트",
+                    task_type="retrieval_document", output_dimensionality=_EMBED_DIM,
+                )
+                vec = resp["embedding"]
+                nonzero = sum(1 for x in vec if abs(x) > 1e-9)
+                st.write(f"- 반환 벡터 차원: {len(vec)}, 비영 성분: {nonzero}")
+                if nonzero > 0:
+                    st.success("✅ Gemini 임베딩 정상 작동!")
+                else:
+                    st.error("❌ 호출은 됐으나 0벡터 반환. 모델/키 상태 이상.")
+            else:
+                test_vec = fn(["지폐 계수 장치 테스트"])[0]
+                nonzero = sum(1 for x in test_vec if abs(x) > 1e-9)
+                st.write(f"- 로컬 임베딩 비영 성분: {nonzero}")
+                st.info("로컬 임베딩 사용 중.")
+        except Exception as e:
+            st.error(
+                f"❌ **임베딩 호출 실패 (모델 폐기·키 만료·할당량 소진 의심):**\n\n```\n{e}\n```\n\n"
+                "→ 모델 폐기면 Secrets의 GROQ_MODEL 또는 코드의 임베딩 모델명을 교체하세요."
+            )
+
+    # 0벡터 확인 / 재임베딩
+    col_chk, col_fix = st.columns(2)
+    with col_chk:
+        if st.button("🔍 0벡터 개수 확인", use_container_width=True):
+            with st.spinner("스캔 중..."):
+                zn, tn = count_zero_vector_patents(collection)
+            if zn == 0:
+                st.success(f"✅ 0벡터 없음 (전체 {tn}건 정상)")
+            else:
+                st.warning(f"⚠️ 0벡터 **{zn}건** / 전체 {tn}건")
+    with col_fix:
+        chunk = st.number_input("한 번에 처리", min_value=50, max_value=1000,
+                                value=300, step=50, key="reembed_chunk",
+                                help="rate limit 도달 시 자동 중단. 300 권장.")
+        if st.button("🔧 0벡터 재임베딩", use_container_width=True):
+            prog = st.progress(0.0, text="재임베딩 준비 중...")
+
+            def _cb(done, tot):
+                prog.progress(min(done / max(tot, 1), 1.0), text=f"재임베딩 {done}/{tot}건...")
+
+            done, remaining, status = reembed_zero_vector_patents(
+                collection, max_process=int(chunk), progress_cb=_cb
+            )
+            prog.empty()
+            if done > 0:
+                with st.spinner("💾 R2 백업 중..."):
+                    backup_chroma_to_r2()
+                _applicant_options_cached.clear()
+            if status == "rate_limited":
+                st.warning(
+                    f"⏸ {done}건 완료 후 rate limit 도달 (남은 {remaining}건). "
+                    f"RPM이면 1~2분 뒤, RPD면 한국 오후 4~5시 이후 다시 누르세요. 진행분은 저장됨."
+                )
+            elif status == "error":
+                st.error("재임베딩 중 오류.")
+            elif remaining > 0:
+                st.success(f"✅ {done}건 완료. 남은 {remaining}건 → 다시 누르세요.")
+                st.rerun()
+            elif done > 0:
+                st.success(f"🎉 {done}건 완료. 0벡터가 모두 복구됐습니다!")
+                st.rerun()
+            else:
+                st.info("0벡터 특허가 없습니다.")
+
+    # R2 연결 진단
+    if st.button("🔍 R2 연결 진단", use_container_width=True):
+        with st.spinner("진단 중..."):
+            diag = diagnose_r2()
+            objs = list_r2_objects() if diag["reachable"] else []
+        if diag["reachable"]:
+            st.success(f"✅ R2 연결 정상 — 버킷 `{diag['bucket']}`")
+            if objs:
+                st.markdown("**📦 버킷 내 파일:**")
+                snapshot_found = False
+                for key, size in objs:
+                    mb = size / (1024 * 1024)
+                    flag = " ← 벡터 스냅샷" if key == R2_SNAPSHOT_KEY else ""
+                    if key == R2_SNAPSHOT_KEY:
+                        snapshot_found = True
+                    st.markdown(f"- `{key}` ({mb:.2f} MB){flag}")
+                if not snapshot_found:
+                    st.error(f"⚠️ 벡터 스냅샷(`{R2_SNAPSHOT_KEY}`)이 없습니다. 적재 후 백업이 실패했을 수 있습니다.")
+            else:
+                st.error("⚠️ 버킷이 비어 있습니다.")
+        else:
+            st.error(f"❌ 연결 실패\n\n{diag['error']}")
+
+    # R2 강제 복원
+    if st.button("🔄 R2에서 벡터 DB 강제 복원", use_container_width=True):
+        with st.spinner("R2 → 로컬 복원 + 진단 중..."):
+            info = restore_chroma_from_r2_verbose()
+        if info["error"]:
+            st.error(f"❌ 복원 실패: {info['error']}")
+        elif not info["extracted"]:
+            st.error("❌ 압축 해제 후 chroma_db 디렉토리가 생성되지 않았습니다.")
+        else:
+            try:
+                _get_chroma_client.clear()
+                _get_embedding_fn.clear()
+            except Exception:
+                pass
+            st.session_state.infra_initialized = False
+            st.session_state.restored = True
+            try:
+                n = _get_collection().count()
+            except Exception as e:
+                n = -1
+                st.error(f"컬렉션 읽기 오류: {e}")
+            st.info(
+                f"📦 **복원 진단** — 다운로드 {info['downloaded_mb']}MB / "
+                f"sqlite {info['sqlite_mb']}MB / 로드 **{n}건**"
+            )
+            if n > 0:
+                st.success(f"✅ {n}건 정상 로드.")
+                st.rerun()
+            elif info["sqlite_mb"] > 1:
+                st.error("⚠️ sqlite엔 데이터가 있는데 0건. sqlite 직접 복구를 시도합니다.")
+                with st.spinner("🛠 sqlite 직접 복구 중..."):
+                    try:
+                        rec_n, rec_msg = recover_from_sqlite_directly(_get_collection())
+                    except Exception as e:
+                        rec_n, rec_msg = 0, str(e)
+                if rec_n > 0:
+                    with st.spinner("💾 R2 재백업 중..."):
+                        backup_chroma_to_r2()
+                    st.success(f"✅ {rec_msg}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ sqlite 직접 복구 실패: {rec_msg}")
+            else:
+                st.warning("sqlite가 비어 있습니다.")
+
+    # 캐시 초기화
+    if st.button("♻️ 임베딩/DB 캐시 초기화", use_container_width=True,
+                 help="코드 수정·재배포 후 옛 객체가 남아 문제될 때. 캐시를 비우고 새로 로드합니다."):
+        try:
+            _get_embedding_fn.clear()
+            _get_chroma_client.clear()
+            _applicant_options_cached.clear()
+        except Exception:
+            pass
+        st.session_state.infra_initialized = False
+        st.success("✅ 캐시를 비웠습니다.")
+        st.rerun()
+
+    # 출원인 필터 진단
+    with st.expander("🔬 출원인 필터 진단"):
+        diag_name = st.text_input("진단할 대표출원인명", value="효성", key="diag_applicant")
+        if st.button("진단 실행", key="run_applicant_diag"):
+            try:
+                all_metas = collection.get(include=["metadatas"]).get("metadatas", [])
+                exact = 0
+                contains = 0
+                raw_samples = set()
+                for m in all_metas:
+                    rep = str((m or {}).get("대표출원인", ""))
+                    reps = {r.strip() for r in rep.split("|")}
+                    if diag_name in reps:
+                        contains += 1
+                        if rep.strip() == diag_name:
+                            exact += 1
+                    raw = str((m or {}).get("출원인", ""))
+                    if diag_name in _canonical_applicants_for_meta(raw) and len(raw_samples) < 8:
+                        raw_samples.add(raw)
+                st.write(f"**'{diag_name}' 통계:** 단독 {exact}건 / 복수포함 {contains}건")
+                try:
+                    wres = collection.get(where={"대표출원인목록": {"$contains": diag_name}}, limit=10000)
+                    n_contains = len(wres.get("ids", []))
+                    st.write(f"- **$contains 배열 필터: {n_contains}건** ← 실제 검색 방식")
+                    if n_contains == 0 and contains > 0:
+                        st.warning("⚠️ 배열 필드가 없습니다. '유지보수 → 대표출원인 필드 갱신'을 누르세요.")
+                except Exception as we:
+                    st.warning(f"$contains 오류: {we}")
+                if raw_samples:
+                    st.write("**원본 표기 샘플:**")
+                    for s in raw_samples:
+                        st.write(f"  - `{s}` → `{_canonical_applicants_for_meta(s)}`")
+                if contains == 0:
+                    st.error(f"⚠️ '{diag_name}' 0건. '유지보수 → 대표출원인 필드 갱신'을 먼저 누르세요.")
+            except Exception as e:
+                st.error(f"진단 오류: {e}")
+
+    # 검색 경로 진단
+    with st.expander("🔎 특허 검색 경로 진단"):
+        st.caption("검색이 안 되는 특허의 출원번호로 저장·임베딩·검색을 추적합니다.")
+        diag_pid = st.text_input("출원번호 (마스터 엑셀의 값)", key="diag_pid")
+        if st.button("검색 경로 추적", key="run_search_diag") and diag_pid.strip():
+            try:
+                cid = _normalize_patent_id(diag_pid.strip())
+                st.write(f"정규화된 ID: `{cid}`")
+                got = collection.get(ids=[cid], include=["documents", "metadatas", "embeddings"])
+                if not got.get("ids"):
+                    st.error(f"❌ ID `{cid}`가 컬렉션에 없습니다. 출원번호 원본 표기를 확인하세요.")
+                else:
+                    doc = got["documents"][0]
+                    emb = got["embeddings"][0] if got.get("embeddings") is not None else None
+                    st.success(f"✅ ID `{cid}` 존재 — 문서 {len(doc)}자")
+                    st.write(f"- 앞 120자: `{doc[:120]}`")
+                    if emb is not None:
+                        import math
+                        norm = math.sqrt(sum(x * x for x in emb))
+                        nonzero = sum(1 for x in emb if abs(x) > 1e-9)
+                        st.write(f"- 임베딩: 차원 {len(emb)}, 비영 {nonzero}, 노름 {norm:.4f}")
+                        if norm < 1e-6 or nonzero == 0:
+                            st.error("🚨 0벡터입니다. '0벡터 재임베딩'을 실행하세요.")
+                        else:
+                            st.info("임베딩 정상.")
+                    st.write("---")
+                    qtext = doc[:500]
+                    qv = _embed_query_vector(qtext)
+                    if qv is not None and emb is not None:
+                        dot = sum(a * b for a, b in zip(emb, qv))
+                        na = sum(a * a for a in emb) ** 0.5
+                        nb = sum(b * b for b in qv) ** 0.5
+                        cos = dot / (na * nb) if na > 0 and nb > 0 else 0.0
+                        st.write(f"- **저장벡터↔질의벡터 코사인: `{cos:.4f}`**")
+                    if qv is not None:
+                        rq = collection.query(query_embeddings=[qv], n_results=50)
+                    else:
+                        rq = collection.query(query_texts=[qtext], n_results=50)
+                    found_rank = None
+                    found_dist = None
+                    _ds_all = rq.get("distances", [[None] * 50])[0]
+                    for rank, (m, dd) in enumerate(zip(rq["metadatas"][0], _ds_all), 1):
+                        if _normalize_patent_id(m.get("출원번호", "")) == cid:
+                            found_rank = rank
+                            found_dist = dd
+                            break
+                    if found_rank:
+                        dtxt = f"{found_dist:.4f}" if isinstance(found_dist, (int, float)) else "?"
+                        if found_rank <= 3:
+                            st.success(f"✅ 자기 문서로 검색 시 {found_rank}위 (거리 {dtxt}). 정상.")
+                        else:
+                            st.warning(f"⚠️ 자기 문서가 {found_rank}위. 검색은 작동하나 유사 특허가 많음.")
+                    else:
+                        st.error("🚨 자기 문서가 상위 50위 안에도 없습니다.")
+                    st.write("상위 10위 (거리):")
+                    for rank, (m, dd) in enumerate(zip(rq["metadatas"][0][:10], _ds_all[:10]), 1):
+                        dtxt = f"{dd:.4f}" if isinstance(dd, (int, float)) else str(dd)
+                        st.write(f"  {rank}. [{dtxt}] {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
+            except Exception as e:
+                st.error(f"진단 오류: {e}")
+
+
+def _sb_members():
+    """👥 회원 관리 — 가입 승인."""
+    st.caption("🔴 승인 대기 계정은 **활성화**로 로그인을 허용합니다.")
+    registry = load_user_registry()
+    if not registry:
+        st.caption("등록된 일반 회원 없음")
+        return
+    updated_registry = dict(registry)
+    for uid, info in registry.items():
+        is_active = info.get("active", True)
+        status_icon = "🟢" if is_active else "🔴"
+        status_note = "" if is_active else " · **승인 대기**"
+        btn_label = "비활성화" if is_active else "활성화 (승인)"
+        btn_type = "secondary" if is_active else "primary"
+        col_info, col_btn = st.columns([3, 1])
+        with col_info:
+            st.markdown(
+                f"{status_icon} **{uid}**  \n"
+                f"<span style='font-size:12px;color:gray'>"
+                f"{info.get('name','')} · {info.get('department','부서없음')} · "
+                f"{info.get('registered_at','')[:10]}{status_note}</span>",
+                unsafe_allow_html=True,
+            )
+        with col_btn:
+            if st.button(btn_label, key=f"toggle_{uid}", type=btn_type):
+                updated_registry[uid]["active"] = not is_active
+                save_user_registry(updated_registry)
+                upload_user_registry_to_r2()
+                refresh_user_registry_from_r2(force=True)
+                action = "활성화(승인)" if not is_active else "비활성화"
+                st.toast(f"✅ {uid} 계정을 {action}했습니다.")
+                st.rerun()
+        st.divider()
+
+
+def _sb_danger_zone(collection):
+    """⚠️ 위험 구역 — 전체 포맷."""
+    st.caption("되돌릴 수 없는 작업입니다. 신중히 사용하세요.")
+    also_clear_r2 = st.checkbox(
+        "R2 백업도 함께 삭제 (snapshot 제거)", value=False,
+        help="체크 시 R2 벡터 스냅샷도 삭제합니다. 완전히 새로 시작할 때만.",
+    )
+    if st.button("🚨 데이터 웨어하우스 전체 포맷"):
+        with st.spinner("⏳ 벡터 DB 완전 초기화 중..."):
+            try:
+                reset_collection()
+                if also_clear_r2:
+                    r2_delete(R2_SNAPSHOT_KEY)
+                st.session_state["_last_chroma_count"] = 0
+                st.session_state.restored = True
+                st.toast("✅ 로컬 + R2 초기화 완료." if also_clear_r2 else "✅ 로컬 초기화 완료 (R2 유지).")
+                st.rerun()
+            except Exception as e:
+                st.error(f"초기화 중 오류: {e}")
+
+
+def _sb_clone_env():
+    """🧬 운영 데이터 복제 — 테스트 환경 전용."""
+    st.info(f"🧪 환경: `{APP_ENV}` | 스냅샷: `{R2_SNAPSHOT_KEY}`")
+    if st.button("🧬 운영 데이터 복제해오기", use_container_width=True,
+                 help="운영 스냅샷을 테스트 키로 R2 내부 복사 후 로컬 복원. 재임베딩 불필요."):
+        with st.spinner("R2 내부 복제 중..."):
+            ok, msg = r2_copy(R2_PROD_SNAPSHOT_KEY, R2_SNAPSHOT_KEY)
+        if not ok:
+            st.error(f"❌ {msg}")
+        else:
+            st.success(f"✅ {msg}")
+            with st.spinner("로컬로 복원 중..."):
+                info = restore_chroma_from_r2_verbose()
+            try:
+                _get_chroma_client.clear()
+                _get_embedding_fn.clear()
+                _applicant_options_cached.clear()
+            except Exception:
+                pass
+            st.session_state.infra_initialized = False
+            st.session_state.restored = True
+            if info.get("extracted"):
+                try:
+                    n = _get_collection().count()
+                    st.success(f"🎉 복제 완료 — {n}건 로드됐습니다.")
+                except Exception as e:
+                    st.warning(f"복원됐으나 카운트 실패: {e}")
+                st.rerun()
+            else:
+                st.error(f"복원 실패: {info.get('error','')}")
+
+
 def run_main_portal():
     # ── 세션 최초 진입: 인프라 초기화 전에 R2 복원 먼저 ──
     # (빈 컬렉션이 디스크에 먼저 생기는 것을 방지)
@@ -2146,633 +2633,33 @@ def run_main_portal():
         if is_admin:
             st.header("📂 데이터 관리 센터")
 
+            # 테스트 환경일 때만 — 운영 데이터 복제
             if IS_TEST_ENV:
-                st.info(f"🧪 환경: `{APP_ENV}` | 스냅샷: `{R2_SNAPSHOT_KEY}`")
-                if st.button("🧬 운영 데이터 복제해오기", use_container_width=True,
-                             help="운영 스냅샷을 테스트 키로 R2 내부 복사 후 로컬 복원. "
-                                  "재임베딩 불필요 (벡터까지 그대로 복제)."):
-                    with st.spinner("R2 내부 복제 중..."):
-                        ok, msg = r2_copy(R2_PROD_SNAPSHOT_KEY, R2_SNAPSHOT_KEY)
-                    if not ok:
-                        st.error(f"❌ {msg}")
-                    else:
-                        st.success(f"✅ {msg}")
-                        with st.spinner("로컬로 복원 중..."):
-                            info = restore_chroma_from_r2_verbose()
-                        try:
-                            _get_chroma_client.clear()
-                            _get_embedding_fn.clear()
-                            _applicant_options_cached.clear()
-                        except Exception:
-                            pass
-                        st.session_state.infra_initialized = False
-                        st.session_state.restored = True
-                        if info.get("extracted"):
-                            try:
-                                n = _get_collection().count()
-                                st.success(f"🎉 복제 완료 — {n}건 로드됐습니다.")
-                            except Exception as e:
-                                st.warning(f"복원됐으나 카운트 실패: {e}")
-                            st.rerun()
-                        else:
-                            st.error(f"복원 실패: {info.get('error','')}")
+                _sb_clone_env()
                 st.divider()
             else:
                 st.caption(f"🔒 운영 환경 | 스냅샷: `{R2_SNAPSHOT_KEY}`")
 
-            # R2 연결 진단 (버킷 객체 목록 포함)
-            if st.button("🔍 R2 연결 진단", use_container_width=True):
-                with st.spinner("진단 중..."):
-                    diag = diagnose_r2()
-                    objs = list_r2_objects() if diag["reachable"] else []
-                if diag["reachable"]:
-                    st.success(f"✅ R2 연결 정상\n\n- 버킷: `{diag['bucket']}`")
-                    if objs:
-                        st.markdown("**📦 버킷 내 파일 목록:**")
-                        snapshot_found = False
-                        for key, size in objs:
-                            mb = size / (1024 * 1024)
-                            flag = ""
-                            if key == R2_SNAPSHOT_KEY:
-                                snapshot_found = True
-                                flag = " ← 벡터 스냅샷"
-                            st.markdown(f"- `{key}` ({mb:.2f} MB){flag}")
-                        if not snapshot_found:
-                            st.error(
-                                f"⚠️ 벡터 스냅샷(`{R2_SNAPSHOT_KEY}`)이 버킷에 **없습니다**. "
-                                f"→ 어제 적재 후 R2 백업이 실패했을 가능성이 큽니다. "
-                                f"엑셀을 다시 적재하거나, 로컬에 데이터가 남아 있으면 '💾 R2 백업 재시도'를 누르세요."
-                            )
-                    else:
-                        st.error(
-                            "⚠️ 버킷이 **비어 있습니다**. 벡터 스냅샷이 한 번도 저장되지 않았습니다. "
-                            "→ 엑셀을 다시 적재하면 적재 직후 자동 백업됩니다."
-                        )
-                else:
-                    st.error(f"❌ 연결 실패\n\n{diag['error']}")
-
-            # R2 → 로컬 강제 복원 (상세 진단)
-            if st.button("🔄 R2에서 벡터 DB 강제 복원", use_container_width=True):
-                with st.spinner("R2 → 로컬 복원 + 진단 중..."):
-                    info = restore_chroma_from_r2_verbose()
-
-                if info["error"]:
-                    st.error(f"❌ 복원 실패: {info['error']}")
-                elif not info["extracted"]:
-                    st.error("❌ 압축 해제 후 chroma_db 디렉토리가 생성되지 않았습니다.")
-                else:
-                    # 캐시 완전 초기화 후 컬렉션 새로 읽기
-                    try:
-                        _get_chroma_client.clear()
-                        _get_embedding_fn.clear()
-                    except Exception:
-                        pass
-                    st.session_state.infra_initialized = False
-                    st.session_state.restored = True
-
-                    # 컬렉션 직접 카운트
-                    try:
-                        new_col = _get_collection()
-                        n = new_col.count()
-                    except Exception as e:
-                        n = -1
-                        st.error(f"컬렉션 읽기 오류: {e}")
-
-                    st.info(
-                        f"📦 **복원 진단**\n\n"
-                        f"- 다운로드: {info['downloaded_mb']} MB\n"
-                        f"- 압축 해제: {'성공' if info['extracted'] else '실패'}\n"
-                        f"- chroma.sqlite3 크기: {info['sqlite_mb']} MB\n"
-                        f"- 풀린 파일 수: {len(info['files'])}개\n"
-                        f"- **로드된 특허 건수: {n}건**"
-                    )
-                    with st.expander("🔍 tar 내부 구조 / 풀린 파일"):
-                        st.write("**tar 멤버:**", info["tar_members"])
-                        st.write("**풀린 파일:**", info["files"])
-
-                    if n > 0:
-                        st.success(f"✅ {n}건 정상 로드. 새로고침하면 반영됩니다.")
-                        st.rerun()
-                    elif info["sqlite_mb"] > 1:
-                        st.error(
-                            "⚠️ sqlite에 데이터는 있는데 0건으로 읽힙니다 "
-                            "(chromadb 버전 불일치 가능성). "
-                            "→ **sqlite에서 직접 복구**를 시도합니다."
-                        )
-                        with st.spinner("🛠 sqlite에서 직접 읽어 재임베딩 복구 중... (시간이 걸릴 수 있음)"):
-                            try:
-                                col2 = _get_collection()
-                                rec_n, rec_msg = recover_from_sqlite_directly(col2)
-                            except Exception as e:
-                                rec_n, rec_msg = 0, str(e)
-                        if rec_n > 0:
-                            with st.spinner("💾 복구분 R2 재백업 중..."):
-                                backup_chroma_to_r2()
-                            st.success(f"✅ {rec_msg} R2 재백업 완료. 새로고침하면 반영됩니다.")
-                            st.rerun()
-                        else:
-                            st.error(
-                                f"❌ sqlite 직접 복구 실패: {rec_msg}\n\n"
-                                "→ requirements.txt에 `chromadb==0.5.23`이 적용됐는지 확인하고, "
-                                "그래도 안 되면 원본 엑셀을 다시 적재해야 합니다."
-                            )
-                    else:
-                        st.warning("sqlite가 비어 있습니다 — 백업 시점에 데이터가 없었을 수 있습니다.")
+            # 📥 특허 데이터 — 항상 펼침 (일상 운영)
+            _sb_data_ingest(collection)
 
             st.divider()
 
-            # 엑셀 업로드 및 적재
-            uploaded_file = st.file_uploader("경쟁사 특허 엑셀 리스트 업로드 (.xlsx)", type=["xlsx"])
-            if uploaded_file is not None:
-                overwrite_mode = st.checkbox(
-                    "🔄 기존 데이터 덮어쓰기 (전량 교체)",
-                    value=False,
-                    help="체크 시: 출원번호가 이미 있어도 업로드 데이터로 교체합니다(재임베딩 발생). "
-                         "미체크 시: 신규 출원번호만 추가하고 기존은 유지합니다.",
-                )
-                if overwrite_mode:
-                    st.warning(
-                        "⚠️ **덮어쓰기 모드**: 중복 출원번호를 업로드 내용으로 **전량 교체**합니다. "
-                        "교체분은 다시 임베딩되므로 Gemini rate limit이 발생할 수 있습니다. "
-                        "덮어쓸 건수가 많으면 나눠서 올리는 것을 권장합니다."
-                    )
-                btn_label = "🔄 덮어쓰기 적재" if overwrite_mode else "🚀 신규 특허 무결성 적재"
-                if st.button(btn_label):
-                    try:
-                        preview_bytes = uploaded_file.read()
-                        uploaded_file.seek(0)
-                        preview_df = pd.read_excel(io.BytesIO(preview_bytes), nrows=3)
-                        detected = _detect_columns(preview_df)
-                        total_rows = pd.read_excel(io.BytesIO(preview_bytes)).shape[0]
-                        uploaded_file.seek(0)
-                        with st.expander("📋 업로드 파일 열 감지 결과", expanded=True):
-                            st.write(f"- **전체 행 수:** {total_rows}행")
-                            st.write(f"- **감지된 출원번호 열:** `{detected['id']}`")
-                            st.write(f"- **감지된 명칭 열:** `{detected['title']}`")
-                            st.write(f"- **전체 열 목록:** {list(preview_df.columns)}")
-                    except Exception as diag_e:
-                        st.warning(f"파일 사전 진단 실패: {diag_e}")
+            # 🔧 유지보수 — 가끔 씀
+            with st.expander("🔧 유지보수", expanded=False):
+                _sb_maintenance(collection)
 
-                    spin_msg = ("덮어쓰기 및 재임베딩 중..." if overwrite_mode
-                                else "중복 제거 및 실시간 인덱싱 중...") + " (임베딩 호출, 건수에 따라 시간 소요)"
-                    with st.spinner(spin_msg):
-                        ingested, dup, overwritten, skipped, backup_ok = process_and_update_db(
-                            uploaded_file, collection, overwrite=overwrite_mode
-                        )
+            # 🩺 진단 & 복구 — 문제 생겼을 때만
+            with st.expander("🩺 진단 & 복구", expanded=False):
+                _sb_diagnostics(collection)
 
-                    if overwrite_mode:
-                        st.info(
-                            f"📊 처리 결과(덮어쓰기): 신규 **{ingested}건** / 교체 **{overwritten}건** / "
-                            f"파일내 중복 **{dup}건** / 번호없음 **{skipped}건** / "
-                            f"DB 총 **{safe_count(collection)}건**"
-                        )
-                        changed = ingested + overwritten
-                        if changed > 0:
-                            if backup_ok:
-                                st.success(
-                                    f"✅ 신규 {ingested}건 + 교체 {overwritten}건 반영 + R2 백업 성공."
-                                )
-                            else:
-                                st.error(
-                                    f"⚠️ {changed}건 반영됐으나 **R2 백업 실패**. "
-                                    f"'💾 R2 백업 재시도'를 눌러 주세요."
-                                )
-                        else:
-                            st.warning("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
-                    else:
-                        st.info(
-                            f"📊 처리 결과: 신규 **{ingested}건** / 파일내 중복 **{dup}건** / "
-                            f"이미 존재 **{overwritten}건** / 번호없음 **{skipped}건** / "
-                            f"DB 총 **{safe_count(collection)}건**"
-                        )
-                        if ingested > 0:
-                            if backup_ok:
-                                st.success(
-                                    f"✅ 신규 {ingested}건 인덱싱 + R2 백업 성공 — "
-                                    f"재시작·슬립 후에도 데이터가 보존됩니다."
-                                )
-                            else:
-                                st.error(
-                                    f"⚠️ 신규 {ingested}건 인덱싱은 됐으나 **R2 백업 실패**. "
-                                    f"'🔍 R2 연결 진단' 후 다시 적재하거나 아래 백업 버튼을 누르세요."
-                                )
-                        elif dup > 0 or overwritten > 0:
-                            st.warning(
-                                "업로드 특허가 이미 DB에 존재합니다. 새 데이터가 없습니다. "
-                                "기존 내용을 갱신하려면 **덮어쓰기**를 체크하세요."
-                            )
-                        else:
-                            st.error("처리된 데이터가 없습니다. 출원번호 열 감지 결과를 확인하세요.")
-                    st.rerun()
+            # 👥 회원 관리
+            with st.expander("👥 회원 관리", expanded=False):
+                _sb_members()
 
-            st.divider()
-            st.markdown(f"📊 **누적 적재 데이터:** `{safe_count(collection)}` 건")
-
-            # R2 수동 백업
-            if st.button("💾 R2 백업 재시도", use_container_width=True):
-                with st.spinner("R2에 벡터 DB 업로드 중..."):
-                    ok = backup_chroma_to_r2()
-                if ok:
-                    st.success("✅ R2 백업 성공!")
-                else:
-                    st.error("❌ 백업 실패. R2 연결 진단을 확인하세요.")
-
-            # 대표출원인 메타 마이그레이션 (기존 적재분에 검색 필터 필드 추가)
-            if st.button("🏷 대표출원인 필드 갱신 (검색 필터용)", use_container_width=True,
-                         help="기존 적재 특허에 '대표출원인' 메타를 채웁니다. 재임베딩 없이 메타만 갱신 → 빠름. "
-                              "효성·히타치 등 변형 통합 규칙이 바뀐 경우에도 다시 누르세요."):
-                with st.spinner("대표출원인 메타 갱신 중... (재임베딩 없음)"):
-                    n_upd = migrate_add_representative_applicant(collection)
-                    backup_chroma_to_r2()
-                _applicant_options_cached.clear()
-                st.success(f"✅ {n_upd}건 대표출원인 갱신 + R2 백업 완료. 출원인 드롭다운에 반영됩니다.")
-                st.rerun()
-
-            # 출원인 필터 진단 (특정 출원인이 검색 안 될 때 원인 파악)
-            with st.expander("🔬 출원인 필터 진단"):
-                diag_name = st.text_input("진단할 대표출원인명", value="효성", key="diag_applicant")
-                if st.button("진단 실행", key="run_applicant_diag"):
-                    try:
-                        # 1) 전체 메타에서 대표출원인 값 분포
-                        all_metas = collection.get(include=["metadatas"]).get("metadatas", [])
-                        exact = 0        # 대표출원인 == diag_name
-                        contains = 0     # '|' 결합 포함
-                        raw_samples = set()
-                        for m in all_metas:
-                            rep = str((m or {}).get("대표출원인", ""))
-                            reps = {r.strip() for r in rep.split("|")}
-                            if diag_name in reps:
-                                contains += 1
-                                if rep.strip() == diag_name:
-                                    exact += 1
-                            # 원본 출원인 표기 샘플 수집 (해당 대표명 관련)
-                            raw = str((m or {}).get("출원인", ""))
-                            if diag_name in _canonical_applicants_for_meta(raw):
-                                if len(raw_samples) < 8:
-                                    raw_samples.add(raw)
-
-                        st.write(f"**'{diag_name}' 대표출원인 통계:**")
-                        st.write(f"- 단독 대표출원인 일치: **{exact}건**")
-                        st.write(f"- 복수출원인('|') 포함: **{contains}건**")
-
-                        # 2) $contains 배열 필터 직접 테스트
-                        try:
-                            wres = collection.get(
-                                where={"대표출원인목록": {"$contains": diag_name}}, limit=10000
-                            )
-                            n_contains = len(wres.get("ids", []))
-                            st.write(f"- **$contains 배열 필터 매칭: {n_contains}건** ← 실제 검색에 쓰이는 방식")
-                            if n_contains == 0 and contains > 0:
-                                st.warning(
-                                    "⚠️ 문자열엔 있으나 배열 필터가 0건 → **배열 필드가 아직 없습니다**. "
-                                    "'🏷 대표출원인 필드 갱신'을 누르면 배열 필드가 채워집니다."
-                                )
-                        except Exception as we:
-                            st.warning(
-                                f"$contains 필터 오류: {we}\n\n"
-                                "→ chromadb가 1.5 미만이거나 배열 필드가 없습니다. "
-                                "requirements.txt의 `chromadb==1.5.9` 확인 후 '대표출원인 필드 갱신'을 누르세요."
-                            )
-
-                        # 3) 원본 출원인 표기 샘플
-                        if raw_samples:
-                            st.write("**원본 출원인 표기 샘플:**")
-                            for s in raw_samples:
-                                st.write(f"  - `{s}` → 대표명: `{_canonical_applicants_for_meta(s)}`")
-
-                        if contains == 0:
-                            st.error(
-                                f"⚠️ '{diag_name}'로 저장된 특허가 0건입니다. "
-                                f"대표출원인 필드가 아직 안 채워졌을 수 있습니다 → "
-                                f"'🏷 대표출원인 필드 갱신'을 먼저 누르세요."
-                            )
-                        elif exact == 0 and contains > 0:
-                            st.warning(
-                                f"'{diag_name}'가 모두 복수출원인('|' 결합)으로만 존재합니다. "
-                                f"where 정확매칭은 0건이지만 하이브리드 검색으로 조회됩니다."
-                            )
-                    except Exception as e:
-                        st.error(f"진단 오류: {e}")
-
-            # 검색 경로 진단 (특정 특허가 검색 안 될 때 원인 추적)
-            with st.expander("🔎 특허 검색 경로 진단"):
-                st.caption("검색이 안 되는 특허의 출원번호를 넣으면 저장·임베딩·검색을 단계별로 추적합니다.")
-                diag_pid = st.text_input("출원번호 (마스터 엑셀의 값)", key="diag_pid")
-                if st.button("검색 경로 추적", key="run_search_diag") and diag_pid.strip():
-                    try:
-                        cid = _normalize_patent_id(diag_pid.strip())
-                        st.write(f"정규화된 ID: `{cid}`")
-
-                        # 1) 해당 ID가 컬렉션에 있는지 + 문서/메타/임베딩 확인
-                        got = collection.get(ids=[cid], include=["documents", "metadatas", "embeddings"])
-                        if not got.get("ids"):
-                            st.error(
-                                f"❌ ID `{cid}`가 컬렉션에 없습니다. "
-                                f"정규화 규칙 때문에 저장된 ID와 다를 수 있습니다. "
-                                f"엑셀의 출원번호 원본 표기를 확인하세요."
-                            )
-                        else:
-                            doc = got["documents"][0]
-                            emb = got["embeddings"][0] if got.get("embeddings") is not None else None
-                            st.success(f"✅ ID `{cid}` 존재")
-                            st.write(f"- 문서 길이: {len(doc)}자")
-                            st.write(f"- 문서 앞 120자: `{doc[:120]}`")
-
-                            # 2) 임베딩 유효성 (0벡터면 적재 시 임베딩 실패한 것)
-                            if emb is not None:
-                                import math
-                                norm = math.sqrt(sum(x * x for x in emb))
-                                nonzero = sum(1 for x in emb if abs(x) > 1e-9)
-                                st.write(f"- 임베딩 차원: {len(emb)}, 비영(非零) 성분: {nonzero}, 노름: {norm:.4f}")
-                                if norm < 1e-6 or nonzero == 0:
-                                    st.error(
-                                        "🚨 **이 특허의 임베딩이 0벡터입니다.** "
-                                        "적재 시 Gemini 임베딩 호출이 실패해 0벡터로 저장됐습니다. "
-                                        "→ 이 특허(및 유사 케이스)를 재임베딩해야 합니다. "
-                                        "아래 '🔧 0벡터 특허 재임베딩'을 실행하세요."
-                                    )
-                                else:
-                                    st.info("임베딩은 정상(비영 벡터)입니다.")
-
-                            # 3) 문서 자체로 검색 시 몇 위에 나오는지 (retrieval_query)
-                            st.write("---")
-                            st.write("**이 특허의 문서 내용으로 검색 시 순위:**")
-                            qtext = doc[:500]
-                            qv = _embed_query_vector(qtext)
-
-                            # 3-a) 결정적 판별: 저장벡터 vs 질의벡터 코사인 유사도 직접 계산
-                            if qv is not None and emb is not None:
-                                dot = sum(a * b for a, b in zip(emb, qv))
-                                na = sum(a * a for a in emb) ** 0.5
-                                nb = sum(b * b for b in qv) ** 0.5
-                                cos = dot / (na * nb) if na > 0 and nb > 0 else 0.0
-                                st.write(f"- **저장벡터 ↔ 질의벡터 코사인 유사도: `{cos:.4f}`**")
-                                if cos > 0.7:
-                                    st.info(
-                                        "→ 유사도가 높습니다. 임베딩 공간은 정상. "
-                                        "순위에서 밀린다면 **0벡터 특허들이 검색 결과를 오염**시키는 것이 원인입니다."
-                                    )
-                                elif cos > 0.3:
-                                    st.warning("→ 유사도가 애매합니다. 문서 앞 500자만 질의해 그럴 수 있습니다.")
-                                else:
-                                    st.error(
-                                        "→ 유사도가 낮습니다. **저장 임베딩과 질의 임베딩이 다른 공간**입니다. "
-                                        "(저장은 옛 모델, 질의는 새 모델일 가능성) → 전체 재임베딩 필요."
-                                    )
-
-                            if qv is not None:
-                                rq = collection.query(query_embeddings=[qv], n_results=50)
-                            else:
-                                rq = collection.query(query_texts=[qtext], n_results=50)
-                            found_rank = None
-                            found_dist = None
-                            _ds_all = rq.get("distances", [[None] * 50])[0]
-                            for rank, (m, dd) in enumerate(zip(rq["metadatas"][0], _ds_all), 1):
-                                if _normalize_patent_id(m.get("출원번호", "")) == cid:
-                                    found_rank = rank
-                                    found_dist = dd
-                                    break
-                            if found_rank:
-                                dtxt = f"{found_dist:.4f}" if isinstance(found_dist, (int, float)) else "?"
-                                if found_rank <= 3:
-                                    st.success(f"✅ 자기 문서로 검색 시 **{found_rank}위** (거리 {dtxt}). 검색 정상.")
-                                else:
-                                    st.warning(
-                                        f"⚠️ 자기 문서가 **{found_rank}위** (거리 {dtxt})입니다. "
-                                        f"유사 특허가 많아 밀린 것으로, 검색 자체는 작동합니다."
-                                    )
-                            else:
-                                st.error("🚨 자기 문서가 상위 50위 안에도 없습니다.")
-                            # 상위 10위 + 거리 표시
-                            st.write("상위 10위 특허 (거리):")
-                            for rank, (m, dd) in enumerate(zip(rq["metadatas"][0][:10], _ds_all[:10]), 1):
-                                dtxt = f"{dd:.4f}" if isinstance(dd, (int, float)) else str(dd)
-                                st.write(f"  {rank}. [{dtxt}] {m.get('출원번호','')} | {m.get('명칭','')[:30]}")
-                    except Exception as e:
-                        st.error(f"진단 오류: {e}")
-
-            # 인덱스 재구축 (저장 벡터는 정상인데 검색이 안 될 때 — API 호출 없음)
-            st.markdown("**🧱 검색 인덱스 재구축**")
-            st.caption(
-                "저장된 임베딩은 정상인데 검색에 안 잡힐 때 사용. "
-                "Gemini 호출 없이 인덱스만 다시 씁니다 (빠름·rate limit 무관)."
-            )
-            rb_chunk = st.number_input("재구축 건수", min_value=200, max_value=5000,
-                                       value=1500, step=100, key="rb_chunk")
-            if st.button("🧱 인덱스 재구축 실행", use_container_width=True):
-                prog2 = st.progress(0.0, text="재구축 준비 중...")
-
-                def _cb2(d, t):
-                    prog2.progress(min(d / max(t, 1), 1.0), text=f"재구축 {d}/{t}건...")
-
-                d2, r2, s2 = rebuild_index_from_stored_embeddings(
-                    collection, max_process=int(rb_chunk), progress_cb=_cb2
-                )
-                prog2.empty()
-                if s2 == "error":
-                    st.error("재구축 중 오류. 로그를 확인하세요.")
-                elif d2 > 0:
-                    with st.spinner("💾 R2 백업 중..."):
-                        backup_chroma_to_r2()
-                    if r2 > 0:
-                        st.success(f"✅ {d2}건 재구축. 남은 {r2}건 → 버튼을 다시 누르세요.")
-                    else:
-                        st.success(f"🎉 {d2}건 재구축 완료. 인덱스가 모두 갱신됐습니다!")
-                    st.rerun()
-                else:
-                    st.info("재구축 대상이 없습니다.")
-
-            st.divider()
-
-            # 0벡터 특허 재임베딩 (임베딩 실패분 복구) — 청크 처리로 타임아웃 회피
-            st.markdown("**🔧 0벡터 특허 복구**")
-            st.caption(
-                "적재 시 rate limit으로 임베딩 실패한 특허를 재임베딩합니다. "
-                "Streamlit 20분 제한 때문에 한 번에 300건씩 처리 → 여러 번 나눠 누르세요."
-            )
-
-            # 임베딩 엔진 실시간 진단 (전량 0벡터일 때 원인 파악)
-            if st.button("♻️ 임베딩/DB 캐시 초기화 (코드 수정 후 필수)", use_container_width=True,
-                         help="Streamlit이 붙들고 있는 옛 임베딩 함수 객체를 버리고 새로 로드합니다."):
-                try:
-                    _get_embedding_fn.clear()
-                    _get_chroma_client.clear()
-                    _applicant_options_cached.clear()
-                except Exception:
-                    pass
-                st.session_state.infra_initialized = False
-                st.success("✅ 캐시를 비웠습니다. 새 임베딩 함수로 다시 로드됩니다.")
-                st.rerun()
-
-            if st.button("🩺 임베딩 엔진 진단 (먼저 실행)", use_container_width=True):
-                st.write("**1. 설정 확인**")
-                gkey = _clean_ascii(st.secrets.get("GEMINI_API_KEY", ""))
-                st.write(f"- GEMINI_API_KEY 존재: {'✅ 예 (길이 ' + str(len(gkey)) + ')' if gkey else '❌ 없음'}")
-                st.write(f"- google-generativeai 설치: {'✅' if _GENAI_AVAILABLE else '❌'}")
-
-                fn = _get_embedding_fn()
-                fn_type = type(fn).__name__
-                st.write(f"- 현재 임베딩 함수: `{fn_type}`")
-                if fn_type != "GeminiEmbeddingFunction":
-                    st.error(
-                        "⚠️ Gemini가 아닌 폴백(로컬) 임베딩이 선택됐습니다. "
-                        "GEMINI_API_KEY 또는 google-generativeai 설치를 확인하세요."
-                    )
-
-                st.write("**2. 실제 임베딩 호출 테스트**")
-                try:
-                    if fn_type == "GeminiEmbeddingFunction":
-                        # 재시도 없이 1회만 직접 호출해 raw 에러 확인
-                        import google.generativeai as _genai
-                        _genai.configure(api_key=gkey)
-                        resp = _genai.embed_content(
-                            model="models/gemini-embedding-001",
-                            content="지폐 계수 장치 테스트",
-                            task_type="retrieval_document",
-                            output_dimensionality=_EMBED_DIM,
-                        )
-                        vec = resp["embedding"]
-                        nonzero = sum(1 for x in vec if abs(x) > 1e-9)
-                        st.write(f"- 반환 벡터 차원: {len(vec)}, 비영 성분: {nonzero}")
-                        if nonzero > 0:
-                            st.success("✅ Gemini 임베딩 정상 작동! 이제 재임베딩하면 0벡터가 채워집니다.")
-                        else:
-                            st.error("❌ 호출은 됐으나 0벡터 반환. 모델/키 상태 이상.")
-                    else:
-                        test_vec = fn(["지폐 계수 장치 테스트"])[0]
-                        nonzero = sum(1 for x in test_vec if abs(x) > 1e-9)
-                        st.write(f"- 로컬 임베딩 비영 성분: {nonzero}")
-                        st.info("로컬 임베딩 사용 중. Gemini로 바꾸려면 GEMINI_API_KEY 설정 필요.")
-                except Exception as e:
-                    st.error(
-                        f"❌ **임베딩 호출 실패 (이게 전량 0벡터의 원인):**\n\n```\n{e}\n```\n\n"
-                        "→ 에러 내용에 따라: API 키 만료·무효, 할당량 소진(quota), "
-                        "또는 google-generativeai 버전 문제일 수 있습니다."
-                    )
-
-            col_chk, col_fix = st.columns(2)
-            with col_chk:
-                if st.button("🔍 0벡터 개수 확인", use_container_width=True):
-                    with st.spinner("스캔 중..."):
-                        zn, tn = count_zero_vector_patents(collection)
-                    if zn == 0:
-                        st.success(f"✅ 0벡터 특허 없음 (전체 {tn}건 정상)")
-                    else:
-                        st.warning(f"⚠️ 0벡터 특허 **{zn}건** / 전체 {tn}건. 아래 재임베딩을 실행하세요.")
-            with col_fix:
-                chunk = st.number_input("한 번에 처리할 건수", min_value=50, max_value=1000,
-                                        value=300, step=50,
-                                        help="rate limit 도달 시 자동 중단됩니다. 300 권장.")
-                if st.button("🔧 0벡터 재임베딩", use_container_width=True):
-                    prog = st.progress(0.0, text="재임베딩 준비 중...")
-
-                    def _cb(done, tot):
-                        prog.progress(min(done / max(tot, 1), 1.0),
-                                      text=f"재임베딩 {done}/{tot}건...")
-
-                    done, remaining, status = reembed_zero_vector_patents(
-                        collection, max_process=int(chunk), progress_cb=_cb
-                    )
-                    prog.empty()
-                    if done > 0:
-                        with st.spinner("💾 R2 백업 중..."):
-                            backup_chroma_to_r2()
-                        _applicant_options_cached.clear()
-
-                    if status == "rate_limited":
-                        st.warning(
-                            f"⏸ 이번에 **{done}건** 완료 후 Gemini rate limit에 도달해 멈췄습니다. "
-                            f"(남은 {remaining}건)\n\n"
-                            f"- **분당 한도(RPM)**면 1~2분 뒤 다시 누르면 이어집니다.\n"
-                            f"- **일일 한도(RPD)**면 태평양시 자정(한국 오후 4~5시) 이후 재개됩니다.\n"
-                            f"진행분은 R2에 저장됐으니 언제 다시 눌러도 이어서 됩니다."
-                        )
-                    elif status == "error":
-                        st.error("재임베딩 중 오류. 로그를 확인하세요.")
-                    elif remaining > 0:
-                        st.success(
-                            f"✅ 이번에 {done}건 완료. 남은 {remaining}건 → 버튼을 다시 누르세요."
-                        )
-                        st.rerun()
-                    elif done > 0:
-                        st.success(f"🎉 {done}건 완료. 0벡터 특허가 모두 복구됐습니다!")
-                        st.rerun()
-                    else:
-                        st.info("0벡터 특허가 없습니다. 모두 정상입니다.")
-
-            st.divider()
-
-            # 엑셀 내보내기 (원본 재생성)
-            if safe_count(collection) > 0:
-                if st.button("📥 마스터 엑셀 준비", use_container_width=True):
-                    with st.spinner("엑셀 생성 중..."):
-                        xlsx_bytes = export_collection_to_excel_bytes(collection)
-                    if xlsx_bytes:
-                        st.download_button(
-                            "⬇️ 다운로드 (요약·청구항 포함)",
-                            data=xlsx_bytes,
-                            file_name="master_patents.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                        )
-
-            st.divider()
-
-            # 전체 포맷
-            also_clear_r2 = st.checkbox(
-                "R2 백업도 함께 삭제 (snapshot 제거)",
-                value=False,
-                help="체크 시 R2의 벡터 스냅샷도 삭제합니다. 완전히 새로 시작할 때 사용하세요.",
-            )
-            if st.button("🚨 데이터 웨어하우스 전체 포맷"):
-                with st.spinner("⏳ 벡터 DB 완전 초기화 중..."):
-                    try:
-                        reset_collection()
-                        if also_clear_r2:
-                            r2_delete(R2_SNAPSHOT_KEY)
-                        st.session_state["_last_chroma_count"] = 0
-                        st.session_state.restored = True  # 포맷 직후 R2 재복원 방지
-                        if also_clear_r2:
-                            st.toast("✅ 로컬 + R2 초기화 완료. 엑셀을 새로 업로드하세요.")
-                        else:
-                            st.toast("✅ 로컬 초기화 완료. (R2 백업은 유지)")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"초기화 중 오류: {e}")
-
-            st.divider()
-            st.subheader("👥 가입 회원 현황")
-            st.caption("🔴 승인 대기 계정은 **활성화** 버튼으로 로그인을 허용합니다.")
-            registry = load_user_registry()
-            if not registry:
-                st.caption("등록된 일반 회원 없음")
-            else:
-                updated_registry = dict(registry)
-                for uid, info in registry.items():
-                    is_active = info.get("active", True)
-                    status_icon = "🟢" if is_active else "🔴"
-                    status_note = "" if is_active else " · **승인 대기**"
-                    btn_label = "비활성화" if is_active else "활성화 (승인)"
-                    btn_type = "secondary" if is_active else "primary"
-                    col_info, col_btn = st.columns([3, 1])
-                    with col_info:
-                        st.markdown(
-                            f"{status_icon} **{uid}**  \n"
-                            f"<span style='font-size:12px;color:gray'>"
-                            f"{info.get('name','')} · {info.get('department','부서없음')} · "
-                            f"{info.get('registered_at','')[:10]}{status_note}</span>",
-                            unsafe_allow_html=True,
-                        )
-                    with col_btn:
-                        if st.button(btn_label, key=f"toggle_{uid}", type=btn_type):
-                            updated_registry[uid]["active"] = not is_active
-                            save_user_registry(updated_registry)
-                            upload_user_registry_to_r2()
-                            refresh_user_registry_from_r2(force=True)
-                            action = "활성화(승인)" if not is_active else "비활성화"
-                            st.toast(f"✅ {uid} 계정을 {action}했습니다.")
-                            st.rerun()
-                    st.divider()
+            # ⚠️ 위험 구역
+            with st.expander("⚠️ 위험 구역", expanded=False):
+                _sb_danger_zone(collection)
         else:
             st.caption("분석 기능 전용 접속 모드입니다.")
 
