@@ -2694,14 +2694,20 @@ def run_main_portal():
             help=f"AI가 분석에 참조할 최대 특허 건수. Groq 입력 한도({GROQ_TPM_LIMIT:,} TPM) 때문에 수가 많으면 본문이 자동 축약됩니다.",
         )
         # 출원인 한정 드롭다운 (경쟁사 특허 조사 정확도 향상)
+        # 옵션 순서를 고정(정렬)하고 고유 key를 부여해, "(전체)" 선택이
+        # 실제 필터 값으로 정확히 반영되도록 함 (key 없을 때 위젯 상태가
+        # 위치 기반으로 꼬여 이전 선택이 남는 문제 방지).
         applicant_opts = _applicant_options_cached(safe_count(collection), _COLLECTION_NAME)
-        applicant_filter = st.selectbox(
+        applicant_options_list = ["(전체)"] + sorted(applicant_opts)
+        applicant_sel = st.selectbox(
             "🏢 4단계: 출원인 한정 (선택)",
-            ["(전체)"] + applicant_opts,
+            applicant_options_list,
+            key="applicant_filter_select", # 고유 key로 선택 상태 명확히 관리
             help="특정 경쟁사를 고르면 그 출원인의 특허 안에서만 검색합니다. "
                  "예: '효성'을 고르고 '현금 수표 통합 모듈' 입력 → 효성 특허만 조사.",
         )
-        applicant_filter = "" if applicant_filter == "(전체)" else applicant_filter
+        # "(전체)"이면 빈 문자열(필터 없음), 아니면 공백 제거한 출원인명
+        applicant_filter = "" if str(applicant_sel).strip() == "(전체)" else str(applicant_sel).strip()
         keyword_boost = st.checkbox(
             "🔑 키워드 우선 매칭 (질의 단어가 명칭·본문에 포함된 특허를 상위로)",
             value=True,
@@ -2891,6 +2897,8 @@ def run_main_portal():
 
                     if applicant_filter:
                         st.info(f"🏢 '{applicant_filter}' 출원인으로 한정해 {len(retrieved_docs)}건을 조사했습니다.")
+                    else:
+                        st.info(f"🌐 전체 출원인 대상으로 {len(retrieved_docs)}건을 조사했습니다. (출원인 한정 없음)")
 
                     if "💡 단순 키워드" in analysis_mode:
                         system_prompt = (
