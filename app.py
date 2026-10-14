@@ -883,30 +883,51 @@ def download_logo_from_r2() -> bool:
 
 
 # ── 수동 대표출원인 매핑: R2 저장/로드 ──
-def load_applicant_overrides() -> dict:
-    """R2에서 수동 매핑 사전을 받아 전역 캐시에 적재. 반환: 매핑 dict."""
+def _set_overrides_cache(clean: dict):
+    """전역 + session_state 양쪽에 매핑 캐시 저장 (리런 간 유지 보장)."""
     global _APPLICANT_OVERRIDES
+    _APPLICANT_OVERRIDES = dict(clean)
+    try:
+        st.session_state["_applicant_overrides_cache"] = dict(clean)
+    except Exception:
+        pass
+
+
+def load_applicant_overrides() -> dict:
+    """
+    수동 매핑 사전 로드. session_state 캐시가 있으면 우선 사용(리런 간 유지),
+    없으면 R2에서 받아 적재. 반환: 매핑 dict.
+    """
+    global _APPLICANT_OVERRIDES
+    # session_state에 이미 있으면 그걸 전역에 복원 (R2 재조회 불필요)
+    cached = None
+    try:
+        cached = st.session_state.get("_applicant_overrides_cache")
+    except Exception:
+        cached = None
+    if isinstance(cached, dict):
+        _APPLICANT_OVERRIDES = dict(cached)
+        return _APPLICANT_OVERRIDES
+
     data = r2_download_bytes(R2_APPLICANT_OVERRIDES_KEY)
     if not data:
-        _APPLICANT_OVERRIDES = {}
+        _set_overrides_cache({})
         return _APPLICANT_OVERRIDES
     try:
         mapping = json.loads(data.decode("utf-8"))
-        # 키는 lookup_key로 정규화해 저장되어 있다고 가정하되, 안전하게 재정규화
         clean = {}
         for k, v in mapping.items():
             if isinstance(k, str) and isinstance(v, str) and v.strip():
                 clean[k.strip().upper()] = v.strip()
-        _APPLICANT_OVERRIDES = clean
+        _set_overrides_cache(clean)
     except Exception as e:
         print(f"[수동 매핑 로드 오류] {e}")
-        _APPLICANT_OVERRIDES = {}
+        _set_overrides_cache({})
     return _APPLICANT_OVERRIDES
 
 
 def save_applicant_overrides(mapping: dict) -> bool:
-    """수동 매핑 사전을 R2에 저장 + 전역 캐시 갱신."""
-    global _APPLICANT_OVERRIDES
+    """수동 매핑 사전을 R2에 저장 + 전역·session_state 캐시 갱신."""
     try:
         clean = {}
         for k, v in (mapping or {}).items():
@@ -914,22 +935,22 @@ def save_applicant_overrides(mapping: dict) -> bool:
                 clean[k.strip().upper()] = v.strip()
         payload = json.dumps(clean, ensure_ascii=False, indent=2).encode("utf-8")
         ok = r2_upload_bytes(R2_APPLICANT_OVERRIDES_KEY, payload, "application/json")
-        if ok:
-            _APPLICANT_OVERRIDES = clean
+        # R2 성공 여부와 무관하게 세션 캐시는 갱신 (이번 세션에서 즉시 반영)
+        _set_overrides_cache(clean)
         return ok
     except Exception as e:
         print(f"[수동 매핑 저장 오류] {e}")
         return False
 
 
-def add_applicant_override(raw_names: list, canonical: str) -> int:
+def add_applicant_override(raw_names: list, canonical: str) -> tuple:
     """
     여러 출원인 표기(raw_names)를 하나의 대표명(canonical)으로 통합하는 매핑 추가.
-    각 raw는 lookup_key로 변환해 저장. 반환: 추가/갱신된 항목 수.
+    각 raw는 lookup_key로 변환해 저장. 반환: (추가 항목 수, R2 저장 성공bool).
     """
     canonical = str(canonical).strip()
     if not canonical:
-        return 0
+        return 0, False
     current = dict(_applicant_overrides_get())
     n = 0
     for raw in raw_names:
@@ -937,9 +958,10 @@ def add_applicant_override(raw_names: list, canonical: str) -> int:
         if key:
             current[key] = canonical
             n += 1
+    saved = False
     if n > 0:
-        save_applicant_overrides(current)
-    return n
+        saved = save_applicant_overrides(current)
+    return n, saved
 
 
 def remove_applicant_override(lookup_key: str) -> bool:
@@ -2305,15 +2327,22 @@ def _sb_maintenance(collection):
             elif not merge_target.strip():
                 st.warning("통합 대표명을 입력하세요.")
             else:
-                n_map = add_applicant_override(to_merge, merge_target.strip())
+                n_map, saved = add_applicant_override(to_merge, merge_target.strip())
                 with st.spinner("대표출원인 메타 갱신 중... (재임베딩 없음)"):
                     n_upd = migrate_add_representative_applicant(collection)
                     backup_chroma_to_r2()
                 _applicant_options_cached.clear()
-                st.success(
-                    f"✅ {n_map}개 출원인을 '{merge_target.strip()}'(으)로 통합 + "
-                    f"{n_upd}건 메타 갱신 완료."
-                )
+                if saved:
+                    st.success(
+                        f"✅ {n_map}개 출원인을 '{merge_target.strip()}'(으)로 통합 + "
+                        f"{n_upd}건 메타 갱신 완료."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ {n_map}개 통합을 이번 세션에는 적용했으나 **R2 저장 실패**. "
+                        f"(앱 재시작 시 사라질 수 있음) '진단 & 복구 → R2 연결 진단'을 확인하세요. "
+                        f"메타 갱신은 {n_upd}건 완료."
+                    )
                 st.rerun()
 
         # 현재 수동 매핑 목록 + 개별 삭제
@@ -2726,10 +2755,9 @@ def _sb_clone_env():
 
 
 def run_main_portal():
-    # 수동 대표출원인 매핑 로드 (리런마다 전역 캐시가 비면 R2에서 재적재)
-    if not st.session_state.get("_overrides_loaded"):
-        load_applicant_overrides()
-        st.session_state["_overrides_loaded"] = True
+    # 수동 대표출원인 매핑 로드 — 매 리런 호출 (session_state 캐시 우선이라 빠름).
+    # 전역 _APPLICANT_OVERRIDES가 모듈 재실행으로 비어도 매번 복원됨.
+    load_applicant_overrides()
 
     # ── 세션 최초 진입: 인프라 초기화 전에 R2 복원 먼저 ──
     # (빈 컬렉션이 디스크에 먼저 생기는 것을 방지)
