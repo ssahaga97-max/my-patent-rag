@@ -70,6 +70,7 @@ R2_SNAPSHOT_KEY = _secret("R2_SNAPSHOT_KEY") or f"chroma_snapshot{_ENV_SUFFIX}.t
 R2_PROD_SNAPSHOT_KEY = "chroma_snapshot.tar.gz"           # 복제 원본(운영)
 R2_REGISTRY_KEY = f"user_registry{_ENV_SUFFIX}.json"
 R2_LOGO_KEY = "atec_logo.png"                             # 로고는 환경 공용
+R2_APPLICANT_OVERRIDES_KEY = f"applicant_overrides{_ENV_SUFFIX}.json"  # 수동 대표출원인 매핑
 
 _EMBED_DIM = 768                      # gemini-embedding-001을 768차원으로 축소 사용
 _COLLECTION_NAME = _secret("COLLECTION_NAME") or "competitor_patents"
@@ -306,6 +307,17 @@ _CORP_SUFFIX_HANGUL_RE = re.compile("(?:" + "|".join(_HANGUL_SUFFIXES) + r")")
 _CORP_SEP_RE = re.compile(r"[\s\-_./\\()（）\[\]]+")
 
 
+# ── 수동 대표출원인 매핑 (R2 저장, 자동 규칙보다 우선) ──
+# {lookup_key: 대표명} 형태. 예: {"HOTS": "효성", "HYOSUNGTNS": "효성"}
+# 세션 전역 캐시. 앱 시작 시 R2에서 load_applicant_overrides()로 채움.
+_APPLICANT_OVERRIDES: dict = {}
+
+
+def _applicant_overrides_get() -> dict:
+    """현재 세션에 로드된 수동 매핑 사전 반환."""
+    return _APPLICANT_OVERRIDES
+
+
 def _applicant_lookup_key(name: str) -> str:
     """출원인 문자열을 alias 조회용 키로 변환."""
     s = str(name).strip()
@@ -331,6 +343,11 @@ def _canonical_applicant_name(name: str) -> str:
     key = _applicant_lookup_key(raw)
     if not key:
         return raw
+
+    # 0) 수동 매핑 최우선 (관리자가 '유지보수 → 대표출원인 통합'에서 지정)
+    overrides = _applicant_overrides_get()
+    if key in overrides:
+        return overrides[key]
 
     # 1) 정확 매칭 (영문 키 + 한글 변형 키 모두 등록됨)
     if key in _APPLICANT_CANONICAL_KEYS:
@@ -863,6 +880,76 @@ def download_logo_from_r2() -> bool:
         return True
     except Exception:
         return False
+
+
+# ── 수동 대표출원인 매핑: R2 저장/로드 ──
+def load_applicant_overrides() -> dict:
+    """R2에서 수동 매핑 사전을 받아 전역 캐시에 적재. 반환: 매핑 dict."""
+    global _APPLICANT_OVERRIDES
+    data = r2_download_bytes(R2_APPLICANT_OVERRIDES_KEY)
+    if not data:
+        _APPLICANT_OVERRIDES = {}
+        return _APPLICANT_OVERRIDES
+    try:
+        mapping = json.loads(data.decode("utf-8"))
+        # 키는 lookup_key로 정규화해 저장되어 있다고 가정하되, 안전하게 재정규화
+        clean = {}
+        for k, v in mapping.items():
+            if isinstance(k, str) and isinstance(v, str) and v.strip():
+                clean[k.strip().upper()] = v.strip()
+        _APPLICANT_OVERRIDES = clean
+    except Exception as e:
+        print(f"[수동 매핑 로드 오류] {e}")
+        _APPLICANT_OVERRIDES = {}
+    return _APPLICANT_OVERRIDES
+
+
+def save_applicant_overrides(mapping: dict) -> bool:
+    """수동 매핑 사전을 R2에 저장 + 전역 캐시 갱신."""
+    global _APPLICANT_OVERRIDES
+    try:
+        clean = {}
+        for k, v in (mapping or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and v.strip():
+                clean[k.strip().upper()] = v.strip()
+        payload = json.dumps(clean, ensure_ascii=False, indent=2).encode("utf-8")
+        ok = r2_upload_bytes(R2_APPLICANT_OVERRIDES_KEY, payload, "application/json")
+        if ok:
+            _APPLICANT_OVERRIDES = clean
+        return ok
+    except Exception as e:
+        print(f"[수동 매핑 저장 오류] {e}")
+        return False
+
+
+def add_applicant_override(raw_names: list, canonical: str) -> int:
+    """
+    여러 출원인 표기(raw_names)를 하나의 대표명(canonical)으로 통합하는 매핑 추가.
+    각 raw는 lookup_key로 변환해 저장. 반환: 추가/갱신된 항목 수.
+    """
+    canonical = str(canonical).strip()
+    if not canonical:
+        return 0
+    current = dict(_applicant_overrides_get())
+    n = 0
+    for raw in raw_names:
+        key = _applicant_lookup_key(str(raw))
+        if key:
+            current[key] = canonical
+            n += 1
+    if n > 0:
+        save_applicant_overrides(current)
+    return n
+
+
+def remove_applicant_override(lookup_key: str) -> bool:
+    """수동 매핑에서 특정 키 제거."""
+    current = dict(_applicant_overrides_get())
+    k = str(lookup_key).strip().upper()
+    if k in current:
+        del current[k]
+        return save_applicant_overrides(current)
+    return False
 
 
 # ==========================================
@@ -2190,6 +2277,73 @@ def _sb_maintenance(collection):
         st.success(f"✅ {n_upd}건 대표출원인 갱신 + R2 백업 완료.")
         st.rerun()
 
+    # ── 수동 대표출원인 통합 (여러 변형을 하나로 묶기) ──
+    with st.expander("🔗 대표출원인 수동 통합"):
+        st.caption(
+            "자동 규칙으로 안 묶이는 출원인을 수동으로 하나의 대표명으로 통합합니다. "
+            "통합 후 '대표출원인 필드 갱신'이 자동 실행되어 검색·드롭다운에 바로 반영됩니다."
+        )
+        # 현재 대표출원인 목록(드롭다운에 뜨는 값)
+        cur_opts = _applicant_options_cached(safe_count(collection), _COLLECTION_NAME)
+
+        st.markdown("**① 통합할 출원인 선택** (현재 드롭다운에 뜨는 이름들)")
+        to_merge = st.multiselect(
+            "하나로 묶을 출원인들을 모두 선택",
+            options=sorted(cur_opts),
+            key="merge_src_select",
+            help="예: 'HOTS', 'HYOSUNG TNS'를 선택",
+        )
+        st.markdown("**② 통합 대표명 입력**")
+        merge_target = st.text_input(
+            "이들을 어느 대표명으로 통합할지",
+            key="merge_target_input",
+            placeholder="예: 효성",
+        )
+        if st.button("🔗 통합 적용", use_container_width=True, key="apply_merge"):
+            if not to_merge:
+                st.warning("통합할 출원인을 하나 이상 선택하세요.")
+            elif not merge_target.strip():
+                st.warning("통합 대표명을 입력하세요.")
+            else:
+                n_map = add_applicant_override(to_merge, merge_target.strip())
+                with st.spinner("대표출원인 메타 갱신 중... (재임베딩 없음)"):
+                    n_upd = migrate_add_representative_applicant(collection)
+                    backup_chroma_to_r2()
+                _applicant_options_cached.clear()
+                st.success(
+                    f"✅ {n_map}개 출원인을 '{merge_target.strip()}'(으)로 통합 + "
+                    f"{n_upd}건 메타 갱신 완료."
+                )
+                st.rerun()
+
+        # 현재 수동 매핑 목록 + 개별 삭제
+        overrides = _applicant_overrides_get()
+        if overrides:
+            st.markdown("**현재 수동 통합 규칙**")
+            # 대표명별로 묶어서 표시
+            by_target: dict = {}
+            for k, v in overrides.items():
+                by_target.setdefault(v, []).append(k)
+            for target, keys in sorted(by_target.items()):
+                st.markdown(f"→ **{target}**: `{', '.join(sorted(keys))}`")
+            st.caption("아래에서 개별 규칙(키)을 삭제할 수 있습니다.")
+            del_key = st.selectbox(
+                "삭제할 규칙(키) 선택",
+                options=["(선택 안 함)"] + sorted(overrides.keys()),
+                key="del_override_select",
+            )
+            if st.button("🗑 선택 규칙 삭제", use_container_width=True, key="del_override_btn"):
+                if del_key and del_key != "(선택 안 함)":
+                    remove_applicant_override(del_key)
+                    with st.spinner("메타 갱신 중..."):
+                        migrate_add_representative_applicant(collection)
+                        backup_chroma_to_r2()
+                    _applicant_options_cached.clear()
+                    st.success(f"✅ 규칙 '{del_key}' 삭제 + 메타 갱신 완료.")
+                    st.rerun()
+        else:
+            st.caption("아직 수동 통합 규칙이 없습니다.")
+
     st.markdown("**🧱 검색 인덱스 재구축**")
     st.caption("저장 임베딩은 정상인데 검색에 안 잡힐 때. Gemini 호출 없이 인덱스만 다시 씀 (빠름).")
     rb_chunk = st.number_input("재구축 건수", min_value=200, max_value=5000,
@@ -2572,6 +2726,11 @@ def _sb_clone_env():
 
 
 def run_main_portal():
+    # 수동 대표출원인 매핑 로드 (리런마다 전역 캐시가 비면 R2에서 재적재)
+    if not st.session_state.get("_overrides_loaded"):
+        load_applicant_overrides()
+        st.session_state["_overrides_loaded"] = True
+
     # ── 세션 최초 진입: 인프라 초기화 전에 R2 복원 먼저 ──
     # (빈 컬렉션이 디스크에 먼저 생기는 것을 방지)
     if not st.session_state.restored:
