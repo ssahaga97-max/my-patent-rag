@@ -341,29 +341,39 @@ def _canonical_applicant_name(name: str) -> str:
         return ""
 
     key = _applicant_lookup_key(raw)
+
+    # ── 1단계: 자동 대표명화 (원본 → 표시용 대표명) ──
     if not key:
-        return raw
+        canon = raw
+    elif key in _APPLICANT_CANONICAL_KEYS:
+        # 정확 매칭 (영문 키 + 한글 변형 키 모두 등록됨)
+        canon = _APPLICANT_CANONICAL_KEYS[key]
+    else:
+        canon = None
+        # 접두사 매칭 (변형 흡수)
+        for prefix, canonical in _APPLICANT_PREFIX_RULES:
+            if key.startswith(prefix):
+                canon = canonical
+                break
+        if canon is None:
+            if re.search(r"[가-힣]", raw):
+                # 매핑 없는 한글 출원인: 회사 접미사만 정리해 표시
+                cleaned = re.sub(r"\s*(\(주\)|주식회사|㈜|유한회사|\(유\))\s*", "", raw).strip()
+                canon = cleaned if cleaned else raw
+            else:
+                canon = raw
 
-    # 0) 수동 매핑 최우선 (관리자가 '유지보수 → 대표출원인 통합'에서 지정)
+    # ── 2단계: 수동 통합 규칙 적용 (대표명 → 대표명, 자동화 뒤에 덮어씀) ──
+    # 관리자가 '유지보수 → 대표출원인 수동 통합'에서 지정한 규칙.
+    # 드롭다운에 보이는 '표시 이름' 기준으로 매칭하므로 항상 정확히 맞는다.
     overrides = _applicant_overrides_get()
-    if key in overrides:
-        return overrides[key]
+    if overrides:
+        seen = set()  # 순환 매핑 방어
+        while canon in overrides and canon not in seen:
+            seen.add(canon)
+            canon = overrides[canon]
 
-    # 1) 정확 매칭 (영문 키 + 한글 변형 키 모두 등록됨)
-    if key in _APPLICANT_CANONICAL_KEYS:
-        return _APPLICANT_CANONICAL_KEYS[key]
-
-    # 2) 접두사 매칭 (변형 흡수)
-    for prefix, canonical in _APPLICANT_PREFIX_RULES:
-        if key.startswith(prefix):
-            return canonical
-
-    # 3) 매핑 없는 한글 출원인: 회사 접미사만 정리해 표시
-    if re.search(r"[가-힣]", raw):
-        cleaned = re.sub(r"\s*(\(주\)|주식회사|㈜|유한회사|\(유\))\s*", "", raw).strip()
-        return cleaned if cleaned else raw
-
-    return raw
+    return canon
 
 
 def _explode_multi_values(value, *, allow_comma: bool = False, is_code: bool = False) -> list:
@@ -917,8 +927,10 @@ def load_applicant_overrides() -> dict:
         mapping = json.loads(data.decode("utf-8"))
         clean = {}
         for k, v in mapping.items():
-            if isinstance(k, str) and isinstance(v, str) and v.strip():
-                clean[k.strip().upper()] = v.strip()
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                ks, vs = k.strip(), v.strip()
+                if ks != vs:  # 자기 자신 매핑 제외
+                    clean[ks] = vs
         _set_overrides_cache(clean)
     except Exception as e:
         print(f"[수동 매핑 로드 오류] {e}")
@@ -931,8 +943,10 @@ def save_applicant_overrides(mapping: dict) -> bool:
     try:
         clean = {}
         for k, v in (mapping or {}).items():
-            if isinstance(k, str) and isinstance(v, str) and v.strip():
-                clean[k.strip().upper()] = v.strip()
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                ks, vs = k.strip(), v.strip()
+                if ks != vs:  # 자기 자신 매핑 제외
+                    clean[ks] = vs
         payload = json.dumps(clean, ensure_ascii=False, indent=2).encode("utf-8")
         ok = r2_upload_bytes(R2_APPLICANT_OVERRIDES_KEY, payload, "application/json")
         # R2 성공 여부와 무관하게 세션 캐시는 갱신 (이번 세션에서 즉시 반영)
@@ -943,20 +957,21 @@ def save_applicant_overrides(mapping: dict) -> bool:
         return False
 
 
-def add_applicant_override(raw_names: list, canonical: str) -> tuple:
+def add_applicant_override(src_names: list, canonical: str) -> tuple:
     """
-    여러 출원인 표기(raw_names)를 하나의 대표명(canonical)으로 통합하는 매핑 추가.
-    각 raw는 lookup_key로 변환해 저장. 반환: (추가 항목 수, R2 저장 성공bool).
+    여러 대표명(src_names)을 하나의 대표명(canonical)으로 통합하는 매핑 추가.
+    드롭다운에 보이는 '표시 이름' 그대로 키로 저장(대표명→대표명).
+    반환: (추가 항목 수, R2 저장 성공bool).
     """
     canonical = str(canonical).strip()
     if not canonical:
         return 0, False
     current = dict(_applicant_overrides_get())
     n = 0
-    for raw in raw_names:
-        key = _applicant_lookup_key(str(raw))
-        if key:
-            current[key] = canonical
+    for nm in src_names:
+        nm = str(nm).strip()
+        if nm and nm != canonical:  # 자기 자신으로의 매핑은 제외
+            current[nm] = canonical
             n += 1
     saved = False
     if n > 0:
@@ -964,14 +979,19 @@ def add_applicant_override(raw_names: list, canonical: str) -> tuple:
     return n, saved
 
 
-def remove_applicant_override(lookup_key: str) -> bool:
-    """수동 매핑에서 특정 키 제거."""
+def remove_applicant_override(name: str) -> bool:
+    """수동 매핑에서 특정 규칙(표시 이름 키) 제거."""
     current = dict(_applicant_overrides_get())
-    k = str(lookup_key).strip().upper()
+    k = str(name).strip()
     if k in current:
         del current[k]
         return save_applicant_overrides(current)
     return False
+
+
+def clear_applicant_overrides() -> bool:
+    """수동 통합 규칙 전체 삭제 (잘못 저장된 과거 규칙 정리용)."""
+    return save_applicant_overrides({})
 
 
 # ==========================================
@@ -2313,7 +2333,7 @@ def _sb_maintenance(collection):
             "하나로 묶을 출원인들을 모두 선택",
             options=sorted(cur_opts),
             key="merge_src_select",
-            help="예: 'HOTS', 'HYOSUNG TNS'를 선택",
+            help="드롭다운에 보이는 이름 그대로 묶입니다. 예: 'DIEBOLD', 'DIEBOLD NIXDORF' 선택 → 대표명 'DIEBOLD NIXDORF'",
         )
         st.markdown("**② 통합 대표명 입력**")
         merge_target = st.text_input(
@@ -2348,27 +2368,39 @@ def _sb_maintenance(collection):
         # 현재 수동 매핑 목록 + 개별 삭제
         overrides = _applicant_overrides_get()
         if overrides:
-            st.markdown("**현재 수동 통합 규칙**")
+            st.markdown("**현재 수동 통합 규칙** (묶인 이름 → 대표명)")
             # 대표명별로 묶어서 표시
             by_target: dict = {}
             for k, v in overrides.items():
                 by_target.setdefault(v, []).append(k)
-            for target, keys in sorted(by_target.items()):
-                st.markdown(f"→ **{target}**: `{', '.join(sorted(keys))}`")
-            st.caption("아래에서 개별 규칙(키)을 삭제할 수 있습니다.")
+            for target, names in sorted(by_target.items()):
+                st.markdown(f"→ **{target}**: `{', '.join(sorted(names))}`")
+            st.caption("아래에서 개별 규칙을 삭제하거나, 전체를 초기화할 수 있습니다.")
             del_key = st.selectbox(
-                "삭제할 규칙(키) 선택",
+                "삭제할 규칙 선택",
                 options=["(선택 안 함)"] + sorted(overrides.keys()),
                 key="del_override_select",
             )
-            if st.button("🗑 선택 규칙 삭제", use_container_width=True, key="del_override_btn"):
-                if del_key and del_key != "(선택 안 함)":
-                    remove_applicant_override(del_key)
-                    with st.spinner("메타 갱신 중..."):
+            c_del, c_reset = st.columns(2)
+            with c_del:
+                if st.button("🗑 선택 규칙 삭제", use_container_width=True, key="del_override_btn"):
+                    if del_key and del_key != "(선택 안 함)":
+                        remove_applicant_override(del_key)
+                        with st.spinner("메타 갱신 중..."):
+                            migrate_add_representative_applicant(collection)
+                            backup_chroma_to_r2()
+                        _applicant_options_cached.clear()
+                        st.success(f"✅ 규칙 '{del_key}' 삭제 + 메타 갱신 완료.")
+                        st.rerun()
+            with c_reset:
+                if st.button("⚠️ 전체 초기화", use_container_width=True, key="reset_override_btn",
+                             help="잘못 저장된 과거 규칙을 모두 지웁니다. (예전 방식으로 저장된 규칙 정리용)"):
+                    clear_applicant_overrides()
+                    with st.spinner("규칙 전체 삭제 + 메타 갱신 중..."):
                         migrate_add_representative_applicant(collection)
                         backup_chroma_to_r2()
                     _applicant_options_cached.clear()
-                    st.success(f"✅ 규칙 '{del_key}' 삭제 + 메타 갱신 완료.")
+                    st.success("✅ 수동 통합 규칙을 모두 초기화했습니다.")
                     st.rerun()
         else:
             st.caption("아직 수동 통합 규칙이 없습니다.")
